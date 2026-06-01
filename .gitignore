@@ -1,9 +1,9 @@
-/target/
-/node_modules/
-/dist/
-/.svelte-kit/
-/.tauri/
-/.vite/
+target/
+node_modules/
+dist/
+.svelte-kit/
+.tauri/
+.vite/
 *.log
 *.db
 *.db-shm
@@ -11,4 +11,3 @@
 .env
 .env.*
 !.env.example
-
