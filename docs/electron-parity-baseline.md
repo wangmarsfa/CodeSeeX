@@ -24,7 +24,9 @@ The boundary rules are:
 - Codex speaks `/v1/responses`, `/v1/chat/completions`, `/v1/models`, and related Responses endpoints to CodeSeeX.
 - CodeSeeX sends OpenAI-compatible Chat Completions to DeepSeek or a custom upstream.
 - Codex-native tools, especially MCP/external tools, remain visible to Codex as native Responses `function_call` items.
-- CodeSeeX-hosted tools may be executed internally, but their visible output must still be legal Responses output.
+- CodeSeeX-hosted tools are executed internally and must not be exposed as client-executable Responses `function_call` items.
+- CodeSeeX-hosted regular built-in/community tools use display-only messages plus `proxy_tool_call` diagnostic items; Codex must never be asked to execute them.
+- Native `apply_patch` is returned to Codex as `custom_tool_call`; CodeSeeX consumes the later `custom_tool_call_output` but does not apply the patch itself.
 - The app must see a completed turn exactly once unless the model intentionally emits a native tool call and waits for Codex to execute it.
 
 ## Model Mapping
@@ -33,13 +35,15 @@ Old behavior:
 
 - `deepseek-v4-flash` stays `deepseek-v4-flash`.
 - `deepseek-v4-pro` stays `deepseek-v4-pro`.
-- Unknown Codex-requested models are not forwarded to DeepSeek raw.
-- In default mode, unsupported requested models fall back to `deepseek-v4-pro`.
+- Unknown Codex-requested models are not forced to Pro in default mode.
+- In default mode, unknown requested models pass through unchanged so Codex TOML and custom/local upstream model IDs remain the source of truth.
+- Codex lightweight mini requests such as `gpt-5.4-mini` / `gpt-5.5-mini` are treated as title/lightweight requests and map to `deepseek-v4-flash`.
 - Explicit override modes force Flash or Pro regardless of requested model.
 
 Regression guard:
 
-- A request with `model: "gpt-5.4-mini"` must not reach DeepSeek as `gpt-5.4-mini`.
+- A request with `model: "gpt-5.4-mini"` must not reach DeepSeek as `gpt-5.4-mini`; default mode maps it to Flash.
+- A truly unknown request model must not be silently rewritten to Pro; default mode preserves the requested model.
 - Logs should record both `requested_model` and actual upstream `model`.
 
 ## Account Balance
@@ -130,6 +134,7 @@ Old behavior:
 
 - DeepSeek may return text, reasoning, and tool calls.
 - Internal hosted tools are executed by CodeSeeX, appended as legal Chat `tool` messages, and DeepSeek is called again.
+- `apply_patch` is returned to Codex as a native `custom_tool_call`; the next request replays Codex's `custom_tool_call_output` as a legal Chat tool result.
 - External/MCP tool calls are returned to Codex as native Responses function calls and CodeSeeX stops the current turn.
 - Hosted tool loops have a bounded max iteration count.
 - If a hosted tool loop cannot produce a final answer, CodeSeeX returns a deterministic fallback rather than spinning forever.

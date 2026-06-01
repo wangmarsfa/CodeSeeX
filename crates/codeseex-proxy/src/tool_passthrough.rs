@@ -2,6 +2,8 @@ use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use uuid::Uuid;
 
+use crate::tools::ownership::ChatToolCall;
+
 #[derive(Debug, Clone, Default)]
 pub struct ToolContext {
     entries: BTreeMap<String, ToolEntry>,
@@ -53,7 +55,7 @@ impl ToolContext {
         self.entries.contains_key(name)
     }
 
-    pub fn response_item_from_chat_call(&self, call: &crate::server::ChatToolCall) -> Value {
+    pub fn response_item_from_chat_call(&self, call: &ChatToolCall) -> Value {
         let entry = self.entries.get(&call.name);
         let mut item = json!({
             "id": format!("fc_{}", Uuid::new_v4().simple()),
@@ -319,7 +321,7 @@ mod tests {
                 .and_then(Value::as_str),
             Some("smoke_add")
         );
-        let item = context.response_item_from_chat_call(&crate::server::ChatToolCall {
+        let item = context.response_item_from_chat_call(&ChatToolCall {
             id: "call_1".to_owned(),
             name: "smoke_add".to_owned(),
             arguments: "{\"a\":1,\"b\":2}".to_owned(),

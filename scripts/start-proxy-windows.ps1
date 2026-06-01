@@ -3,7 +3,8 @@ param(
   [string]$DevRoot = "D:\DevTools\CodeSeeXNext",
   [string]$DataDir = "D:\DevTools\CodeSeeXNext\Data",
   [int]$Port = 8787,
-  [string]$UpstreamBaseUrl = ""
+  [string]$UpstreamBaseUrl = "",
+  [switch]$NoBuild
 )
 
 $ErrorActionPreference = "Stop"
@@ -38,7 +39,54 @@ if (-not (Test-Path $cargo)) {
   $cargo = "cargo"
 }
 
-$command = @(
+function Get-LatestProxyInputWriteTime {
+  $paths = @(
+    (Join-Path $RepoRoot "Cargo.toml"),
+    (Join-Path $RepoRoot "Cargo.lock"),
+    (Join-Path $RepoRoot "crates\codeseex-core"),
+    (Join-Path $RepoRoot "crates\codeseex-store"),
+    (Join-Path $RepoRoot "crates\codeseex-proxy")
+  )
+  $latest = [DateTime]::MinValue
+  foreach ($path in $paths) {
+    if (-not (Test-Path $path)) {
+      continue
+    }
+    $item = Get-Item -LiteralPath $path
+    if (-not $item.PSIsContainer) {
+      if ($item.LastWriteTimeUtc -gt $latest) {
+        $latest = $item.LastWriteTimeUtc
+      }
+      continue
+    }
+    Get-ChildItem -LiteralPath $path -Recurse -File -Include *.rs,*.toml,*.json,build.rs -ErrorAction SilentlyContinue |
+      ForEach-Object {
+        if ($_.LastWriteTimeUtc -gt $latest) {
+          $latest = $_.LastWriteTimeUtc
+        }
+      }
+  }
+  return $latest
+}
+
+function Test-ProxyBuildRequired {
+  param([string]$ProxyExe)
+
+  if ($NoBuild) {
+    return $false
+  }
+  if ($env:CODESEEX_FORCE_BUILD -and $env:CODESEEX_FORCE_BUILD -ne "0") {
+    return $true
+  }
+  if (-not (Test-Path $ProxyExe)) {
+    return $true
+  }
+  $exeTime = (Get-Item -LiteralPath $ProxyExe).LastWriteTimeUtc
+  $sourceTime = Get-LatestProxyInputWriteTime
+  return $sourceTime -gt $exeTime
+}
+
+$buildCommand = @(
   "set `"CARGO_HOME=$env:CARGO_HOME`"",
   "set `"CARGO_TARGET_DIR=$env:CARGO_TARGET_DIR`"",
   "set `"TEMP=$env:TEMP`"",
@@ -47,13 +95,29 @@ $command = @(
   "set `"CODESEEX_PORT=$env:CODESEEX_PORT`""
 )
 if ($env:DEEPSEEK_BASE_URL) {
-  $command += "set `"DEEPSEEK_BASE_URL=$env:DEEPSEEK_BASE_URL`""
+  $buildCommand += "set `"DEEPSEEK_BASE_URL=$env:DEEPSEEK_BASE_URL`""
 }
-$command += @(
+$buildCommand += @(
   "`"$VsDevCmd`" -arch=x64 >nul",
   "cd /d `"$RepoRoot`"",
-  "`"$cargo`" run -p codeseex-proxy"
+  "`"$cargo`" build -p codeseex-proxy"
 )
 
-cmd /d /c ($command -join " && ")
+$proxyExe = Join-Path $env:CARGO_TARGET_DIR "debug\codeseex-proxy.exe"
+if (Test-ProxyBuildRequired -ProxyExe $proxyExe) {
+  Write-Host "Building CodeSeeX Next proxy ..."
+  cmd /d /c ($buildCommand -join " && ")
+  if ($LASTEXITCODE -ne 0) {
+    exit $LASTEXITCODE
+  }
+} else {
+  Write-Host "Skipping proxy Rust build; existing executable is up to date."
+}
+
+if (-not (Test-Path $proxyExe)) {
+  throw "Proxy executable was not found: $proxyExe"
+}
+
+Write-Host "Starting CodeSeeX Next proxy on http://127.0.0.1:$Port ..."
+& $proxyExe
 exit $LASTEXITCODE

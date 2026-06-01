@@ -45,6 +45,20 @@ $RepoRoot = Split-Path -Parent $PSScriptRoot
 $LogDir = Join-Path $DevRoot "Logs"
 $SmokeDir = Join-Path $DevRoot "Smoke"
 
+$trimPathChars = [char[]]@([System.IO.Path]::DirectorySeparatorChar, [System.IO.Path]::AltDirectorySeparatorChar)
+$resolvedDevRoot = [System.IO.Path]::GetFullPath($DevRoot).TrimEnd($trimPathChars)
+$resolvedDataDir = [System.IO.Path]::GetFullPath($DataDir).TrimEnd($trimPathChars)
+$devRootBoundary = $resolvedDevRoot + [System.IO.Path]::DirectorySeparatorChar
+$devRootAltBoundary = $resolvedDevRoot + [System.IO.Path]::AltDirectorySeparatorChar
+if ([string]::Equals($resolvedDataDir, $resolvedDevRoot, [System.StringComparison]::OrdinalIgnoreCase) -or
+    (-not $resolvedDataDir.StartsWith($devRootBoundary, [System.StringComparison]::OrdinalIgnoreCase) -and
+     -not $resolvedDataDir.StartsWith($devRootAltBoundary, [System.StringComparison]::OrdinalIgnoreCase))) {
+  throw "Refusing to reset smoke data outside DevRoot: $DataDir"
+}
+if (Test-Path $DataDir) {
+  Remove-Item -Recurse -Force -LiteralPath $DataDir
+}
+
 $env:CARGO_HOME = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $DevRoot "Cargo" }
 $env:CARGO_TARGET_DIR = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { Join-Path $DevRoot "CargoTarget" }
 $env:npm_config_cache = if ($env:npm_config_cache) { $env:npm_config_cache } else { Join-Path $DevRoot "npm-cache" }
@@ -146,7 +160,7 @@ const server = http.createServer((req, res) => {
     req.on("end", () => {
       const parsed = JSON.parse(body);
       fs.writeFileSync(payloadFile, JSON.stringify({ path: req.url, body: parsed }), "utf8");
-      if (!["deepseek-v4-pro", "deepseek-v4-flash"].includes(String(parsed.model || ""))) {
+      if (!["deepseek-v4-pro", "deepseek-v4-flash", "unknown-codex-model"].includes(String(parsed.model || ""))) {
         res.writeHead(400, { "content-type": "application/json" });
         res.end(JSON.stringify({ error: { code: "unsupported_model", message: `unsupported model ${parsed.model}` } }));
         return;
@@ -289,8 +303,9 @@ const server = http.createServer((req, res) => {
       }
       const applyPatchResult = toolMessages.find((message) => message.role === "tool" && message.tool_call_id === "call_apply_patch");
       if (applyPatchResult) {
-        const ok = String(applyPatchResult.content || "").includes("\"ok\":true")
-          && String(applyPatchResult.content || "").includes("apply-patch-smoke.txt");
+        const applyPatchContent = String(applyPatchResult.content || "");
+        const ok = (applyPatchContent.includes("\"ok\":true") || applyPatchContent.includes("Success."))
+          && applyPatchContent.includes("apply-patch-smoke.txt");
         sendAssistant(ok ? "apply-patch-tool-ok" : "apply-patch-tool-failed", "chatcmpl_context_smoke_apply_patch_final");
         return;
       }
@@ -644,25 +659,38 @@ process.stdin.on("end", () => {
   $streamCommunityToolRaw = Invoke-WebRequest -Method Post -Uri "http://127.0.0.1:$ProxyPort/v1/responses" -Headers @{ Authorization = "Bearer codex-test" } -Body $streamCommunityToolBody -ContentType "application/json" -TimeoutSec 15
   $streamCommunityToolText = [string]$streamCommunityToolRaw.Content
   $streamCommunityChecks = [ordered]@{
-    stream_has_function_call_item = $streamCommunityToolText.Contains("response.function_call_arguments.done")
+    stream_has_proxy_tool_item = $streamCommunityToolText.Contains('"type":"proxy_tool_call"')
+    stream_omits_client_function_call = -not $streamCommunityToolText.Contains("response.function_call_arguments.done")
     stream_has_final_text = $streamCommunityToolText.Contains("community-tool-ok")
   }
   $streamCommunityChecks | ConvertTo-Json -Depth 10
-  if (-not $streamCommunityChecks.stream_has_function_call_item -or -not $streamCommunityChecks.stream_has_final_text) {
-    throw "streaming community tool execution loop did not emit function call and final text"
+  if (-not $streamCommunityChecks.stream_has_proxy_tool_item -or -not $streamCommunityChecks.stream_omits_client_function_call -or -not $streamCommunityChecks.stream_has_final_text) {
+    throw "streaming community tool execution loop did not keep CodeSeeX tool client-inert"
   }
-  Write-Step "checking unknown Codex model fallback and duplicate tool deconfliction"
+  Write-Step "checking Codex lightweight model mapping, unknown default passthrough, and duplicate tool deconfliction"
   $fallbackModelBody = @{
     id = "resp_model_fallback"
     model = "gpt-5.4-mini"
     input = @(
-      @{ role = "user"; content = @(@{ type = "input_text"; text = "model fallback please" }) }
+      @{ role = "user"; content = @(@{ type = "input_text"; text = "model mapping please" }) }
     )
   } | ConvertTo-Json -Depth 20
   Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:$ProxyPort/v1/responses" -Headers @{ Authorization = "Bearer codex-test" } -Body $fallbackModelBody -ContentType "application/json" -TimeoutSec 15 | Out-Null
   $fallbackPayload = (Get-Content $payloadFile -Raw | ConvertFrom-Json).body
-  if ($fallbackPayload.model -ne "deepseek-v4-pro") {
-    throw "unknown Codex model was not mapped to deepseek-v4-pro in default mode"
+  if ($fallbackPayload.model -ne "deepseek-v4-flash") {
+    throw "Codex lightweight mini model was not mapped to deepseek-v4-flash in default mode"
+  }
+  $unknownModelBody = @{
+    id = "resp_unknown_model_fallback"
+    model = "unknown-codex-model"
+    input = @(
+      @{ role = "user"; content = @(@{ type = "input_text"; text = "unknown model passthrough please" }) }
+    )
+  } | ConvertTo-Json -Depth 20
+  Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:$ProxyPort/v1/responses" -Headers @{ Authorization = "Bearer codex-test" } -Body $unknownModelBody -ContentType "application/json" -TimeoutSec 15 | Out-Null
+  $unknownModelPayload = (Get-Content $payloadFile -Raw | ConvertFrom-Json).body
+  if ($unknownModelPayload.model -ne "unknown-codex-model") {
+    throw "unknown Codex model did not follow the requested TOML/default model in default mode"
   }
   $duplicateApplyPatchToolBody = @{
     id = "resp_duplicate_apply_patch_tool"
@@ -1216,9 +1244,9 @@ process.stdin.on("end", () => {
     throw "built-in tool call loop did not execute web_search successfully"
   }
 
-  Write-Step "checking apply_patch tool loop"
+  Write-Step "checking native apply_patch passthrough and replay"
   $applyPatchToolBody = @{
-    id = "resp_apply_patch_tool_loop"
+    id = "resp_apply_patch_native_call"
     model = "deepseek-v4-pro"
     input = @(
       @{ role = "user"; content = @(@{ type = "input_text"; text = "call apply_patch tool" }) }
@@ -1227,15 +1255,28 @@ process.stdin.on("end", () => {
   $applyPatchToolResponse = Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:$ProxyPort/v1/responses" -Headers @{ Authorization = "Bearer codex-test" } -Body $applyPatchToolBody -ContentType "application/json" -TimeoutSec 15
   $applyPatchToolEvents = Invoke-RestMethod -Method Get -Uri "http://127.0.0.1:$ProxyPort/api/events?limit=140" -TimeoutSec 5
   $applyPatchToolResultEvent = @($applyPatchToolEvents.events | Where-Object { $_.type -eq "tool_result" -and $_.detail.name -eq "apply_patch" } | Select-Object -Last 1)[0]
+  $applyPatchCallItem = @($applyPatchToolResponse.output | Where-Object { $_.type -eq "custom_tool_call" -and $_.name -eq "apply_patch" } | Select-Object -First 1)[0]
   $applyPatchToolChecks = [ordered]@{
-    response_output = $applyPatchToolResponse.output[0].content[0].text
+    response_has_custom_tool_call = [bool]$applyPatchCallItem
     file_content = (Get-Content -LiteralPath $applyPatchFixture -Raw).Trim()
-    tool_result_seen = [bool]$applyPatchToolResultEvent
-    tool_result_ok = if ($applyPatchToolResultEvent) { [bool]$applyPatchToolResultEvent.detail.ok } else { $false }
+    proxy_did_not_execute = -not [bool]$applyPatchToolResultEvent
   }
   $applyPatchToolChecks | ConvertTo-Json -Depth 10
-  if ($applyPatchToolChecks.response_output -ne "apply-patch-tool-ok" -or $applyPatchToolChecks.file_content -ne "after" -or -not $applyPatchToolChecks.tool_result_seen -or -not $applyPatchToolChecks.tool_result_ok) {
-    throw "apply_patch tool loop did not execute successfully"
+  if (-not $applyPatchToolChecks.response_has_custom_tool_call -or $applyPatchToolChecks.file_content -ne "before" -or -not $applyPatchToolChecks.proxy_did_not_execute) {
+    throw "apply_patch was not returned as native custom tool call without proxy execution"
+  }
+  $applyPatchReplayBody = @{
+    id = "resp_apply_patch_native_replay"
+    previous_response_id = "resp_apply_patch_native_call"
+    model = "deepseek-v4-pro"
+    input = @(
+      @{ type = "custom_tool_call_output"; call_id = "call_apply_patch"; output = "Exit code: 0`nWall time: 0 seconds`nOutput:`nSuccess. Updated the following files:`nM fixtures/apply-patch-smoke.txt`n" }
+    )
+  } | ConvertTo-Json -Depth 20
+  $applyPatchReplayResponse = Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:$ProxyPort/v1/responses" -Headers @{ Authorization = "Bearer codex-test" } -Body $applyPatchReplayBody -ContentType "application/json" -TimeoutSec 15
+  $applyPatchReplayOutput = $applyPatchReplayResponse.output[0].content[0].text
+  if ($applyPatchReplayOutput -ne "apply-patch-tool-ok") {
+    throw "apply_patch custom_tool_call_output was not replayed as a legal upstream tool result"
   }
 
   Write-Step "checking streaming built-in tool call loop"
@@ -1264,14 +1305,15 @@ process.stdin.on("end", () => {
   $streamToolPayload = $streamToolReceived.body
   $streamToolContent = ($streamToolPayload.messages | ForEach-Object { $_.content }) -join "`n"
   $streamToolChecks = [ordered]@{
-    stream_has_function_call_item = $streamToolText.Contains("response.function_call_arguments.done")
+    stream_has_proxy_tool_item = $streamToolText.Contains('"type":"proxy_tool_call"')
+    stream_omits_client_function_call = -not $streamToolText.Contains("response.function_call_arguments.done")
     stream_has_final_text = $streamToolText.Contains("tool-loop-ok")
     tool_result_seen = [bool]$streamToolResultEvent
     tool_result_ok = if ($streamToolResultEvent) { [bool]$streamToolResultEvent.detail.ok } else { $false }
     history_contains_tool_fact = $streamToolContent.Contains("Verified CodeSeeX tool execution facts") -and $streamToolContent.Contains("list_directory") -and $streamToolContent.Contains("Cargo.toml")
   }
   $streamToolChecks | ConvertTo-Json -Depth 10
-  if (-not $streamToolChecks.stream_has_function_call_item -or -not $streamToolChecks.stream_has_final_text -or -not $streamToolChecks.tool_result_seen -or -not $streamToolChecks.tool_result_ok -or -not $streamToolChecks.history_contains_tool_fact) {
+  if (-not $streamToolChecks.stream_has_proxy_tool_item -or -not $streamToolChecks.stream_omits_client_function_call -or -not $streamToolChecks.stream_has_final_text -or -not $streamToolChecks.tool_result_seen -or -not $streamToolChecks.tool_result_ok -or -not $streamToolChecks.history_contains_tool_fact) {
     throw "streaming built-in tool call loop did not execute and persist facts successfully"
   }
 

@@ -6,6 +6,13 @@ use std::fs;
 use std::net::{IpAddr, Ipv6Addr};
 use std::path::{Component, Path, PathBuf};
 
+pub(crate) mod chat_protocol;
+pub(crate) mod coordinator;
+pub(crate) mod hosted;
+pub(crate) mod ownership;
+pub(crate) mod registry;
+pub(crate) mod response_items;
+
 const MAX_DEPTH: usize = 4;
 const MAX_ENTRIES: usize = 200;
 const MAX_READ_LINES: usize = 220;

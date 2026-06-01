@@ -1,6 +1,7 @@
 param(
   [string]$VsDevCmd = $env:CODESEEX_VSDEVCMD,
-  [string]$DevRoot = "D:\DevTools\CodeSeeXNext"
+  [string]$DevRoot = "D:\DevTools\CodeSeeXNext",
+  [switch]$NoBuild
 )
 
 $ErrorActionPreference = "Stop"
@@ -94,6 +95,9 @@ function Get-LatestRustInputWriteTime {
 function Test-DesktopBuildRequired {
   param([string]$DesktopExe)
 
+  if ($NoBuild) {
+    return $false
+  }
   if ($env:CODESEEX_FORCE_BUILD -and $env:CODESEEX_FORCE_BUILD -ne "0") {
     return $true
   }

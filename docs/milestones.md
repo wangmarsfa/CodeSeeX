@@ -61,7 +61,7 @@ Current progress:
 - Inline `data:` URLs in tool facts are redacted to deterministic size/hash markers to protect prompt caching from binary payloads.
 - Request checkpoints persist context diagnostics, including current message count and verified fact count.
 - `/v1/responses/compact` returns a local readable compaction item without fake `encrypted_content`.
-- `npm run smoke:context:windows` starts a fake upstream plus the real proxy and verifies instructions, `previous_response_id` history, verified tool facts, completed parent output, failed parent safe replay, streaming parent persistence, manual compaction replay, native MCP/external tool passthrough and result replay, community command-tool execution, streaming built-in tool execution, and inline image redaction.
+- `npm run smoke:context:windows` starts a fake upstream plus the real proxy and verifies instructions, model mapping, `previous_response_id` history, verified tool facts, completed parent output, failed parent safe replay, streaming parent persistence, manual compaction replay, native MCP/external tool passthrough and result replay, community command-tool execution, streaming built-in tool execution, and inline image redaction.
 
 ## M4 Tool System
 
@@ -69,7 +69,7 @@ Add tools only after the base proxy and context state are proven.
 
 Acceptance criteria:
 
-- Apply Patch behaves like Codex native freeform patching.
+- Apply Patch behaves like Codex native freeform patching; CodeSeeX passes the native call to Codex and replays the later output instead of applying the patch itself.
 - MCP remains Codex-native and is not converted into fake CodeSeeX hosted tools.
 - Web Search avoids base64/image payloads entering model-visible text context and blocks local/private targets by default.
 - Community tools are disabled by default and isolated by design.
@@ -78,12 +78,12 @@ Current progress:
 
 - `/api/tools` now exposes system tools and built-in tool metadata for the desktop Tools page.
 - `ENABLED_TOOLS` is persisted as an enabled id array in TOML.
-- Apply Patch, Web Search, and MCP Server are represented as non-configurable system tools with built-in source labels; Apply Patch and Web Search have CodeSeeX execution while MCP remains Codex-native and is passed through without proxy execution.
-- `apply_patch` and `web_search` are always exposed as system executable tools; `apply_patch` applies Codex-style patches under the configured workspace root and returns stale-context recovery guidance on failure.
+- Apply Patch, Web Search, and MCP Server are represented as non-configurable system tools with built-in source labels; Web Search has CodeSeeX execution while Apply Patch and MCP remain Codex-native at the client boundary.
+- `apply_patch` and `web_search` are always exposed as system tools; `apply_patch` is passed through as a native custom tool call and `web_search` returns compact text evidence from CodeSeeX.
 - Codex-native MCP/external tool declarations from Responses `tools` are normalized into upstream Chat function tools, then mapped back to native Responses `function_call` items for Codex execution.
 - MCP/external `function_call_output` turns replay as legal Chat tool pairs only when the referenced previous response contains the matching function call; otherwise they remain verified facts.
 - `/v1/responses` now supports tool loops in non-streaming and streaming mode: system `web_search`, plus configurable built-ins `list_directory`, `read_file_range`, and `workspace_search`.
-- Streaming tool calls are emitted as native Responses `function_call` events, then CodeSeeX executes the bounded built-in tool, persists the verified fact, and continues the upstream stream.
+- Streaming regular built-in/community tool calls are emitted as display-only/proxy diagnostic output, then CodeSeeX executes the bounded tool, persists the verified fact, and continues the upstream stream. Apply Patch uses native `custom_tool_call` events and is executed by Codex.
 - Built-in tool calls write separate call/result events and persist verified tool facts to SQLite for later `previous_response_id` reconstruction.
 - Configurable built-in and community execution is gated by the persisted enabled-tool list; system tools are always enabled. Read-only tools revalidate workspace boundaries before touching files, and Web Search returns compact text-only evidence.
 - Community tool manifests are discovered from `~/.codeseex-next/extension/tools/<tool>/manifest.json` for the desktop Tools page.

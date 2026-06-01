@@ -35,12 +35,13 @@ impl UpstreamModelOverride {
 
 fn default_upstream_slug(requested: &str) -> String {
     let requested = requested.trim();
-    match requested.to_ascii_lowercase().as_str() {
+    let normalized = requested.to_ascii_lowercase();
+    match normalized.as_str() {
+        "" => MODEL_PRO.to_owned(),
         MODEL_FLASH => MODEL_FLASH.to_owned(),
         MODEL_PRO => MODEL_PRO.to_owned(),
-        "gpt-5.4-mini" | "gpt-5.5-mini" => MODEL_FLASH.to_owned(),
-        "gpt-5.4" | "gpt-5.5" => MODEL_PRO.to_owned(),
-        _ => MODEL_PRO.to_owned(),
+        value if value.starts_with("gpt-") && value.ends_with("-mini") => MODEL_FLASH.to_owned(),
+        _ => requested.to_owned(),
     }
 }
 
@@ -105,17 +106,22 @@ mod tests {
             MODEL_FLASH
         );
         assert_eq!(
-            UpstreamModelOverride::Default.upstream_slug("gpt-5.5-mini"),
+            UpstreamModelOverride::Default.upstream_slug("gpt-5.6-mini"),
             MODEL_FLASH
         );
         assert_eq!(
+            UpstreamModelOverride::Default.upstream_slug("unknown-model"),
+            "unknown-model"
+        );
+        assert_eq!(
             UpstreamModelOverride::Default.upstream_slug("gpt-5.4"),
-            MODEL_PRO
+            "gpt-5.4"
         );
         assert_eq!(
             UpstreamModelOverride::Default.upstream_slug("gpt-5.5"),
-            MODEL_PRO
+            "gpt-5.5"
         );
+        assert_eq!(UpstreamModelOverride::Default.upstream_slug(""), MODEL_PRO);
         assert_eq!(UpstreamModelOverride::Flash.upstream_slug("x"), MODEL_FLASH);
         assert_eq!(UpstreamModelOverride::Pro.upstream_slug("x"), MODEL_PRO);
     }

@@ -13,6 +13,7 @@ This checklist is the migration guardrail for replacing the Electron implementat
 
 - `model_catalog_json` points to a generated catalog that Codex App can read with and without language packs loaded.
 - `/v1/models` lists `deepseek-v4-flash` and `deepseek-v4-pro`.
+- Codex lightweight mini requests map to Flash; truly unknown requested models remain TOML/request-driven instead of being forced to Pro.
 - `/v1/chat/completions` supports non-streaming and streaming pass-through.
 - `/v1/responses` maps Codex Responses input to legal DeepSeek Chat messages.
 - Streaming tool loops preserve DeepSeek `reasoning_content` when an assistant message contains `tool_calls`.
@@ -34,8 +35,8 @@ This checklist is the migration guardrail for replacing the Electron implementat
 
 ## P0 Tool Parity
 
-- Apply Patch behaves as a Codex-native freeform editing capability from the model's perspective.
-- Apply Patch stays inside the configured workspace root and rejects escapes.
+- Apply Patch behaves as a Codex-native freeform editing capability; CodeSeeX must not also apply the same patch internally.
+- Apply Patch keeps Codex native workspace/sandbox behavior and rejects escapes through the native Codex tool layer.
 - Apply Patch failure returns stale-context recovery guidance.
 - Web Search is a system/built-in capability and does not expose a user switch.
 - Web Search returns compact text evidence and blocks local/private targets by default.
@@ -44,6 +45,7 @@ This checklist is the migration guardrail for replacing the Electron implementat
 - Built-in read-only tools are configurable and default enabled.
 - Community tools are disabled by default and only execute explicit command manifests.
 - Community tool execution uses no shell, minimal environment, timeout handling, and bounded stdout/stderr.
+- CodeSeeX-executed built-in/community tools must not stream client-executable Responses `function_call` items; they use display-only/proxy diagnostic output and continue the upstream loop with legal Chat tool results.
 
 ## P0 Desktop And UI
 
@@ -74,4 +76,3 @@ This checklist is the migration guardrail for replacing the Electron implementat
 - Real Codex App: manual compact, automatic compact-like long context replay, and post-compact follow-up.
 - Fake upstream: usage mapping, streaming tool loop with `reasoning_content`, upstream 400/500 errors, and interrupted stream.
 - Desktop smoke: fresh data dir, configured data dir, port conflict, tray actions, autostart read/write, and update check failure.
-
