@@ -8,6 +8,7 @@ use std::path::{Component, Path, PathBuf};
 
 pub(crate) mod chat_protocol;
 pub(crate) mod coordinator;
+pub(crate) mod diagnostics;
 pub(crate) mod hosted;
 pub(crate) mod ownership;
 pub(crate) mod registry;

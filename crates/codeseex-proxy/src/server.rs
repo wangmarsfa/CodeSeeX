@@ -1,4 +1,4 @@
-﻿use crate::app_state::ProxyState;
+use crate::app_state::ProxyState;
 use crate::http_response::{
     json_error, passthrough_stream_with_completion, response_content_type_json,
     response_from_bytes, response_from_stream,
@@ -8,10 +8,11 @@ use crate::manager_api::ensure_catalog;
 use crate::response_sse::{
     custom_tool_call_sse_added, custom_tool_call_sse_done, function_call_sse_added,
     function_call_sse_done, generic_output_item_sse_events, hidden_reasoning_item_sse_events,
-    message_item_sse_events, next_sequence, quote_thinking_delta, reasoning_done_sse_events,
-    reasoning_response_item, sse_bytes, sse_data, stream_failed_event,
+    message_item_sse_events, next_sequence, proxy_tool_call_sse_events, quote_thinking_delta,
+    reasoning_done_sse_events, reasoning_response_item, sse_bytes, sse_data, stream_failed_event,
     streaming_message_done_sse_events, take_sse_frame, thinking_display_added_sse_events,
-    thinking_display_delta_sse_event, thinking_display_done_sse_events, web_search_call_sse_events,
+    thinking_display_delta_sse_event, thinking_display_done_sse_events, thinking_display_prefix,
+    web_search_call_sse_events,
 };
 use crate::responses::context::{
     build_response_context, chat_messages_to_values, deterministic_compaction_summary,
@@ -27,6 +28,7 @@ use crate::responses::usage::{merge_response_usage, response_usage_from_chat_usa
 use crate::text::compact_line;
 use crate::tools::chat_protocol::chat_tool_calls_to_assistant_message;
 use crate::tools::coordinator::{complete_chat_with_tools, ToolLoopContext, ToolLoopResult};
+use crate::tools::diagnostics::ToolLoopDiagnostics;
 use crate::tools::hosted::{
     execute_code_tool, is_code_tool_executable, summarize_tool_result, tool_fact_line,
 };
@@ -801,6 +803,7 @@ fn response_stream_from_chat(params: StreamingResponseParams) -> axum::response:
 
             let visible_thinking_enabled = show_thinking_enabled(&config);
             let mut completed_tool_iterations = 0_u32;
+            let mut tool_loop_diagnostics = ToolLoopDiagnostics::default();
             while let Some(response) = next_response.take() {
                 let iteration = completed_tool_iterations;
                 let turn_item_id = format!("msg_{}", Uuid::new_v4().simple());
@@ -853,20 +856,7 @@ fn response_stream_from_chat(params: StreamingResponseParams) -> axum::response:
                                 output.push(item);
                             }
                             if thinking_open && !thinking_closed {
-                                let mut suffix = String::new();
-                                if !thinking_text.is_empty() && !thinking_text.ends_with('\n') {
-                                    suffix.push('\n');
-                                }
-                                suffix.push_str("---");
-                                thinking_text.push_str(&suffix);
                                 if let Some(current_output_index) = thinking_output_index {
-                                    yield thinking_display_delta_sse_event(
-                                        &response_id,
-                                        current_output_index,
-                                        &thinking_item_id,
-                                        &suffix,
-                                        &mut sequence,
-                                    );
                                     let (bytes, item) = thinking_display_done_sse_events(
                                         &response_id,
                                         current_output_index,
@@ -976,11 +966,13 @@ fn response_stream_from_chat(params: StreamingResponseParams) -> axum::response:
                                 let current_output_index = output_index;
                                 thinking_output_index = Some(current_output_index);
                                 output_index += 1;
-                                thinking_text.push_str("---\n**DeepSeek Thinking**\n");
+                                let thinking_prefix = thinking_display_prefix();
+                                thinking_text.push_str(thinking_prefix);
                                 yield thinking_display_added_sse_events(
                                     &response_id,
                                     current_output_index,
                                     &thinking_item_id,
+                                    thinking_prefix,
                                     &mut sequence,
                                 );
                             }
@@ -1201,6 +1193,20 @@ fn response_stream_from_chat(params: StreamingResponseParams) -> axum::response:
                     &community_tools,
                     &external_tool_context,
                 );
+                let diagnostic = tool_loop_diagnostics.record_iteration(
+                    iteration + 1,
+                    &all_tool_calls,
+                    &partition,
+                );
+                let _ = state
+                    .store
+                    .record_event(
+                        "debug",
+                        "tool_loop_iteration",
+                        "CodeSeeX streaming tool loop iteration.",
+                        Some(&json!({ "id": response_id, "diagnostic": diagnostic })),
+                    )
+                    .await;
                 if let Some(unknown) = partition.unknown.first() {
                     let message = format!(
                         "tool '{}' is not available to CodeSeeX Next or Codex",
@@ -1349,6 +1355,14 @@ fn response_stream_from_chat(params: StreamingResponseParams) -> axum::response:
                         }
                         Some("web_search_call") => {
                             yield web_search_call_sse_events(
+                                &response_id,
+                                current_output_index,
+                                &item,
+                                &mut sequence,
+                            );
+                        }
+                        Some("proxy_tool_call") => {
+                            yield proxy_tool_call_sse_events(
                                 &response_id,
                                 current_output_index,
                                 &item,
@@ -2086,6 +2100,38 @@ mod tests {
         .unwrap();
         assert!(events.contains("response.web_search_call.searching"));
         assert!(!events.contains("proxy_tool_call"));
+    }
+
+    #[test]
+    fn proxy_tool_call_sse_uses_in_progress_then_completed_lifecycle() {
+        let item = json!({
+            "id": "ptc_test",
+            "type": "proxy_tool_call",
+            "status": "completed",
+            "call_id": "call_test",
+            "name": "list_directory",
+            "arguments": "{\"path\":\".\"}"
+        });
+        let mut sequence = 0;
+        let events = String::from_utf8(
+            proxy_tool_call_sse_events("resp_tool", 0, &item, &mut sequence).to_vec(),
+        )
+        .unwrap();
+
+        let added = events
+            .find("response.output_item.added")
+            .expect("proxy tool call should emit added");
+        let in_progress = events
+            .find("\"status\":\"in_progress\"")
+            .expect("added proxy tool call should be in progress");
+        let done = events
+            .find("response.output_item.done")
+            .expect("proxy tool call should emit done");
+        let completed = events
+            .find("\"status\":\"completed\"")
+            .expect("done proxy tool call should be completed");
+        assert!(added < done, "{events}");
+        assert!(in_progress < completed, "{events}");
     }
 
     #[test]

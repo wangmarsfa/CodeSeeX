@@ -247,6 +247,7 @@ fn response_text_is_display_only(text: &str) -> bool {
     let text = text.trim();
     if text.starts_with("---\ncodeseex_display_only:")
         || text.starts_with("---\n**DeepSeek Thinking**")
+        || text.starts_with("**DeepSeek Thinking**")
         || text.starts_with("\u{5df2}\u{4f7f}\u{7528}\u{5de5}\u{5177} `")
         || text.starts_with("\u{4f7f}\u{7528}\u{5de5}\u{5177} `")
         || (text.starts_with("\u{5df2}\u{4f7f}\u{7528} ")
@@ -437,4 +438,19 @@ pub(crate) fn estimate_tokens_from_messages(messages: &[ChatMessage]) -> u64 {
 pub(crate) fn estimate_tokens_from_text(text: &str) -> u64 {
     let chars = text.chars().count();
     u64::try_from(chars.max(1).div_ceil(4)).unwrap_or(1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn display_only_detection_accepts_legacy_and_current_thinking_markdown() {
+        assert!(response_text_is_display_only(
+            "---\n**DeepSeek Thinking**\n> old format\n---"
+        ));
+        assert!(response_text_is_display_only(
+            "**DeepSeek Thinking**\n> current format"
+        ));
+    }
 }

@@ -63,7 +63,7 @@ async fn api_status(State(state): State<ProxyState>) -> impl IntoResponse {
     let runtime = state.store.runtime_summary(120).await.ok();
     let events = state
         .store
-        .recent_events(30, None)
+        .recent_visible_events(30, None)
         .await
         .map(|(events, _)| events)
         .unwrap_or_default();
@@ -451,7 +451,7 @@ async fn api_events(
 ) -> impl IntoResponse {
     match state
         .store
-        .recent_events(query.limit.unwrap_or(30), query.before.as_deref())
+        .recent_visible_events(query.limit.unwrap_or(30), query.before.as_deref())
         .await
     {
         Ok((events, has_more)) => Json(json!({

@@ -2,6 +2,7 @@ use crate::tools::chat_protocol::{
     assistant_message_from_chat_tool_subset, chat_tool_calls,
     full_assistant_tool_message_from_chat, normalize_assistant_tool_message,
 };
+use crate::tools::diagnostics::ToolLoopDiagnostics;
 use crate::tools::hosted::{
     execute_code_tool, is_code_tool_executable, summarize_tool_result, tool_fact_line,
 };
@@ -33,6 +34,7 @@ pub(crate) async fn complete_chat_with_tools(
     mut chat: Value,
 ) -> Result<ToolLoopResult, String> {
     let mut completed_tool_iterations = 0_u32;
+    let mut loop_diagnostics = ToolLoopDiagnostics::default();
     loop {
         let iteration = completed_tool_iterations;
         let tool_calls = chat_tool_calls(&chat);
@@ -44,6 +46,16 @@ pub(crate) async fn complete_chat_with_tools(
             context.community_tools,
             context.external_tool_context,
         );
+        let diagnostic = loop_diagnostics.record_iteration(iteration + 1, &tool_calls, &partition);
+        let _ = context
+            .store
+            .record_event(
+                "debug",
+                "tool_loop_iteration",
+                "CodeSeeX tool loop iteration.",
+                Some(&json!({ "id": context.request_id, "diagnostic": diagnostic })),
+            )
+            .await;
         if let Some(unknown) = partition.unknown.first() {
             return Err(format!(
                 "tool '{}' is not available to CodeSeeX Next or Codex",

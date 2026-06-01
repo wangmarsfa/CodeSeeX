@@ -282,6 +282,52 @@ impl Store {
         Ok((events, has_more))
     }
 
+    pub async fn recent_visible_events(
+        &self,
+        limit: u32,
+        before: Option<&str>,
+    ) -> Result<(Vec<EventRecord>, bool)> {
+        let limit = i64::from(limit.clamp(1, 200));
+        let fetch_limit = limit + 1;
+        let rows = if let Some(before) = before.filter(|value| !value.trim().is_empty()) {
+            sqlx::query(
+                r#"
+                SELECT id, level, event_type, message, detail_json, created_at
+                FROM events
+                WHERE level <> 'debug' AND created_at < ?1
+                ORDER BY created_at DESC, id DESC
+                LIMIT ?2;
+                "#,
+            )
+            .bind(before)
+            .bind(fetch_limit)
+            .fetch_all(&self.pool)
+            .await?
+        } else {
+            sqlx::query(
+                r#"
+                SELECT id, level, event_type, message, detail_json, created_at
+                FROM events
+                WHERE level <> 'debug'
+                ORDER BY created_at DESC, id DESC
+                LIMIT ?1;
+                "#,
+            )
+            .bind(fetch_limit)
+            .fetch_all(&self.pool)
+            .await?
+        };
+
+        let has_more = rows.len() > usize::try_from(limit).unwrap_or(200);
+        let mut events = rows
+            .into_iter()
+            .take(usize::try_from(limit).unwrap_or(200))
+            .map(|row| event_from_row(&row))
+            .collect::<Result<Vec<_>>>()?;
+        events.reverse();
+        Ok((events, has_more))
+    }
+
     pub async fn response_context_chain(
         &self,
         previous_response_id: &str,
@@ -916,6 +962,39 @@ mod tests {
             .await
             .expect_err("missing request should fail");
         assert!(error.to_string().contains("was not found"));
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn recent_visible_events_hides_debug_diagnostics() {
+        let path = temp_db_path("visible-events");
+        let store = Store::open(&path).await.expect("open store");
+
+        store
+            .record_event(
+                "debug",
+                "tool_loop_iteration",
+                "Internal diagnostic.",
+                Some(&json!({"call_id": "call_secret"})),
+            )
+            .await
+            .expect("record debug event");
+        store
+            .record_event("info", "request_received", "Visible event.", None)
+            .await
+            .expect("record info event");
+
+        let (all_events, _) = store.recent_events(10, None).await.expect("all events");
+        assert_eq!(all_events.len(), 2);
+
+        let (visible_events, _) = store
+            .recent_visible_events(10, None)
+            .await
+            .expect("visible events");
+        assert_eq!(visible_events.len(), 1);
+        assert_eq!(visible_events[0].level, "info");
+        assert_eq!(visible_events[0].event_type, "request_received");
 
         let _ = std::fs::remove_file(path);
     }

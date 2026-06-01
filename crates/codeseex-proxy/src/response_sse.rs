@@ -299,9 +299,9 @@ pub(crate) fn thinking_display_added_sse_events(
     response_id: &str,
     output_index: u64,
     item_id: &str,
+    prefix: &str,
     sequence: &mut u64,
 ) -> Bytes {
-    let prefix = "---\n**DeepSeek Thinking**\n";
     let item = thinking_display_stream_item(item_id, "");
     let mut added_item = item.clone();
     added_item["status"] = Value::String("in_progress".to_owned());
@@ -342,6 +342,10 @@ pub(crate) fn thinking_display_added_sse_events(
         }),
     ));
     Bytes::from(bytes)
+}
+
+pub(crate) fn thinking_display_prefix() -> &'static str {
+    "**DeepSeek Thinking**\n"
 }
 
 pub(crate) fn thinking_display_delta_sse_event(
@@ -513,6 +517,38 @@ pub(crate) fn generic_output_item_sse_events(
             "response_id": response_id,
             "output_index": output_index,
             "item": item,
+            "sequence_number": next_sequence(sequence)
+        }),
+    )
+    .to_vec();
+    bytes.extend_from_slice(&sse_bytes(
+        "response.output_item.done",
+        json!({
+            "type": "response.output_item.done",
+            "response_id": response_id,
+            "output_index": output_index,
+            "item": item,
+            "sequence_number": next_sequence(sequence)
+        }),
+    ));
+    Bytes::from(bytes)
+}
+
+pub(crate) fn proxy_tool_call_sse_events(
+    response_id: &str,
+    output_index: u64,
+    item: &Value,
+    sequence: &mut u64,
+) -> Bytes {
+    let mut added_item = item.clone();
+    added_item["status"] = Value::String("in_progress".to_owned());
+    let mut bytes = sse_bytes(
+        "response.output_item.added",
+        json!({
+            "type": "response.output_item.added",
+            "response_id": response_id,
+            "output_index": output_index,
+            "item": added_item,
             "sequence_number": next_sequence(sequence)
         }),
     )
