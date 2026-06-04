@@ -67,7 +67,7 @@ It should not directly know how to parse every tool, emit every SSE event, execu
 ## Proposed Rust Module Shape
 
 ```text
-crates/codeseex-core/src/
+crates/core/src/
   protocol/
     responses.rs       # Codex-facing request/response item types
     chat.rs            # DeepSeek/OpenAI-compatible Chat message/tool types
@@ -84,7 +84,7 @@ crates/codeseex-core/src/
   catalog.rs
   urls.rs
 
-crates/codeseex-proxy/src/
+crates/proxy/src/
   http/
     router.rs          # Axum routes only
     errors.rs          # HTTP error mapping
@@ -101,7 +101,7 @@ crates/codeseex-proxy/src/
     external.rs        # MCP/Codex passthrough adapters
   app_state.rs         # Shared app dependencies
 
-crates/codeseex-store/src/
+crates/store/src/
   request_repo.rs      # Request lifecycle and chain reconstruction
   event_repo.rs
   usage_repo.rs
@@ -303,7 +303,7 @@ Still intentionally left for later passes:
 - Internal Rust types and trait names.
 - Storage implementation details, if observable behavior stays equivalent.
 - Tool-loop diagnostics and safety caps.
-- Removal of dead paths such as proxy-side `apply_patch` execution, after tests prove the native path.
+- Proxy-side `apply_patch` execution has been removed; only native declaration, custom-tool response mapping, and output replay remain.
 
 ## What Must Not Be Changed Without A New Decision
 

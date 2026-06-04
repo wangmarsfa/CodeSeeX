@@ -43,9 +43,9 @@ function Get-LatestProxyInputWriteTime {
   $paths = @(
     (Join-Path $RepoRoot "Cargo.toml"),
     (Join-Path $RepoRoot "Cargo.lock"),
-    (Join-Path $RepoRoot "crates\codeseex-core"),
-    (Join-Path $RepoRoot "crates\codeseex-store"),
-    (Join-Path $RepoRoot "crates\codeseex-proxy")
+    (Join-Path $RepoRoot "crates\core"),
+    (Join-Path $RepoRoot "crates\store"),
+    (Join-Path $RepoRoot "crates\proxy")
   )
   $latest = [DateTime]::MinValue
   foreach ($path in $paths) {
@@ -105,7 +105,7 @@ $buildCommand += @(
 
 $proxyExe = Join-Path $env:CARGO_TARGET_DIR "debug\codeseex-proxy.exe"
 if (Test-ProxyBuildRequired -ProxyExe $proxyExe) {
-  Write-Host "Building CodeSeeX Next proxy ..."
+  Write-Host "Building CodeSeeX proxy ..."
   cmd /d /c ($buildCommand -join " && ")
   if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE
@@ -118,6 +118,6 @@ if (-not (Test-Path $proxyExe)) {
   throw "Proxy executable was not found: $proxyExe"
 }
 
-Write-Host "Starting CodeSeeX Next proxy on http://127.0.0.1:$Port ..."
+Write-Host "Starting CodeSeeX proxy on http://127.0.0.1:$Port ..."
 & $proxyExe
 exit $LASTEXITCODE

@@ -37,11 +37,13 @@ Acceptance criteria:
 Current progress:
 
 - Embedded proxy starts from the Tauri desktop setup path.
+- Desktop start/stop/restart now controls the embedded proxy through native Tauri commands and graceful shutdown, rather than fake HTTP no-op actions.
+- The Tauri UI reads `/api/*` management data through `desktop_manager_request`; direct HTTP `/api/*` remains only a compatibility/debug adapter.
 - Normal launch shows the main window; `--autostart` launch stays in the tray.
 - Native tray can persist model override, thinking mode, and sampling temperature.
 - Official Tauri autostart and single-instance plugins are wired.
 - Update checks query GitHub Releases silently and return red-dot-ready status data.
-- Inline proxy mode disables old start/stop/restart controls to avoid fake lifecycle actions.
+- Port conflicts no longer prevent the desktop window from opening; the embedded proxy failure is surfaced through runtime status.
 
 ## M3 High-Fidelity Context
 
@@ -61,7 +63,7 @@ Current progress:
 - Inline `data:` URLs in tool facts are redacted to deterministic size/hash markers to protect prompt caching from binary payloads.
 - Request checkpoints persist context diagnostics, including current message count and verified fact count.
 - `/v1/responses/compact` returns a local readable compaction item without fake `encrypted_content`.
-- `npm run smoke:context:windows` starts a fake upstream plus the real proxy and verifies instructions, model mapping, `previous_response_id` history, verified tool facts, completed parent output, failed parent safe replay, streaming parent persistence, manual compaction replay, native MCP/external tool passthrough and result replay, community command-tool execution, streaming built-in tool execution, and inline image redaction.
+- `.\scripts\context-fidelity-smoke-windows.ps1` starts a fake upstream plus the real proxy and verifies instructions, model mapping, `previous_response_id` history, verified tool facts, completed parent output, failed parent safe replay, streaming parent persistence, manual compaction replay, native MCP/external tool passthrough and result replay, community command-tool execution, streaming built-in tool execution, and inline image redaction.
 
 ## M4 Tool System
 

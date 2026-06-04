@@ -61,14 +61,12 @@ if (Test-Path $DataDir) {
 
 $env:CARGO_HOME = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $DevRoot "Cargo" }
 $env:CARGO_TARGET_DIR = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { Join-Path $DevRoot "CargoTarget" }
-$env:npm_config_cache = if ($env:npm_config_cache) { $env:npm_config_cache } else { Join-Path $DevRoot "npm-cache" }
 $env:TEMP = Join-Path $DevRoot "Temp"
 $env:TMP = $env:TEMP
 
 New-Item -ItemType Directory -Force -Path `
   $env:CARGO_HOME, `
   $env:CARGO_TARGET_DIR, `
-  $env:npm_config_cache, `
   $env:TEMP, `
   $DataDir, `
   $LogDir, `
@@ -106,7 +104,6 @@ if (-not (Test-Path $cargo)) {
 $payloadFile = Join-Path $SmokeDir "context-smoke-upstream-payload.json"
 $balanceFile = Join-Path $SmokeDir "context-smoke-balance-request.json"
 $authFile = Join-Path $SmokeDir "context-smoke-auth.json"
-$fakeServer = Join-Path $SmokeDir "context-smoke-upstream.js"
 $fakeOut = Join-Path $LogDir "context-smoke-upstream.out.log"
 $fakeErr = Join-Path $LogDir "context-smoke-upstream.err.log"
 $proxyOut = Join-Path $LogDir "context-smoke-proxy.out.log"
@@ -119,289 +116,7 @@ $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
 [System.IO.File]::WriteAllText($dataUrlFixture, "INLINE_DATA_URL=data:image/png;base64,AAAAAAAAAABBBBBBBBBB", $utf8NoBom)
 [System.IO.File]::WriteAllText($applyPatchFixture, "before", $utf8NoBom)
 
-@'
-const http = require("http");
-const fs = require("fs");
 
-const payloadFile = process.env.PAYLOAD_FILE;
-const balanceFile = process.env.BALANCE_FILE;
-const port = Number(process.env.FAKE_UPSTREAM_PORT || "8892");
-
-const server = http.createServer((req, res) => {
-  if (req.method === "GET" && req.url === "/web-fixture") {
-    res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
-    res.end("<!doctype html><html><head><title>CodeSeeX Web Fixture</title><script>window.noise = true;</script></head><body><main><h1>CodeSeeX Web Fixture</h1><p>WEB_SEARCH_FIXTURE_OK text evidence.</p></main></body></html>");
-    return;
-  }
-
-  if (req.method === "GET" && req.url === "/user/balance") {
-    fs.writeFileSync(balanceFile, JSON.stringify({ path: req.url, authorization: req.headers.authorization || "" }), "utf8");
-    res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify({
-      is_available: true,
-      balance_infos: [
-        {
-          currency: "CNY",
-          total_balance: "8.8",
-          granted_balance: "1.2",
-          topped_up_balance: "7.6"
-        }
-      ]
-    }));
-    return;
-  }
-
-  if (req.method === "POST" && (req.url === "/v1/chat/completions" || req.url === "/chat/completions")) {
-    let body = "";
-    req.setEncoding("utf8");
-    req.on("data", (chunk) => {
-      body += chunk;
-    });
-    req.on("end", () => {
-      const parsed = JSON.parse(body);
-      fs.writeFileSync(payloadFile, JSON.stringify({ path: req.url, body: parsed }), "utf8");
-      if (!["deepseek-v4-pro", "deepseek-v4-flash", "unknown-codex-model"].includes(String(parsed.model || ""))) {
-        res.writeHead(400, { "content-type": "application/json" });
-        res.end(JSON.stringify({ error: { code: "unsupported_model", message: `unsupported model ${parsed.model}` } }));
-        return;
-      }
-      const toolNames = (parsed.tools || []).map((tool) => tool && tool.function && tool.function.name).filter(Boolean);
-      if (new Set(toolNames).size !== toolNames.length) {
-        res.writeHead(400, { "content-type": "application/json" });
-        res.end(JSON.stringify({ error: { code: "duplicate_tools", message: "Tool names must be unique." } }));
-        return;
-      }
-      const messages = parsed.messages || [];
-      const messageText = messages.map((message) => String(message.content || "")).join("\n");
-      const lastUserText = [...messages].reverse().find((message) => message.role === "user")?.content || "";
-      if (String(lastUserText).includes("force upstream failure")) {
-        res.writeHead(500, { "content-type": "application/json" });
-        res.end(JSON.stringify({ error: { code: "forced_failure", message: "forced smoke failure" } }));
-        return;
-      }
-      function sendAssistant(content, id = "chatcmpl_context_smoke") {
-        if (parsed.stream) {
-          res.writeHead(200, { "content-type": "text/event-stream" });
-          res.write(`data: ${JSON.stringify({ id, choices: [{ delta: { content } }], usage: { prompt_tokens: 15, completion_tokens: 3, total_tokens: 18 } })}\r\n\r\n`);
-          res.end("data: [DONE]\r\n\r\n");
-          return;
-        }
-        res.writeHead(200, { "content-type": "application/json" });
-        res.end(JSON.stringify({
-          id,
-          object: "chat.completion",
-          created: Math.floor(Date.now() / 1000),
-          model: "deepseek-v4-pro",
-          choices: [
-            {
-              index: 0,
-              message: { role: "assistant", content },
-              finish_reason: "stop"
-            }
-          ],
-          usage: { prompt_tokens: 15, completion_tokens: 3, total_tokens: 18 }
-        }));
-      }
-      function sendToolCall(callId, name, args) {
-        if (parsed.stream) {
-          res.writeHead(200, { "content-type": "text/event-stream" });
-          res.write(`data: ${JSON.stringify({
-            id: "chatcmpl_context_smoke_" + name + "_call",
-            choices: [
-              {
-                delta: {
-                  tool_calls: [
-                    {
-                      index: 0,
-                      id: callId,
-                      type: "function",
-                      function: { name, arguments: JSON.stringify(args) }
-                    }
-                  ]
-                },
-                finish_reason: "tool_calls"
-              }
-            ],
-            usage: { prompt_tokens: 12, completion_tokens: 1, total_tokens: 13 }
-          })}\r\n\r\n`);
-          res.end("data: [DONE]\r\n\r\n");
-          return;
-        }
-        res.writeHead(200, { "content-type": "application/json" });
-        res.end(JSON.stringify({
-          id: `chatcmpl_context_smoke_${name}_call`,
-          object: "chat.completion",
-          created: Math.floor(Date.now() / 1000),
-          model: "deepseek-v4-pro",
-          choices: [
-            {
-              index: 0,
-              message: {
-                role: "assistant",
-                content: null,
-                tool_calls: [
-                  {
-                    id: callId,
-                    type: "function",
-                    function: { name, arguments: JSON.stringify(args) }
-                  }
-                ]
-              },
-              finish_reason: "tool_calls"
-            }
-          ],
-          usage: { prompt_tokens: 12, completion_tokens: 1, total_tokens: 13 }
-        }));
-      }
-      const toolMessages = messages;
-      const externalResult = toolMessages.find((message) => message.role === "tool" && message.tool_call_id === "call_external_smoke_add");
-      if (externalResult) {
-        const ok = String(externalResult.content || "").includes("42");
-        sendAssistant(ok ? "external-tool-result-ok" : "external-tool-result-missing", "chatcmpl_context_smoke_external_tool_final");
-        return;
-      }
-      const communityResult = toolMessages.find((message) => message.role === "tool" && message.tool_call_id === "call_community_smoke");
-      if (communityResult) {
-        const content = String(communityResult.content || "");
-        const ok = content.includes("community_smoke")
-          && content.includes("\"sum\":42")
-          && content.includes("\"mode\":\"fast\"");
-        sendAssistant(ok ? "community-tool-ok" : "community-tool-missing-result", "chatcmpl_context_smoke_community_tool_final");
-        return;
-      }
-      const listResult = toolMessages.find((message) => message.role === "tool" && message.tool_call_id === "call_list_directory");
-      if (listResult) {
-        const ok = String(listResult.content || "").includes("Cargo.toml");
-        sendAssistant(ok ? "tool-loop-ok" : "tool-loop-missing-cargo", "chatcmpl_context_smoke_list_directory_final");
-        return;
-      }
-      const readResult = toolMessages.find((message) => message.role === "tool" && message.tool_call_id === "call_read_file_range");
-      if (readResult) {
-        const ok = String(readResult.content || "").includes("[workspace]") || String(readResult.content || "").includes("members");
-        sendAssistant(ok ? "read-tool-ok" : "read-tool-missing-content", "chatcmpl_context_smoke_read_file_range_final");
-        return;
-      }
-      const dataUrlReadResult = toolMessages.find((message) => message.role === "tool" && message.tool_call_id === "call_data_url_read");
-      if (dataUrlReadResult) {
-        const content = String(dataUrlReadResult.content || "");
-        const ok = content.includes("[inline-data-url omitted") && !content.includes("AAAAAAAAAABBBBBBBBBB");
-        sendAssistant(ok ? "data-url-redacted-ok" : "data-url-leaked", "chatcmpl_context_smoke_data_url_read_final");
-        return;
-      }
-      const searchResult = toolMessages.find((message) => message.role === "tool" && message.tool_call_id === "call_workspace_search");
-      if (searchResult) {
-        const ok = String(searchResult.content || "").includes("CodeSeeX Next");
-        sendAssistant(ok ? "search-tool-ok" : "search-tool-missing-content", "chatcmpl_context_smoke_workspace_search_final");
-        return;
-      }
-      const webSearchResult = toolMessages.find((message) => message.role === "tool" && message.tool_call_id === "call_web_search");
-      if (webSearchResult) {
-        const ok = String(webSearchResult.content || "").includes("WEB_SEARCH_FIXTURE_OK")
-          && !String(webSearchResult.content || "").includes("window.noise");
-        sendAssistant(ok ? "web-search-tool-ok" : "web-search-tool-missing-content", "chatcmpl_context_smoke_web_search_final");
-        return;
-      }
-      const applyPatchResult = toolMessages.find((message) => message.role === "tool" && message.tool_call_id === "call_apply_patch");
-      if (applyPatchResult) {
-        const applyPatchContent = String(applyPatchResult.content || "");
-        const ok = (applyPatchContent.includes("\"ok\":true") || applyPatchContent.includes("Success."))
-          && applyPatchContent.includes("apply-patch-smoke.txt");
-        sendAssistant(ok ? "apply-patch-tool-ok" : "apply-patch-tool-failed", "chatcmpl_context_smoke_apply_patch_final");
-        return;
-      }
-      if (String(lastUserText).includes("call list_directory tool")) {
-        sendToolCall("call_list_directory", "list_directory", { path: ".", depth: 0 });
-        return;
-      }
-      if (String(lastUserText).includes("call disabled read tool")) {
-        sendToolCall("call_disabled_read_file_range", "read_file_range", { path: "Cargo.toml", start: 1, count: 2 });
-        return;
-      }
-      if (String(lastUserText).includes("call read_file_range tool")) {
-        sendToolCall("call_read_file_range", "read_file_range", { path: "Cargo.toml", start: 1, count: 8 });
-        return;
-      }
-      if (String(lastUserText).includes("call data_url read_file_range tool")) {
-        sendToolCall("call_data_url_read", "read_file_range", { path: "fixtures/data-url-smoke.txt", start: 1, count: 2 });
-        return;
-      }
-      if (String(lastUserText).includes("call workspace_search tool")) {
-        sendToolCall("call_workspace_search", "workspace_search", { query: "CodeSeeX Next", path: "README.md", max_results: 5 });
-        return;
-      }
-      if (String(lastUserText).includes("call web_search tool")) {
-        sendToolCall("call_web_search", "web_search", { mode: "open", url: `http://127.0.0.1:${port}/web-fixture` });
-        return;
-      }
-      if (String(lastUserText).includes("call apply_patch tool")) {
-        const patch = [
-          "*** Begin Patch",
-          "*** Update File: fixtures/apply-patch-smoke.txt",
-          "@@",
-          "-before",
-          "+after",
-          "*** End Patch"
-        ].join("\n");
-        sendToolCall("call_apply_patch", "apply_patch", { patch });
-        return;
-      }
-      if (String(lastUserText).includes("call external mcp smoke tool")) {
-        const tools = parsed.tools || [];
-        const hasExternalTool = tools.some((tool) => tool.function && tool.function.name === "smoke_add");
-        if (!hasExternalTool) {
-          sendAssistant("external-tool-not-forwarded", "chatcmpl_context_smoke_external_tool_missing");
-          return;
-        }
-        sendToolCall("call_external_smoke_add", "smoke_add", { a: 21, b: 21 });
-        return;
-      }
-      if (String(lastUserText).includes("call community smoke tool")) {
-        const tools = parsed.tools || [];
-        const hasCommunityTool = tools.some((tool) => tool.function && tool.function.name === "community_smoke");
-        if (!hasCommunityTool) {
-          sendAssistant("community-tool-not-forwarded", "chatcmpl_context_smoke_community_tool_missing");
-          return;
-        }
-        sendToolCall("call_community_smoke", "community_smoke", { a: 21, b: 21 });
-        return;
-      }
-      if (parsed.stream) {
-        res.writeHead(200, { "content-type": "text/event-stream" });
-        res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: "stream-" } }] })}\r\n\r\n`);
-        res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: "ok" } }], usage: { prompt_tokens: 11, completion_tokens: 2, total_tokens: 13 } })}\r\n\r\n`);
-        res.end("data: [DONE]\r\n\r\n");
-        return;
-      }
-      res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify({
-        id: "chatcmpl_context_smoke",
-        object: "chat.completion",
-        created: Math.floor(Date.now() / 1000),
-        model: "deepseek-v4-pro",
-        choices: [
-          {
-            index: 0,
-            message: { role: "assistant", content: "smoke-ok" },
-            finish_reason: "stop"
-          }
-        ],
-        usage: { prompt_tokens: 10, completion_tokens: 2, total_tokens: 12 }
-      }));
-    });
-    return;
-  }
-
-  res.writeHead(404, { "content-type": "text/plain" });
-  res.end(`not found ${req.method} ${req.url}`);
-});
-
-server.listen(port, "127.0.0.1", () => {
-  console.log(`fake-upstream-ready:${port}`);
-});
-
-process.on("SIGTERM", () => server.close(() => process.exit(0)));
-process.on("SIGINT", () => server.close(() => process.exit(0)));
-'@ | Set-Content -LiteralPath $fakeServer -Encoding UTF8
 
 $fake = $null
 $proxy = $null
@@ -415,7 +130,7 @@ try {
     "set `"TMP=$env:TMP`"",
     "`"$VsDevCmd`" -arch=x64 >nul",
     "cd /d `"$RepoRoot`"",
-    "`"$cargo`" build -p codeseex-proxy"
+    "`"$cargo`" build -p codeseex-proxy --bin codeseex-proxy --example context_smoke_upstream"
   ) -join " && "
   cmd /d /c $buildCommand
   if ($LASTEXITCODE -ne 0) {
@@ -426,7 +141,8 @@ try {
   $env:PAYLOAD_FILE = $payloadFile
   $env:BALANCE_FILE = $balanceFile
   $env:FAKE_UPSTREAM_PORT = [string]$FakeUpstreamPort
-  $fake = Start-Process -FilePath "node" -ArgumentList @($fakeServer) -PassThru -RedirectStandardOutput $fakeOut -RedirectStandardError $fakeErr -WindowStyle Hidden
+  $fakeExe = Join-Path $env:CARGO_TARGET_DIR "debug\examples\context_smoke_upstream.exe"
+  $fake = Start-Process -FilePath $fakeExe -PassThru -RedirectStandardOutput $fakeOut -RedirectStandardError $fakeErr -WindowStyle Hidden
   $fakeReady = Wait-TcpPort -HostName "127.0.0.1" -Port $FakeUpstreamPort -Retries 80 -DelayMs 100 -OnTick {
     if ($fake.HasExited) {
       throw "fake upstream exited early with code $($fake.ExitCode). stderr: $(Get-Content $fakeErr -Raw -ErrorAction SilentlyContinue)"
@@ -521,8 +237,8 @@ try {
     }
     execution = @{
       type = "command"
-      command = "node"
-      args = @("tool.js")
+      command = "powershell.exe"
+      args = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "tool.ps1")
       timeout_ms = 10000
     }
     config = @(
@@ -539,23 +255,26 @@ try {
     )
   } | ConvertTo-Json -Depth 20
   [System.IO.File]::WriteAllText((Join-Path $communityToolDir "manifest.json"), $communityManifest, $utf8NoBom)
-  @'
-let input = "";
-process.stdin.setEncoding("utf8");
-process.stdin.on("data", (chunk) => input += chunk);
-process.stdin.on("end", () => {
-  const payload = JSON.parse(input || "{}");
-  const args = payload.arguments || {};
-  const settings = payload.settings || {};
-  const sum = Number(args.a || 0) + Number(args.b || 0);
-  process.stdout.write(JSON.stringify({
-    ok: true,
-    tool: "community_smoke",
-    sum,
-    mode: settings.SMOKE_COMMUNITY_MODE || "unset"
-  }));
-});
-'@ | Set-Content -LiteralPath (Join-Path $communityToolDir "tool.js") -Encoding UTF8
+  $communityToolScript = @'
+$inputText = [Console]::In.ReadToEnd()
+if ([string]::IsNullOrWhiteSpace($inputText)) {
+  $payload = [pscustomobject]@{}
+} else {
+  $payload = $inputText | ConvertFrom-Json
+}
+$toolArgs = if ($payload.PSObject.Properties.Name -contains "arguments") { $payload.arguments } else { [pscustomobject]@{} }
+$settings = if ($payload.PSObject.Properties.Name -contains "settings") { $payload.settings } else { [pscustomobject]@{} }
+$a = if ($toolArgs.PSObject.Properties.Name -contains "a") { [int]$toolArgs.a } else { 0 }
+$b = if ($toolArgs.PSObject.Properties.Name -contains "b") { [int]$toolArgs.b } else { 0 }
+$mode = if ($settings.PSObject.Properties.Name -contains "SMOKE_COMMUNITY_MODE") { [string]$settings.SMOKE_COMMUNITY_MODE } else { "unset" }
+[Console]::Out.Write((@{
+  ok = $true
+  tool = "community_smoke"
+  sum = $a + $b
+  mode = $mode
+} | ConvertTo-Json -Compress))
+'@
+  [System.IO.File]::WriteAllText((Join-Path $communityToolDir "tool.ps1"), $communityToolScript, $utf8NoBom)
 
   $toolsResponse = Invoke-RestMethod -Method Get -Uri "http://127.0.0.1:$ProxyPort/api/tools" -TimeoutSec 5
   $toolIds = @($toolsResponse.tools | ForEach-Object { $_.id })
@@ -1074,16 +793,17 @@ process.stdin.on("end", () => {
   $compactChecks = [ordered]@{
     response_status = $compactResponse.status
     output_type = $compactItem.type
-    has_summary = $compactSummary.Contains("CodeSeeX compacted context")
+    has_summary = $compactSummary.Contains("CodeSeeX compacted conversation state")
     has_cargo_fact = $compactSummary.Contains("Cargo.toml")
-    omits_encrypted_content = -not ($compactItem.PSObject.Properties.Name -contains "encrypted_content")
+    has_encrypted_content = ($compactItem.PSObject.Properties.Name -contains "encrypted_content")
+    encrypted_content_has_prefix = ([string]$compactItem.encrypted_content).StartsWith("codeseex-compaction-v1:")
   }
   $compactChecks | ConvertTo-Json -Depth 10
   if ($compactChecks.response_status -ne "completed" -or $compactChecks.output_type -ne "compaction") {
     throw "manual compaction did not return a completed compaction item"
   }
-  if (-not $compactChecks.has_summary -or -not $compactChecks.has_cargo_fact -or -not $compactChecks.omits_encrypted_content) {
-    throw "manual compaction summary was incomplete or used fake encrypted content"
+  if (-not $compactChecks.has_summary -or -not $compactChecks.has_cargo_fact -or -not $compactChecks.has_encrypted_content -or -not $compactChecks.encrypted_content_has_prefix) {
+    throw "manual compaction summary was incomplete or encrypted payload was not a CodeSeeX compaction payload"
   }
 
   $compactChildBody = @{

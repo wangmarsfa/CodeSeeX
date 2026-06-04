@@ -35,8 +35,8 @@ Community tools are local CodeSeeX extensions installed under:
   },
   "execution": {
     "type": "command",
-    "command": "node",
-    "args": ["tool.js"],
+    "command": "my-tool.exe",
+    "args": [],
     "timeout_ms": 20000
   },
   "config": [

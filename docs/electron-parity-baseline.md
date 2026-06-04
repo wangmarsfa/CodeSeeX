@@ -1,6 +1,6 @@
 # CodeSeeX Electron Verified Logic Baseline
 
-This document records the verified behavior of the existing Electron/Node implementation before fixing the Tauri/Rust rewrite. It is the migration baseline: CodeSeeX Next must match these behaviors before adding new abstractions.
+This document records the verified behavior of the existing Electron implementation before fixing the Tauri/Rust rewrite. It is the migration baseline: CodeSeeX Next must match these behaviors before adding new abstractions.
 
 ## Why This Exists
 

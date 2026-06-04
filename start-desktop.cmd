@@ -6,6 +6,6 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\start-desktop-
 set "EXIT_CODE=%ERRORLEVEL%"
 
 echo.
-echo CodeSeeX Next desktop exited with code %EXIT_CODE%.
+echo CodeSeeX desktop exited with code %EXIT_CODE%.
 pause
 exit /b %EXIT_CODE%

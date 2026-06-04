@@ -37,7 +37,7 @@ This checklist is the migration guardrail for replacing the Electron implementat
 
 - Apply Patch behaves as a Codex-native freeform editing capability; CodeSeeX must not also apply the same patch internally.
 - Apply Patch keeps Codex native workspace/sandbox behavior and rejects escapes through the native Codex tool layer.
-- Apply Patch failure returns stale-context recovery guidance.
+- Apply Patch failures are replayed from Codex's native output; CodeSeeX must not synthesize a second patch attempt or mutate files internally.
 - Web Search is a system/built-in capability and does not expose a user switch.
 - Web Search returns compact text evidence and blocks local/private targets by default.
 - MCP remains Codex-native: CodeSeeX must not require users to move MCP configuration into CodeSeeX.

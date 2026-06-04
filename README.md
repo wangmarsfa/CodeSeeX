@@ -7,7 +7,7 @@ During development it uses `~/.codeseex-next` only to keep test data away from t
 ## Direction
 
 - Rust core for proxy, protocol conversion, catalog generation, state, and diagnostics.
-- Tauri 2 desktop shell with Svelte + TypeScript UI.
+- Tauri 2 desktop shell with static WebView assets.
 - SQLite for durable request state, usage, logs, and diagnostics.
 - TOML for readable user configuration.
 - External compatibility with the current CodeSeeX Codex setup: port `8787`, `deepseek-v4-flash`, `deepseek-v4-pro`, generated `config.toml`, and `model_catalog_json`.
@@ -26,10 +26,12 @@ M1 proxy loop is in place:
 M2 desktop management has started:
 
 - Tauri desktop shell starts the embedded proxy before showing the window.
-- The desktop manager currently reuses the proven CodeSeeX UI shell while the Rust/Tauri internals are migrated.
+- The desktop manager reuses the proven CodeSeeX UI shell while the Rust/Tauri internals are migrated.
+- In the desktop runtime, UI management calls go through Tauri commands instead of `127.0.0.1`, so the window can open even when the proxy port is occupied.
+- Start, stop, and restart control the embedded proxy through graceful shutdown rather than fake inline no-op actions.
 - Native tray supports quick model, thinking, and sampling-temperature changes.
 - Close-to-tray, start-at-login, single-instance guard, and silent update checks are wired through the desktop layer.
-- The old start/stop/restart controls are disabled in inline proxy mode so the UI does not imply a fake process manager.
+- HTTP `/api/*` routes remain as compatibility/debug adapters; Codex compatibility is provided by `/v1/*`.
 
 M3 context fidelity has started:
 
@@ -44,7 +46,7 @@ M4 tool migration has started:
 
 - `/api/tools` exposes the first system and built-in tool registry for the desktop Tools page.
 - Tool enablement is persisted to TOML as an enabled id array; system tools such as Apply Patch and MCP do not expose client switches.
-- `apply_patch` is exposed as a system executable tool, uses the Codex-style patch grammar, stays inside the configured workspace root, and returns retry guidance when exact context matching fails.
+- `apply_patch` is exposed as a system/native capability only; CodeSeeX declares it to the upstream model and replays Codex's later `custom_tool_call_output`, but never applies patches internally.
 - Codex-native MCP/external tools are passed through from Responses `tools` to the upstream model without proxy execution; tool calls are returned to Codex as native `function_call` items and later `function_call_output` turns replay as legal Chat tool pairs.
 - `/v1/responses` can execute the first built-in tools in both non-streaming and streaming mode: `list_directory`, `read_file_range`, `workspace_search`, and `web_search`.
 - Streaming tool calls are surfaced as native Responses `function_call` events before CodeSeeX executes the bounded built-in tool and continues the upstream conversation.
@@ -62,9 +64,6 @@ Rust is required for the core workspace.
 ```sh
 cargo run -p codeseex-proxy
 cargo test --workspace
-npm install
-npm run dev:ui
-npm run dev:desktop
 ```
 
 If Rust is not installed, install it from <https://rustup.rs/> and reopen the terminal so `cargo` is available in `PATH`.
@@ -72,13 +71,12 @@ If Rust is not installed, install it from <https://rustup.rs/> and reopen the te
 On Windows, use the helper script when working from a normal PowerShell session:
 
 ```powershell
-npm run check:windows
-npm run smoke:context:windows
-npm run start:proxy:windows
-npm run start:desktop:windows
+.\scripts\check-windows.ps1
+.\scripts\context-fidelity-smoke-windows.ps1
+.\scripts\start-desktop-windows.ps1
 ```
 
-The script loads MSVC Build Tools, keeps Cargo/npm caches on `D:\DevTools\CodeSeeXNext` when available, and then checks the Rust crates plus the Svelte UI.
+The scripts load MSVC Build Tools, keep Cargo caches on `D:\DevTools\CodeSeeXNext` when available, and check or launch the Rust/Tauri workspace. The desktop UI is served from `apps/ui/public` through Tauri's custom protocol; there is no Vite dev server in the normal workflow.
 
 For a quick desktop smoke test from Explorer or `cmd.exe`, run:
 

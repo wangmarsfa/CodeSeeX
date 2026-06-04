@@ -1,0 +1,1874 @@
+use super::*;
+use crate::responses::context::{response_history_messages, response_output_tool_call_messages};
+use crate::tools::chat_protocol::assistant_message_from_chat_tool_subset;
+use crate::tools::ownership::ChatToolCall;
+use codeseex_core::config::UpstreamConfig;
+use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+
+#[derive(Clone, Default)]
+struct FakeUpstreamState {
+    requests: Arc<Mutex<Vec<Value>>>,
+}
+
+fn test_config(data_dir: PathBuf) -> AppConfig {
+    AppConfig {
+        data_dir,
+        ..Default::default()
+    }
+}
+
+fn test_config_with_upstream(data_dir: PathBuf, fake_addr: SocketAddr) -> AppConfig {
+    AppConfig {
+        data_dir,
+        upstream: UpstreamConfig {
+            base_url: format!("http://{fake_addr}"),
+            official_v1_compat: false,
+            api_key: Some("test-key".to_owned()),
+            timeout_ms: 30_000,
+        },
+        ..Default::default()
+    }
+}
+
+fn temp_workspace(label: &str) -> PathBuf {
+    std::env::temp_dir().join(format!("codeseex-next-{label}-{}", Uuid::new_v4().simple()))
+}
+
+#[tokio::test]
+async fn serve_with_shutdown_exits_after_listening() {
+    let data_dir = temp_workspace("serve-shutdown");
+    let mut config = test_config(data_dir.clone());
+    config.port = 0;
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
+    let result = serve_with_shutdown(
+        config,
+        async move {
+            let _ = shutdown_rx.await;
+        },
+        move || {
+            let _ = started_tx.send(());
+            let _ = shutdown_tx.send(());
+        },
+    )
+    .await;
+
+    assert!(started_rx.await.is_ok(), "listening callback should run");
+    assert!(result.is_ok(), "server should stop cleanly: {result:?}");
+    let _ = std::fs::remove_dir_all(data_dir);
+}
+
+async fn fake_streaming_chat_completions(
+    State(state): State<FakeUpstreamState>,
+    Json(payload): Json<Value>,
+) -> axum::response::Response {
+    let request_index = {
+        let mut requests = state.requests.lock().expect("fake upstream lock poisoned");
+        requests.push(payload);
+        requests.len()
+    };
+    let body = if request_index == 1 {
+        concat!(
+                "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"need directory\"}}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_ls\",\"type\":\"function\",\"function\":{\"name\":\"list_directory\",\"arguments\":\"{\\\"path\\\":\\\".\\\"}\"}}]}}]}\n\n",
+                "data: [DONE]\n\n"
+            )
+            .to_owned()
+    } else {
+        concat!(
+                "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"after tool\"}}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{\"content\":\"directory checked\"}}],\"usage\":{\"prompt_tokens\":10,\"prompt_cache_hit_tokens\":4,\"completion_tokens\":2,\"total_tokens\":12}}\n\n",
+                "data: [DONE]\n\n"
+            )
+            .to_owned()
+    };
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .body(Body::from(body))
+        .expect("fake upstream response should build")
+}
+
+async fn fake_mixed_streaming_chat_completions(
+    State(state): State<FakeUpstreamState>,
+    Json(payload): Json<Value>,
+) -> axum::response::Response {
+    let request_index = {
+        let mut requests = state.requests.lock().expect("fake upstream lock poisoned");
+        requests.push(payload);
+        requests.len()
+    };
+    let body = if request_index == 1 {
+        concat!(
+                "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"need directory first\"}}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{\"tool_calls\":[",
+                "{\"index\":0,\"id\":\"call_ls\",\"type\":\"function\",\"function\":{\"name\":\"list_directory\",\"arguments\":\"{\\\"path\\\":\\\".\\\"}\"}},",
+                "{\"index\":1,\"id\":\"call_js\",\"type\":\"function\",\"function\":{\"name\":\"js\",\"arguments\":\"{\\\"code\\\":\\\"1+1\\\"}\"}}",
+                "]}}]}\n\n",
+                "data: [DONE]\n\n"
+            )
+            .to_owned()
+    } else {
+        concat!(
+                "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_js_2\",\"type\":\"function\",\"function\":{\"name\":\"js\",\"arguments\":\"{\\\"code\\\":\\\"1+1\\\"}\"}}]}}]}\n\n",
+                "data: [DONE]\n\n"
+            )
+            .to_owned()
+    };
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .body(Body::from(body))
+        .expect("fake upstream response should build")
+}
+
+async fn fake_web_search_streaming_chat_completions(
+    State(state): State<FakeUpstreamState>,
+    Json(payload): Json<Value>,
+) -> axum::response::Response {
+    let has_tool_result = payload
+        .get("messages")
+        .and_then(Value::as_array)
+        .map(|messages| {
+            messages.iter().any(|message| {
+                message.get("role").and_then(Value::as_str) == Some("tool")
+                    && message.get("tool_call_id").and_then(Value::as_str) == Some("call_web")
+            })
+        })
+        .unwrap_or(false);
+    {
+        let mut requests = state.requests.lock().expect("fake upstream lock poisoned");
+        requests.push(payload);
+    }
+    let body = if has_tool_result {
+        concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"web-search-result-handled\"}}]}\n\n",
+            "data: [DONE]\n\n"
+        )
+        .to_owned()
+    } else {
+        concat!(
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"need web evidence\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_web\",\"type\":\"function\",\"function\":{\"name\":\"web_search\",\"arguments\":\"{\\\"mode\\\":\\\"open\\\"}\"}}]}}]}\n\n",
+            "data: [DONE]\n\n"
+        )
+        .to_owned()
+    };
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .body(Body::from(body))
+        .expect("fake upstream response should build")
+}
+
+async fn fake_web_search_chat_completions(
+    State(state): State<FakeUpstreamState>,
+    Json(payload): Json<Value>,
+) -> axum::response::Response {
+    let has_tool_result = payload
+        .get("messages")
+        .and_then(Value::as_array)
+        .map(|messages| {
+            messages.iter().any(|message| {
+                message.get("role").and_then(Value::as_str) == Some("tool")
+                    && message.get("tool_call_id").and_then(Value::as_str) == Some("call_web")
+            })
+        })
+        .unwrap_or(false);
+    {
+        let mut requests = state.requests.lock().expect("fake upstream lock poisoned");
+        requests.push(payload);
+    }
+    if has_tool_result {
+        return Json(json!({
+            "choices": [{
+                "message": { "role": "assistant", "content": "web-search-result-handled" }
+            }],
+            "usage": { "prompt_tokens": 10, "completion_tokens": 3, "total_tokens": 13 }
+        }))
+        .into_response();
+    }
+    Json(json!({
+        "choices": [{
+            "finish_reason": "tool_calls",
+            "message": {
+                "role": "assistant",
+                "content": null,
+                "reasoning_content": "need web evidence",
+                "tool_calls": [{
+                    "id": "call_web",
+                    "type": "function",
+                    "function": {
+                        "name": "web_search",
+                        "arguments": "{\"mode\":\"open\"}"
+                    }
+                }]
+            }
+        }],
+        "usage": { "prompt_tokens": 8, "completion_tokens": 2, "total_tokens": 10 }
+    }))
+    .into_response()
+}
+
+async fn fake_apply_patch_streaming_chat_completions(
+    State(state): State<FakeUpstreamState>,
+    Json(payload): Json<Value>,
+) -> axum::response::Response {
+    let has_tool_result = payload
+        .get("messages")
+        .and_then(Value::as_array)
+        .map(|messages| {
+            messages.iter().any(|message| {
+                message.get("role").and_then(Value::as_str) == Some("tool")
+                    && message.get("tool_call_id").and_then(Value::as_str) == Some("call_patch")
+            })
+        })
+        .unwrap_or(false);
+    {
+        let mut requests = state.requests.lock().expect("fake upstream lock poisoned");
+        requests.push(payload);
+    }
+    let body = if has_tool_result {
+        concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"patch-ok\"}}]}\n\n",
+            "data: [DONE]\n\n"
+        )
+        .to_owned()
+    } else {
+        concat!(
+                "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"patch the file natively\"}}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_patch\",\"type\":\"function\",\"function\":{\"name\":\"apply_patch\",\"arguments\":\"{\\\"patch\\\":\\\"*** Begin Patch\\\\n*** Add File: target/codeseex-next-apply-patch-streaming-test/hello.txt\\\\n+hello\\\\n*** End Patch\\\"}\"}}]}}]}\n\n",
+                "data: [DONE]\n\n"
+            )
+            .to_owned()
+    };
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .body(Body::from(body))
+        .expect("fake upstream response should build")
+}
+
+async fn fake_reasoning_then_content_streaming_chat_completions(
+    State(state): State<FakeUpstreamState>,
+    Json(payload): Json<Value>,
+) -> axum::response::Response {
+    {
+        let mut requests = state.requests.lock().expect("fake upstream lock poisoned");
+        requests.push(payload);
+    }
+    let body = concat!(
+        "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"think before answering\"}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{\"content\":\"final answer\"}}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .body(Body::from(body))
+        .expect("fake upstream response should build")
+}
+
+async fn fake_final_chat_completions(
+    State(state): State<FakeUpstreamState>,
+    Json(payload): Json<Value>,
+) -> axum::response::Response {
+    {
+        let mut requests = state.requests.lock().expect("fake upstream lock poisoned");
+        requests.push(payload);
+    }
+    Json(json!({
+        "choices": [{
+            "message": { "role": "assistant", "content": "tool result acknowledged" }
+        }],
+        "usage": { "prompt_tokens": 10, "completion_tokens": 3, "total_tokens": 13 }
+    }))
+    .into_response()
+}
+
+#[test]
+fn maps_chat_usage_to_responses_usage_shape() {
+    let usage = json!({
+        "prompt_tokens": 100,
+        "prompt_cache_hit_tokens": 60,
+        "completion_tokens": 20,
+        "completion_tokens_details": { "reasoning_tokens": 7 },
+        "total_tokens": 120
+    });
+
+    let mapped = response_usage_from_chat_usage(Some(&usage));
+
+    assert_eq!(mapped["input_tokens"], 100);
+    assert_eq!(mapped["cached_input_tokens"], 60);
+    assert_eq!(mapped["cache_miss_input_tokens"], 40);
+    assert_eq!(mapped["input_tokens_details"]["cached_tokens"], 60);
+    assert_eq!(mapped["output_tokens"], 20);
+    assert_eq!(mapped["reasoning_output_tokens"], 7);
+    assert_eq!(mapped["output_tokens_details"]["reasoning_tokens"], 7);
+    assert_eq!(mapped["total_tokens"], 120);
+}
+
+#[test]
+fn mapped_response_keeps_codex_completion_metadata() {
+    let chat = json!({
+        "choices": [{
+            "message": { "role": "assistant", "content": "ok" }
+        }],
+        "usage": { "prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12 }
+    });
+
+    let response = chat_completion_to_response("resp_test", "deepseek-v4-pro", chat, true);
+
+    assert_eq!(response["status"], "completed");
+    assert_eq!(response["error"], Value::Null);
+    assert_eq!(response["incomplete_details"], Value::Null);
+    assert_eq!(response["parallel_tool_calls"], true);
+    assert_eq!(response["usage"]["input_tokens"], 10);
+    assert_eq!(response["usage"]["output_tokens"], 2);
+}
+
+#[test]
+fn chat_payload_forwards_codex_generation_parameters() {
+    let config = test_config(std::env::temp_dir().join(format!(
+        "codeseex-next-payload-params-test-{}",
+        Uuid::new_v4().simple()
+    )));
+    let request = json!({
+        "temperature": 0.7,
+        "top_p": 0.8,
+        "max_output_tokens": 1234,
+        "text": { "format": { "type": "json_schema" } },
+        "reasoning": { "effort": "xhigh" }
+    });
+    let mut payload = json!({
+        "model": "deepseek-v4-pro",
+        "messages": [],
+        "stream": true
+    });
+
+    normalize_chat_payload(&config, &request, &mut payload);
+
+    assert_eq!(payload["temperature"], json!(0.7));
+    assert_eq!(payload["top_p"], json!(0.8));
+    assert_eq!(payload["max_tokens"], json!(1234));
+    assert_eq!(payload["response_format"], json!({ "type": "json_object" }));
+    assert_eq!(payload["thinking"], json!({ "type": "enabled" }));
+    assert_eq!(payload["stream_options"], json!({ "include_usage": true }));
+}
+
+#[test]
+fn configured_temperature_overrides_request_temperature() {
+    let config = AppConfig {
+        temperature: codeseex_core::models::TemperaturePreset::Strict,
+        ..Default::default()
+    };
+    let mut payload = json!({
+        "model": "deepseek-v4-pro",
+        "messages": [],
+        "stream": false
+    });
+
+    normalize_chat_payload(&config, &json!({ "temperature": 1.5 }), &mut payload);
+
+    assert_eq!(payload["temperature"], json!(0.0));
+}
+
+#[test]
+fn tool_choice_none_is_not_rewritten_to_auto() {
+    let tools = vec![json!({
+        "type": "function",
+        "function": { "name": "read_file_range" }
+    })];
+
+    assert_eq!(
+        normalized_tool_choice(Some(&json!("none")), &tools),
+        Some(json!("none"))
+    );
+    assert_eq!(
+        normalized_tool_choice(
+            Some(&json!({ "type": "function", "function": { "name": "read_file_range" } })),
+            &tools
+        ),
+        Some(json!({ "type": "function", "function": { "name": "read_file_range" } }))
+    );
+}
+
+#[test]
+fn compact_threshold_accepts_codex_context_management_shapes() {
+    assert_eq!(resolve_compact_threshold(Some(&json!(1200))), Some(1200));
+    assert_eq!(
+        resolve_compact_threshold(Some(&json!({ "compaction": { "threshold": 3400 } }))),
+        Some(3400)
+    );
+    assert_eq!(
+        resolve_compact_threshold(Some(&json!([{ "token_threshold": 5600 }]))),
+        Some(5600)
+    );
+    assert_eq!(resolve_compact_threshold(Some(&json!(false))), None);
+}
+
+#[test]
+fn automatic_compaction_is_not_appended_to_client_tool_calls() {
+    let mut response = json!({
+        "output": [{
+            "type": "custom_tool_call",
+            "name": "apply_patch",
+            "call_id": "call_patch",
+            "input": "*** Begin Patch\n*** End Patch"
+        }]
+    });
+    let item = json!({ "type": "compaction", "summary": [] });
+
+    assert!(!append_auto_compaction_if_safe(&mut response, Some(&item)));
+    assert_eq!(response["output"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn streaming_tool_loop_preserves_deepseek_reasoning_content() {
+    let tool_calls = vec![ChatToolCall {
+        id: "call_abc".to_owned(),
+        name: "list_directory".to_owned(),
+        arguments: r#"{"path":"."}"#.to_owned(),
+    }];
+
+    let message =
+        chat_tool_calls_to_assistant_message(&tool_calls, "", "look up the directory first");
+
+    assert_eq!(message["role"], "assistant");
+    assert_eq!(message["content"], "");
+    assert_eq!(message["reasoning_content"], "look up the directory first");
+    assert_eq!(message["tool_calls"][0]["id"], "call_abc");
+    assert_eq!(
+        message["tool_calls"][0]["function"]["name"],
+        "list_directory"
+    );
+    assert_eq!(
+        message["tool_calls"][0]["function"]["arguments"],
+        r#"{"path":"."}"#
+    );
+}
+
+#[test]
+fn mixed_native_and_code_tool_replay_keeps_only_executed_code_tools() {
+    let chat = json!({
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "reasoning_content": "inspect before patching",
+                "tool_calls": [
+                    {
+                        "id": "call_code",
+                        "type": "function",
+                        "function": {
+                            "name": "list_directory",
+                            "arguments": "{\"path\":\".\"}"
+                        }
+                    },
+                    {
+                        "id": "call_patch",
+                        "type": "function",
+                        "function": {
+                            "name": "apply_patch",
+                            "arguments": "{\"patch\":\"*** Begin Patch\\n*** End Patch\"}"
+                        }
+                    }
+                ]
+            }
+        }]
+    });
+    let code_tool_calls = vec![ChatToolCall {
+        id: "call_code".to_owned(),
+        name: "list_directory".to_owned(),
+        arguments: r#"{"path":"."}"#.to_owned(),
+    }];
+
+    let assistant = assistant_message_from_chat_tool_subset(&chat, &code_tool_calls);
+
+    assert_eq!(assistant["reasoning_content"], "inspect before patching");
+    let calls = assistant["tool_calls"].as_array().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0]["id"], "call_code");
+    assert_eq!(calls[0]["function"]["name"], "list_directory");
+}
+
+#[test]
+fn internal_code_tools_keep_codeseex_ownership_without_client_function_calls() {
+    let chat = json!({
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_internal",
+                        "type": "function",
+                        "function": {
+                            "name": "list_directory",
+                            "arguments": "{\"path\":\".\"}"
+                        }
+                    },
+                    {
+                        "id": "call_external",
+                        "type": "function",
+                        "function": {
+                            "name": "js",
+                            "arguments": "{\"code\":\"1+1\"}"
+                        }
+                    }
+                ]
+            }
+        }]
+    });
+    let tool_context = crate::tool_passthrough::ToolContext::from_request_tools(Some(&json!([
+        {
+            "type": "function",
+            "function": {
+                "name": "list_directory",
+                "description": "A colliding client-side tool that must not override CodeSeeX internal ownership.",
+                "parameters": { "type": "object", "properties": {} }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "js",
+                "description": "Run JavaScript.",
+                "parameters": { "type": "object", "properties": {} }
+            }
+        }
+    ])));
+
+    let response = chat_completion_tool_calls_to_response(
+        "resp_test",
+        "deepseek-v4-pro",
+        chat,
+        &crate::community_tools::CommunityToolSet::default(),
+        &tool_context,
+        true,
+    );
+    let output = response["output"].as_array().unwrap();
+
+    assert!(output.iter().any(|item| {
+        item.get("type").and_then(Value::as_str) == Some("proxy_tool_call")
+            && item.get("name").and_then(Value::as_str) == Some("list_directory")
+    }));
+    assert!(output.iter().any(|item| {
+        item.get("type").and_then(Value::as_str) == Some("function_call")
+            && item.get("name").and_then(Value::as_str) == Some("js")
+            && item.get("call_id").and_then(Value::as_str) == Some("call_external")
+    }));
+    assert!(!output.iter().any(|item| {
+        item.get("type").and_then(Value::as_str) == Some("function_call")
+            && item.get("name").and_then(Value::as_str) == Some("list_directory")
+    }));
+}
+
+#[test]
+fn internal_code_tools_do_not_trigger_external_passthrough() {
+    let tool_calls = vec![ChatToolCall {
+        id: "call_internal".to_owned(),
+        name: "workspace_search".to_owned(),
+        arguments: r#"{"query":"needle"}"#.to_owned(),
+    }];
+    let community_tools = crate::community_tools::CommunityToolSet::default();
+    let external_tool_context =
+        crate::tool_passthrough::ToolContext::from_request_tools(Some(&json!([
+            {
+                "type": "function",
+                "function": {
+                    "name": "workspace_search",
+                    "description": "A colliding client-side tool.",
+                    "parameters": { "type": "object", "properties": {} }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "js",
+                    "description": "Run JavaScript.",
+                    "parameters": { "type": "object", "properties": {} }
+                }
+            }
+        ])));
+
+    let partition = partition_tool_calls(tool_calls, &community_tools, &external_tool_context);
+    assert_eq!(partition.code.len(), 1);
+    assert!(partition.external.is_empty());
+    assert!(partition.unknown.is_empty());
+}
+
+#[test]
+fn web_search_maps_to_native_response_item_not_proxy_tool_item() {
+    let chat = json!({
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_web",
+                    "type": "function",
+                    "function": {
+                        "name": "web_search",
+                        "arguments": "{\"query\":\"today weather\"}"
+                    }
+                }]
+            }
+        }]
+    });
+    let response = chat_completion_tool_calls_to_response(
+        "resp_web",
+        "deepseek-v4-pro",
+        chat,
+        &crate::community_tools::CommunityToolSet::default(),
+        &crate::tool_passthrough::ToolContext::default(),
+        true,
+    );
+    let output = response["output"].as_array().unwrap();
+
+    assert!(output.iter().any(|item| {
+        item.get("type").and_then(Value::as_str) == Some("web_search_call")
+            && item.get("call_id").and_then(Value::as_str) == Some("call_web")
+    }));
+    assert!(!output.iter().any(|item| {
+        item.get("type").and_then(Value::as_str) == Some("proxy_tool_call")
+            && item.get("name").and_then(Value::as_str) == Some("web_search")
+    }));
+    let web_item = output
+        .iter()
+        .find(|item| item.get("type").and_then(Value::as_str) == Some("web_search_call"))
+        .unwrap();
+    let mut sequence = 0;
+    let events = String::from_utf8(
+        web_search_call_sse_events("resp_web", 0, web_item, &mut sequence).to_vec(),
+    )
+    .unwrap();
+    assert!(events.contains("response.web_search_call.searching"));
+    assert!(!events.contains("proxy_tool_call"));
+}
+
+#[test]
+fn web_search_open_page_sse_uses_opening_event() {
+    let item = json!({
+        "id": "ws_open",
+        "type": "web_search_call",
+        "status": "completed",
+        "call_id": "call_web",
+        "action": { "type": "open_page", "url": "https://example.com/" }
+    });
+    let mut sequence = 0;
+    let events =
+        String::from_utf8(web_search_call_sse_events("resp_web", 0, &item, &mut sequence).to_vec())
+            .unwrap();
+
+    assert!(events.contains("response.web_search_call.opening"));
+    assert!(!events.contains("response.web_search_call.searching"));
+}
+
+#[test]
+fn proxy_tool_call_sse_uses_in_progress_then_completed_lifecycle() {
+    let item = json!({
+        "id": "ptc_test",
+        "type": "proxy_tool_call",
+        "status": "completed",
+        "call_id": "call_test",
+        "name": "list_directory",
+        "arguments": "{\"path\":\".\"}"
+    });
+    let mut sequence = 0;
+    let events = String::from_utf8(
+        proxy_tool_call_sse_events("resp_tool", 0, &item, &mut sequence).to_vec(),
+    )
+    .unwrap();
+
+    let added = events
+        .find("response.output_item.added")
+        .expect("proxy tool call should emit added");
+    let in_progress = events
+        .find("\"status\":\"in_progress\"")
+        .expect("added proxy tool call should be in progress");
+    let done = events
+        .find("response.output_item.done")
+        .expect("proxy tool call should emit done");
+    let completed = events
+        .find("\"status\":\"completed\"")
+        .expect("done proxy tool call should be completed");
+    assert!(added < done, "{events}");
+    assert!(in_progress < completed, "{events}");
+}
+
+#[test]
+fn proxy_visible_items_preserve_tool_order_while_grouping_proxy_usage() {
+    let calls = vec![
+        ChatToolCall {
+            id: "call_ls_1".to_owned(),
+            name: "list_directory".to_owned(),
+            arguments: r#"{"path":"."}"#.to_owned(),
+        },
+        ChatToolCall {
+            id: "call_web".to_owned(),
+            name: "web_search".to_owned(),
+            arguments: r#"{"query":"CodeSeeX"}"#.to_owned(),
+        },
+        ChatToolCall {
+            id: "call_ls_2".to_owned(),
+            name: "workspace_search".to_owned(),
+            arguments: r#"{"query":"needle"}"#.to_owned(),
+        },
+    ];
+
+    let items = proxy_visible_response_items(&calls);
+    let types = items
+        .iter()
+        .map(|item| item.get("type").and_then(Value::as_str).unwrap_or(""))
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        types,
+        vec![
+            "message",
+            "proxy_tool_call",
+            "web_search_call",
+            "message",
+            "proxy_tool_call"
+        ]
+    );
+    assert_eq!(items[1]["call_id"], "call_ls_1");
+    assert_eq!(items[2]["call_id"], "call_web");
+    assert_eq!(items[4]["call_id"], "call_ls_2");
+}
+
+#[tokio::test]
+async fn streaming_closes_thinking_before_final_content() {
+    let fake_state = FakeUpstreamState::default();
+    let fake_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let fake_addr = fake_listener.local_addr().unwrap();
+    let fake_app = Router::new()
+        .route(
+            "/chat/completions",
+            post(fake_reasoning_then_content_streaming_chat_completions),
+        )
+        .with_state(fake_state);
+    tokio::spawn(async move {
+        axum::serve(fake_listener, fake_app).await.unwrap();
+    });
+
+    let data_dir = std::env::temp_dir().join(format!(
+        "codeseex-next-thinking-order-test-{}",
+        Uuid::new_v4().simple()
+    ));
+    let config = test_config_with_upstream(data_dir, fake_addr);
+    let store = Store::open(&config.database_path()).await.unwrap();
+    let proxy_state = ProxyState {
+        config: Arc::new(config),
+        client: reqwest::Client::new(),
+        store,
+    };
+    let proxy_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    let proxy_app = Router::new()
+        .route("/v1/responses", post(responses))
+        .with_state(proxy_state);
+    tokio::spawn(async move {
+        axum::serve(proxy_listener, proxy_app).await.unwrap();
+    });
+
+    let body = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/responses"))
+        .json(&json!({
+            "id": "resp_stream_thinking_order",
+            "model": "deepseek-v4-pro",
+            "stream": true,
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "answer once" }]
+            }]
+        }))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+
+    let reasoning_done = body
+        .find("response.reasoning_summary_text.done")
+        .expect("reasoning should be closed");
+    let thinking_done = body
+        .find("\"codeseex_display_only\":\"thinking_markdown\"")
+        .expect("thinking display item should be emitted");
+    let content_delta = body
+        .find("\"delta\":\"final answer\"")
+        .expect("final content should stream");
+    assert!(reasoning_done < content_delta, "{body}");
+    assert!(thinking_done < content_delta, "{body}");
+}
+
+#[tokio::test]
+async fn streaming_internal_tools_execute_inside_proxy_without_client_function_call() {
+    let fake_state = FakeUpstreamState::default();
+    let fake_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let fake_addr = fake_listener.local_addr().unwrap();
+    let fake_app = Router::new()
+        .route("/chat/completions", post(fake_streaming_chat_completions))
+        .with_state(fake_state.clone());
+    tokio::spawn(async move {
+        axum::serve(fake_listener, fake_app).await.unwrap();
+    });
+
+    let data_dir = std::env::temp_dir().join(format!(
+        "codeseex-next-streaming-test-{}",
+        Uuid::new_v4().simple()
+    ));
+    let config = test_config_with_upstream(data_dir, fake_addr);
+    let store = Store::open(&config.database_path()).await.unwrap();
+    let proxy_state = ProxyState {
+        config: Arc::new(config),
+        client: reqwest::Client::new(),
+        store,
+    };
+    let proxy_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    let proxy_app = Router::new()
+        .route("/v1/responses", post(responses))
+        .with_state(proxy_state);
+    tokio::spawn(async move {
+        axum::serve(proxy_listener, proxy_app).await.unwrap();
+    });
+
+    let body = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/responses"))
+        .json(&json!({
+            "id": "resp_stream_internal_tool",
+            "model": "deepseek-v4-pro",
+            "stream": true,
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{ "type": "input_text", "text": "list files then answer" }]
+                }
+            ]
+        }))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+
+    assert!(
+        body.contains("response.reasoning_summary_text.delta"),
+        "{body}"
+    );
+    assert!(body.contains("DeepSeek Thinking"), "{body}");
+    assert!(body.contains("codeseex_display_only"), "{body}");
+    assert_eq!(
+        body.matches("\"delta\":\"**DeepSeek Thinking**\\n\"")
+            .count(),
+        1,
+        "{body}"
+    );
+    assert!(body.contains("after tool"), "{body}");
+    assert!(body.contains("已使用工具 `list_directory`"), "{body}");
+    assert!(body.contains("\"type\":\"proxy_tool_call\""), "{body}");
+    assert!(body.contains("directory checked"), "{body}");
+    assert!(
+        !body.contains("response.function_call_arguments.delta"),
+        "{body}"
+    );
+    assert!(!body.contains("\"type\":\"function_call\""), "{body}");
+    assert!(!body.contains("unsupported call"), "{body}");
+    let reasoning_done = body
+        .find("response.reasoning_summary_text.done")
+        .expect("reasoning should close before tool display");
+    let thinking_added = body
+        .find("\"codeseex_display_only\":\"thinking_markdown\"")
+        .expect("thinking display should be emitted before tool display");
+    let proxy_tool = body
+        .find("\"type\":\"proxy_tool_call\"")
+        .expect("proxy tool item should be emitted");
+    assert!(reasoning_done < proxy_tool, "{body}");
+    assert!(thinking_added < proxy_tool, "{body}");
+
+    let requests = fake_state
+        .requests
+        .lock()
+        .expect("fake upstream lock poisoned")
+        .clone();
+    assert_eq!(requests.len(), 2);
+    let second_messages = requests[1]["messages"].as_array().unwrap();
+    let assistant_tool_message = second_messages
+        .iter()
+        .find(|message| {
+            message.get("role").and_then(Value::as_str) == Some("assistant")
+                && message.get("tool_calls").is_some()
+        })
+        .expect("second upstream request should include assistant tool call message");
+    assert_eq!(
+        assistant_tool_message["reasoning_content"],
+        "need directory"
+    );
+    assert!(second_messages.iter().any(|message| {
+        message.get("role").and_then(Value::as_str) == Some("tool")
+            && message.get("tool_call_id").and_then(Value::as_str) == Some("call_ls")
+    }));
+}
+
+#[tokio::test]
+async fn current_input_tool_outputs_replay_as_chat_tool_protocol() {
+    let fake_state = FakeUpstreamState::default();
+    let fake_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let fake_addr = fake_listener.local_addr().unwrap();
+    let fake_app = Router::new()
+        .route("/chat/completions", post(fake_final_chat_completions))
+        .with_state(fake_state.clone());
+    tokio::spawn(async move {
+        axum::serve(fake_listener, fake_app).await.unwrap();
+    });
+
+    let data_dir = std::env::temp_dir().join(format!(
+        "codeseex-next-current-tool-replay-test-{}",
+        Uuid::new_v4().simple()
+    ));
+    let config = test_config_with_upstream(data_dir, fake_addr);
+    let store = Store::open(&config.database_path()).await.unwrap();
+    let proxy_state = ProxyState {
+        config: Arc::new(config),
+        client: reqwest::Client::new(),
+        store,
+    };
+    let proxy_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    let proxy_app = Router::new()
+        .route("/v1/responses", post(responses))
+        .with_state(proxy_state);
+    tokio::spawn(async move {
+        axum::serve(proxy_listener, proxy_app).await.unwrap();
+    });
+
+    let response = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/responses"))
+        .json(&json!({
+            "id": "resp_current_tool_replay",
+            "model": "deepseek-v4-pro",
+            "stream": false,
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{ "type": "input_text", "text": "test a shell tool" }]
+                },
+                {
+                    "type": "reasoning",
+                    "summary": [{ "type": "summary_text", "text": "create the test file first" }]
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_shell",
+                    "name": "shell_command",
+                    "arguments": "{\"command\":\"echo ok\"}"
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_shell",
+                    "output": "Exit code: 0\nOutput:\nok\n"
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{ "type": "input_text", "text": "continue" }]
+                }
+            ],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "shell_command",
+                    "description": "Run shell command.",
+                    "parameters": { "type": "object", "properties": {} }
+                }
+            }]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert!(response.status().is_success());
+    let requests = fake_state
+        .requests
+        .lock()
+        .expect("fake upstream lock poisoned")
+        .clone();
+    assert_eq!(requests.len(), 1);
+    let messages = requests[0]["messages"].as_array().unwrap();
+    let assistant = messages
+        .iter()
+        .find(|message| {
+            message.get("role").and_then(Value::as_str) == Some("assistant")
+                && message.get("tool_calls").is_some()
+        })
+        .expect("upstream should receive the prior assistant tool call");
+    assert_eq!(assistant["reasoning_content"], "create the test file first");
+    assert_eq!(
+        assistant["tool_calls"][0]["function"]["name"],
+        "shell_command"
+    );
+    assert!(messages.iter().any(|message| {
+        message.get("role").and_then(Value::as_str) == Some("tool")
+            && message.get("tool_call_id").and_then(Value::as_str) == Some("call_shell")
+            && message
+                .get("content")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .contains("ok")
+    }));
+}
+
+#[tokio::test]
+async fn previous_response_history_pairs_tool_outputs_with_parent_calls() {
+    let data_dir = std::env::temp_dir().join(format!(
+        "codeseex-next-history-tool-pair-test-{}",
+        Uuid::new_v4().simple()
+    ));
+    let config = test_config(data_dir);
+    let store = Store::open(&config.database_path()).await.unwrap();
+    let state = ProxyState {
+        config: Arc::new(config),
+        client: reqwest::Client::new(),
+        store,
+    };
+
+    state
+        .store
+        .checkpoint_request(
+            "resp_parent",
+            None,
+            Some("deepseek-v4-pro"),
+            &json!({
+                "input": [{
+                    "type": "message",
+                    "role": "user",
+                    "content": [{ "type": "input_text", "text": "run a shell command" }]
+                }]
+            }),
+        )
+        .await
+        .unwrap();
+    state
+        .store
+        .finish_request(
+            "resp_parent",
+            RequestStatus::Completed,
+            Some(&json!({
+                "output": [{
+                    "type": "function_call",
+                    "call_id": "call_shell",
+                    "name": "shell_command",
+                    "arguments": "{\"command\":\"echo ok\"}"
+                }]
+            })),
+            None,
+        )
+        .await
+        .unwrap();
+    state
+        .store
+        .checkpoint_request(
+            "resp_child",
+            Some("resp_parent"),
+            Some("deepseek-v4-pro"),
+            &json!({
+                "input": [{
+                    "type": "function_call_output",
+                    "call_id": "call_shell",
+                    "output": "Exit code: 0\nOutput:\nok\n"
+                }]
+            }),
+        )
+        .await
+        .unwrap();
+    state
+        .store
+        .finish_request(
+            "resp_child",
+            RequestStatus::Completed,
+            Some(&json!({
+                "output": [{
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{ "type": "output_text", "text": "done" }]
+                }]
+            })),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let messages = response_history_messages(&state, Some("resp_child")).await;
+
+    assert!(messages.iter().any(|message| {
+        message.role == "assistant"
+            && message
+                .tool_calls
+                .as_ref()
+                .and_then(|calls| calls.first())
+                .and_then(|call| call.pointer("/function/name"))
+                .and_then(Value::as_str)
+                == Some("shell_command")
+    }));
+    assert!(messages.iter().any(|message| {
+        message.role == "tool"
+            && message.tool_call_id.as_deref() == Some("call_shell")
+            && message.content.contains("ok")
+    }));
+    assert!(messages
+        .last()
+        .map(|message| message.role == "assistant" && message.content == "done")
+        .unwrap_or(false));
+}
+
+#[tokio::test]
+async fn previous_response_history_prefers_persisted_turn_messages() {
+    let data_dir = std::env::temp_dir().join(format!(
+        "codeseex-next-turn-message-history-test-{}",
+        Uuid::new_v4().simple()
+    ));
+    let config = test_config(data_dir);
+    let store = Store::open(&config.database_path()).await.unwrap();
+    let state = ProxyState {
+        config: Arc::new(config),
+        client: reqwest::Client::new(),
+        store,
+    };
+
+    state
+        .store
+        .checkpoint_request(
+            "resp_turn",
+            None,
+            Some("deepseek-v4-pro"),
+            &json!({"input":"ignored once turn messages exist"}),
+        )
+        .await
+        .unwrap();
+    state
+        .store
+        .replace_request_turn_messages(
+            "resp_turn",
+            &[
+                json!({"role":"user","content":"list files"}),
+                json!({
+                    "role":"assistant",
+                    "content":"",
+                    "reasoning_content":"need directory first",
+                    "tool_calls":[{
+                        "id":"call_ls",
+                        "type":"function",
+                        "function":{"name":"list_directory","arguments":"{\"path\":\".\"}"}
+                    }]
+                }),
+                json!({"role":"tool","tool_call_id":"call_ls","content":"Cargo.toml"}),
+                json!({"role":"assistant","content":"I saw Cargo.toml."}),
+            ],
+        )
+        .await
+        .unwrap();
+    state
+        .store
+        .finish_request(
+            "resp_turn",
+            RequestStatus::Completed,
+            Some(&json!({
+                "output": [{
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{ "type": "output_text", "text": "fallback must not duplicate" }]
+                }]
+            })),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let messages = response_history_messages(&state, Some("resp_turn")).await;
+    assert_eq!(messages.len(), 4);
+    assert_eq!(
+        messages[1].reasoning_content.as_deref(),
+        Some("need directory first")
+    );
+    assert_eq!(messages[2].tool_call_id.as_deref(), Some("call_ls"));
+    assert_eq!(messages[3].content, "I saw Cargo.toml.");
+}
+
+#[tokio::test]
+async fn streaming_mixed_internal_and_external_tools_runs_internal_first() {
+    let fake_state = FakeUpstreamState::default();
+    let fake_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let fake_addr = fake_listener.local_addr().unwrap();
+    let fake_app = Router::new()
+        .route(
+            "/chat/completions",
+            post(fake_mixed_streaming_chat_completions),
+        )
+        .with_state(fake_state.clone());
+    tokio::spawn(async move {
+        axum::serve(fake_listener, fake_app).await.unwrap();
+    });
+
+    let data_dir = std::env::temp_dir().join(format!(
+        "codeseex-next-mixed-streaming-test-{}",
+        Uuid::new_v4().simple()
+    ));
+    let config = test_config_with_upstream(data_dir, fake_addr);
+    let store = Store::open(&config.database_path()).await.unwrap();
+    let proxy_state = ProxyState {
+        config: Arc::new(config),
+        client: reqwest::Client::new(),
+        store,
+    };
+    let proxy_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    let proxy_app = Router::new()
+        .route("/v1/responses", post(responses))
+        .with_state(proxy_state);
+    tokio::spawn(async move {
+        axum::serve(proxy_listener, proxy_app).await.unwrap();
+    });
+
+    let body = reqwest::Client::new()
+            .post(format!("http://{proxy_addr}/v1/responses"))
+            .json(&json!({
+                "id": "resp_stream_mixed_tool",
+                "model": "deepseek-v4-pro",
+                "stream": true,
+                "input": [
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{ "type": "input_text", "text": "use local files and js" }]
+                    }
+                ],
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "list_directory",
+                            "description": "Colliding client tool that must not take internal ownership.",
+                            "parameters": { "type": "object", "properties": {} }
+                        }
+                    },
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "js",
+                            "description": "External JavaScript tool.",
+                            "parameters": { "type": "object", "properties": {} }
+                        }
+                    }
+                ]
+            }))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+
+    assert!(
+        body.contains("response.function_call_arguments.delta"),
+        "{body}"
+    );
+    assert!(body.contains("\"name\":\"js\""), "{body}");
+    assert!(body.contains("已使用工具 `list_directory`"), "{body}");
+    assert!(body.contains("\"type\":\"proxy_tool_call\""), "{body}");
+    assert!(
+        !body.contains(
+            "\"name\":\"list_directory\",\"status\":\"completed\",\"type\":\"function_call\""
+        ),
+        "{body}"
+    );
+    assert!(!body.contains("unsupported call"), "{body}");
+
+    let requests = fake_state
+        .requests
+        .lock()
+        .expect("fake upstream lock poisoned")
+        .clone();
+    assert_eq!(requests.len(), 1);
+}
+
+#[tokio::test]
+async fn non_streaming_web_search_emits_replayable_output_item() {
+    let fake_state = FakeUpstreamState::default();
+    let fake_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let fake_addr = fake_listener.local_addr().unwrap();
+    let fake_app = Router::new()
+        .route("/chat/completions", post(fake_web_search_chat_completions))
+        .with_state(fake_state.clone());
+    tokio::spawn(async move {
+        axum::serve(fake_listener, fake_app).await.unwrap();
+    });
+
+    let data_dir = std::env::temp_dir().join(format!(
+        "codeseex-next-web-search-non-stream-output-test-{}",
+        Uuid::new_v4().simple()
+    ));
+    let config = test_config_with_upstream(data_dir, fake_addr);
+    let store = Store::open(&config.database_path()).await.unwrap();
+    let proxy_state = ProxyState {
+        config: Arc::new(config),
+        client: reqwest::Client::new(),
+        store,
+    };
+    let proxy_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    let proxy_app = Router::new()
+        .route("/v1/responses", post(responses))
+        .with_state(proxy_state);
+    tokio::spawn(async move {
+        axum::serve(proxy_listener, proxy_app).await.unwrap();
+    });
+
+    let body = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/responses"))
+        .json(&json!({
+            "id": "resp_non_stream_web_search_output",
+            "model": "deepseek-v4-pro",
+            "stream": false,
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "use web search" }]
+            }]
+        }))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+
+    assert!(body.contains("\"type\":\"web_search_call\""), "{body}");
+    assert!(
+        body.contains("\"type\":\"web_search_call_output\""),
+        "{body}"
+    );
+    assert!(body.contains("missing_url"), "{body}");
+    assert!(body.contains("web-search-result-handled"), "{body}");
+    let call_item = body
+        .find("\"type\":\"web_search_call\"")
+        .expect("web_search call item should be present");
+    let output_item = body
+        .find("\"type\":\"web_search_call_output\"")
+        .expect("web_search output item should be present");
+    let final_text = body
+        .find("web-search-result-handled")
+        .expect("final answer should be present after tool result");
+    assert!(call_item < output_item, "{body}");
+    assert!(output_item < final_text, "{body}");
+
+    let requests = fake_state
+        .requests
+        .lock()
+        .expect("fake upstream lock poisoned")
+        .clone();
+    assert_eq!(requests.len(), 2);
+    let second_messages = requests[1]["messages"].as_array().unwrap();
+    assert!(second_messages.iter().any(|message| {
+        message.get("role").and_then(Value::as_str) == Some("tool")
+            && message.get("tool_call_id").and_then(Value::as_str) == Some("call_web")
+            && message
+                .get("content")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .contains("missing_url")
+    }));
+}
+
+#[tokio::test]
+async fn streaming_web_search_emits_replayable_output_item() {
+    let fake_state = FakeUpstreamState::default();
+    let fake_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let fake_addr = fake_listener.local_addr().unwrap();
+    let fake_app = Router::new()
+        .route(
+            "/chat/completions",
+            post(fake_web_search_streaming_chat_completions),
+        )
+        .with_state(fake_state.clone());
+    tokio::spawn(async move {
+        axum::serve(fake_listener, fake_app).await.unwrap();
+    });
+
+    let data_dir = std::env::temp_dir().join(format!(
+        "codeseex-next-web-search-output-test-{}",
+        Uuid::new_v4().simple()
+    ));
+    let config = test_config_with_upstream(data_dir, fake_addr);
+    let store = Store::open(&config.database_path()).await.unwrap();
+    let proxy_state = ProxyState {
+        config: Arc::new(config),
+        client: reqwest::Client::new(),
+        store,
+    };
+    let proxy_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    let proxy_app = Router::new()
+        .route("/v1/responses", post(responses))
+        .with_state(proxy_state);
+    tokio::spawn(async move {
+        axum::serve(proxy_listener, proxy_app).await.unwrap();
+    });
+
+    let body = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/responses"))
+        .json(&json!({
+            "id": "resp_stream_web_search_output",
+            "model": "deepseek-v4-pro",
+            "stream": true,
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "use web search" }]
+            }]
+        }))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+
+    assert!(body.contains("\"type\":\"web_search_call\""), "{body}");
+    assert!(
+        body.contains("\"type\":\"web_search_call_output\""),
+        "{body}"
+    );
+    assert!(body.contains("missing_url"), "{body}");
+    assert!(body.contains("web-search-result-handled"), "{body}");
+    let call_completed = body
+        .find("response.web_search_call.completed")
+        .expect("web_search call should complete");
+    let output_item = body
+        .find("\"type\":\"web_search_call_output\"")
+        .expect("web_search output should be emitted");
+    let final_text = body
+        .find("web-search-result-handled")
+        .expect("final answer should stream after tool result");
+    assert!(call_completed < output_item, "{body}");
+    assert!(output_item < final_text, "{body}");
+
+    let requests = fake_state
+        .requests
+        .lock()
+        .expect("fake upstream lock poisoned")
+        .clone();
+    assert_eq!(requests.len(), 2);
+    let second_messages = requests[1]["messages"].as_array().unwrap();
+    assert!(second_messages.iter().any(|message| {
+        message.get("role").and_then(Value::as_str) == Some("tool")
+            && message.get("tool_call_id").and_then(Value::as_str) == Some("call_web")
+            && message
+                .get("content")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .contains("missing_url")
+    }));
+}
+
+#[tokio::test]
+async fn responses_recover_web_search_facts_when_client_returns_call_without_output() {
+    let fake_state = FakeUpstreamState::default();
+    let fake_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let fake_addr = fake_listener.local_addr().unwrap();
+    let fake_app = Router::new()
+        .route(
+            "/chat/completions",
+            post(fake_reasoning_then_content_streaming_chat_completions),
+        )
+        .with_state(fake_state.clone());
+    tokio::spawn(async move {
+        axum::serve(fake_listener, fake_app).await.unwrap();
+    });
+
+    let data_dir = std::env::temp_dir().join(format!(
+        "codeseex-next-web-search-recovery-test-{}",
+        Uuid::new_v4().simple()
+    ));
+    let config = test_config_with_upstream(data_dir.clone(), fake_addr);
+    let store = Store::open(&config.database_path()).await.unwrap();
+    store
+        .checkpoint_request(
+            "resp_prior_web",
+            None,
+            Some("deepseek-v4-pro"),
+            &json!({
+                "input": [{"role":"user","content":[{"type":"input_text","text":"weather"}]}]
+            }),
+        )
+        .await
+        .unwrap();
+    store
+        .append_request_tool_fact(
+            "resp_prior_web",
+            "tool=web_search call_id=call_web arguments={\"mode\":\"search\",\"query\":\"Shanghai weather\"} ok=true result={\"summary\":\"light rain\"}",
+        )
+        .await
+        .unwrap();
+    store
+        .finish_request(
+            "resp_prior_web",
+            RequestStatus::Completed,
+            Some(&json!({
+                "output": [{
+                    "type":"web_search_call",
+                    "status":"completed",
+                    "action":{"type":"search","query":"Shanghai weather"}
+                }]
+            })),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let proxy_state = ProxyState {
+        config: Arc::new(config),
+        client: reqwest::Client::new(),
+        store,
+    };
+    let proxy_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    let proxy_app = Router::new()
+        .route("/v1/responses", post(responses))
+        .with_state(proxy_state);
+    tokio::spawn(async move {
+        axum::serve(proxy_listener, proxy_app).await.unwrap();
+    });
+
+    let body = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/responses"))
+        .json(&json!({
+            "id": "resp_client_returned_web_call_only",
+            "model": "deepseek-v4-pro",
+            "stream": true,
+            "input": [
+                {
+                    "type":"web_search_call",
+                    "status":"completed",
+                    "action":{"type":"search","query":"Shanghai weather"}
+                },
+                {
+                    "type":"message",
+                    "role":"user",
+                    "content":[{"type":"input_text","text":"what happened with web_search?"}]
+                }
+            ]
+        }))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+
+    assert!(body.contains("final answer"), "{body}");
+    let requests = fake_state
+        .requests
+        .lock()
+        .expect("fake upstream lock poisoned")
+        .clone();
+    assert_eq!(requests.len(), 1);
+    let upstream_messages = serde_json::to_string(&requests[0]["messages"]).unwrap();
+    assert!(
+        upstream_messages.contains("Verified CodeSeeX tool execution facts"),
+        "{upstream_messages}"
+    );
+    assert!(
+        upstream_messages.contains("Shanghai weather"),
+        "{upstream_messages}"
+    );
+    assert!(
+        upstream_messages.contains("light rain"),
+        "{upstream_messages}"
+    );
+
+    let _ = std::fs::remove_dir_all(data_dir);
+}
+
+#[tokio::test]
+async fn responses_recover_empty_web_search_call_when_prior_final_text_matches() {
+    let fake_state = FakeUpstreamState::default();
+    let fake_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let fake_addr = fake_listener.local_addr().unwrap();
+    let fake_app = Router::new()
+        .route(
+            "/chat/completions",
+            post(fake_reasoning_then_content_streaming_chat_completions),
+        )
+        .with_state(fake_state.clone());
+    tokio::spawn(async move {
+        axum::serve(fake_listener, fake_app).await.unwrap();
+    });
+
+    let data_dir = std::env::temp_dir().join(format!(
+        "codeseex-next-web-search-empty-recovery-test-{}",
+        Uuid::new_v4().simple()
+    ));
+    let config = test_config_with_upstream(data_dir.clone(), fake_addr);
+    let store = Store::open(&config.database_path()).await.unwrap();
+    store
+        .checkpoint_request(
+            "resp_prior_web",
+            None,
+            Some("deepseek-v4-pro"),
+            &json!({
+                "input": [{"role":"user","content":[{"type":"input_text","text":"weather"}]}]
+            }),
+        )
+        .await
+        .unwrap();
+    store
+        .append_request_tool_fact(
+            "resp_prior_web",
+            "tool=web_search call_id=call_web arguments={\"mode\":\"open\"} ok=false result={\"error\":\"missing_url\"}",
+        )
+        .await
+        .unwrap();
+    store
+        .finish_request(
+            "resp_prior_web",
+            RequestStatus::Completed,
+            Some(&json!({
+                "output": [
+                    {
+                        "type":"web_search_call",
+                        "status":"completed",
+                        "action":{"type":"open_page"}
+                    },
+                    {
+                        "type":"message",
+                        "role":"assistant",
+                        "content":[{"type":"output_text","text":"prior final answer"}]
+                    }
+                ]
+            })),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let proxy_state = ProxyState {
+        config: Arc::new(config),
+        client: reqwest::Client::new(),
+        store,
+    };
+    let proxy_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    let proxy_app = Router::new()
+        .route("/v1/responses", post(responses))
+        .with_state(proxy_state);
+    tokio::spawn(async move {
+        axum::serve(proxy_listener, proxy_app).await.unwrap();
+    });
+
+    let body = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/responses"))
+        .json(&json!({
+            "id": "resp_client_returned_empty_web_call",
+            "model": "deepseek-v4-pro",
+            "stream": true,
+            "input": [
+                {
+                    "type":"web_search_call",
+                    "status":"completed",
+                    "action":{"type":"open_page"}
+                },
+                {
+                    "type":"message",
+                    "role":"assistant",
+                    "content":[{"type":"output_text","text":"prior final answer"}]
+                },
+                {
+                    "type":"message",
+                    "role":"user",
+                    "content":[{"type":"input_text","text":"what happened with web_search?"}]
+                }
+            ]
+        }))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+
+    assert!(body.contains("final answer"), "{body}");
+    let requests = fake_state
+        .requests
+        .lock()
+        .expect("fake upstream lock poisoned")
+        .clone();
+    assert_eq!(requests.len(), 1);
+    let upstream_messages = serde_json::to_string(&requests[0]["messages"]).unwrap();
+    assert!(
+        upstream_messages.contains("Verified CodeSeeX tool execution facts"),
+        "{upstream_messages}"
+    );
+    assert!(
+        upstream_messages.contains("missing_url"),
+        "{upstream_messages}"
+    );
+
+    let _ = std::fs::remove_dir_all(data_dir);
+}
+
+#[tokio::test]
+async fn streaming_apply_patch_returns_native_custom_tool_call() {
+    let fake_state = FakeUpstreamState::default();
+    let fake_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let fake_addr = fake_listener.local_addr().unwrap();
+    let fake_app = Router::new()
+        .route(
+            "/chat/completions",
+            post(fake_apply_patch_streaming_chat_completions),
+        )
+        .with_state(fake_state.clone());
+    tokio::spawn(async move {
+        axum::serve(fake_listener, fake_app).await.unwrap();
+    });
+
+    let data_dir = std::env::temp_dir().join(format!(
+        "codeseex-next-apply-patch-streaming-test-{}",
+        Uuid::new_v4().simple()
+    ));
+    let patch_dir = PathBuf::from("target").join("codeseex-next-apply-patch-streaming-test");
+    std::fs::create_dir_all(&patch_dir).expect("create ignored apply_patch test directory");
+    let patch_file = patch_dir.join("hello.txt");
+    let _ = std::fs::remove_file(&patch_file);
+    let config = test_config_with_upstream(data_dir, fake_addr);
+    let store = Store::open(&config.database_path()).await.unwrap();
+    let proxy_state = ProxyState {
+        config: Arc::new(config),
+        client: reqwest::Client::new(),
+        store,
+    };
+    let proxy_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    let proxy_app = Router::new()
+        .route("/v1/responses", post(responses))
+        .with_state(proxy_state);
+    tokio::spawn(async move {
+        axum::serve(proxy_listener, proxy_app).await.unwrap();
+    });
+
+    let body = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/responses"))
+        .json(&json!({
+            "id": "resp_stream_apply_patch",
+            "model": "deepseek-v4-pro",
+            "stream": true,
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{ "type": "input_text", "text": "patch a file" }]
+                }
+            ]
+        }))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+
+    assert!(body.contains("\"type\":\"custom_tool_call\""), "{body}");
+    assert!(body.contains("\"name\":\"apply_patch\""), "{body}");
+    assert!(body.contains("*** Begin Patch"), "{body}");
+    assert!(!body.contains("patch-ok"), "{body}");
+    assert!(body.contains("encrypted_content"), "{body}");
+    let thinking_done = body
+        .find("response.output_text.done")
+        .expect("thinking display should close before native tool completion");
+    let completed = body
+        .find("response.completed")
+        .expect("stream should complete");
+    assert!(thinking_done < completed, "{body}");
+    assert!(
+        !patch_file.exists(),
+        "proxy must not execute native apply_patch"
+    );
+    let _ = std::fs::remove_file(&patch_file);
+
+    let requests = fake_state
+        .requests
+        .lock()
+        .expect("fake upstream lock poisoned")
+        .clone();
+    assert_eq!(requests.len(), 1);
+}
+
+#[test]
+fn reconstructed_tool_call_history_keeps_reasoning_content_field() {
+    let reasoning = "read the file before answering";
+    let response = json!({
+        "output": [
+            reasoning_response_item(reasoning, false),
+            {
+                "type": "function_call",
+                "call_id": "call_prev",
+                "name": "read_file_range",
+                "arguments": "{\"path\":\"README.md\"}"
+            }
+        ]
+    });
+
+    let messages = response_output_tool_call_messages(&response);
+    let serialized = serde_json::to_value(&messages[0]).unwrap();
+
+    assert_eq!(messages.len(), 1);
+    assert_eq!(serialized["role"], "assistant");
+    assert_eq!(serialized["content"], "");
+    assert_eq!(serialized["reasoning_content"], reasoning);
+    assert_eq!(serialized["tool_calls"][0]["id"], "call_prev");
+    assert_eq!(
+        serialized["tool_calls"][0]["function"]["name"],
+        "read_file_range"
+    );
+}
+
+#[test]
+fn reconstructed_custom_apply_patch_history_uses_patch_argument() {
+    let response = json!({
+        "output": [
+            {
+                "type": "custom_tool_call",
+                "call_id": "call_patch",
+                "name": "apply_patch",
+                "input": "*** Begin Patch\n*** Add File: hi.txt\n+hi\n*** End Patch"
+            }
+        ]
+    });
+
+    let messages = response_output_tool_call_messages(&response);
+    let serialized = serde_json::to_value(&messages[0]).unwrap();
+    let arguments = serialized["tool_calls"][0]["function"]["arguments"]
+        .as_str()
+        .unwrap();
+    let parsed = serde_json::from_str::<Value>(arguments).unwrap();
+
+    assert_eq!(messages.len(), 1);
+    assert_eq!(serialized["tool_calls"][0]["id"], "call_patch");
+    assert_eq!(
+        serialized["tool_calls"][0]["function"]["name"],
+        "apply_patch"
+    );
+    assert!(parsed["patch"]
+        .as_str()
+        .unwrap()
+        .contains("*** Begin Patch"));
+}

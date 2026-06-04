@@ -1,0 +1,23 @@
+[package]
+name = "codeseex-desktop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lib]
+name = "codeseex_desktop"
+crate-type = ["rlib"]
+
+[dependencies]
+codeseex-core = { path = "../../../crates/core" }
+codeseex-proxy = { path = "../../../crates/proxy" }
+serde_json.workspace = true
+tauri.workspace = true
+tauri-plugin-autostart.workspace = true
+tauri-plugin-single-instance.workspace = true
+tokio.workspace = true
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }

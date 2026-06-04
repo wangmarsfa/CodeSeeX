@@ -7,14 +7,13 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+$RepoRoot = Split-Path -Parent $PSScriptRoot
+
 if (-not $CargoHome) {
   $CargoHome = Join-Path $DevRoot "Cargo"
 }
 if (-not $CargoTargetDir) {
   $CargoTargetDir = Join-Path $DevRoot "CargoTarget"
-}
-if (-not $env:npm_config_cache) {
-  $env:npm_config_cache = Join-Path $DevRoot "npm-cache"
 }
 
 $env:CARGO_HOME = $CargoHome
@@ -22,7 +21,7 @@ $env:CARGO_TARGET_DIR = $CargoTargetDir
 $env:TEMP = Join-Path $DevRoot "Temp"
 $env:TMP = $env:TEMP
 
-New-Item -ItemType Directory -Force -Path $env:CARGO_HOME, $env:CARGO_TARGET_DIR, $env:TEMP, $env:npm_config_cache | Out-Null
+New-Item -ItemType Directory -Force -Path $env:CARGO_HOME, $env:CARGO_TARGET_DIR, $env:TEMP | Out-Null
 
 if (-not $VsDevCmd) {
   $defaultVsDevCmd = Join-Path $DevRoot "VSBuildTools\Common7\Tools\VsDevCmd.bat"
@@ -59,22 +58,14 @@ $command = @(
   "set `"TEMP=$env:TEMP`"",
   "set `"TMP=$env:TMP`"",
   "`"$VsDevCmd`" -arch=x64 >nul",
+  "cd /d `"$RepoRoot`"",
   "`"$cargo`" fmt --all --check",
   "`"$cargo`" test -p codeseex-core -p codeseex-store -p codeseex-proxy",
-  "`"$cargo`" check -p codeseex-desktop"
+  "`"$cargo`" test -p codeseex-desktop --no-default-features --features tauri/custom-protocol",
+  "`"$cargo`" check -p codeseex-desktop --no-default-features --features tauri/custom-protocol"
 ) -join " && "
 
 cmd /d /c $command
-if ($LASTEXITCODE -ne 0) {
-  exit $LASTEXITCODE
-}
-
-npm --workspace apps/codeseex-ui run check
-if ($LASTEXITCODE -ne 0) {
-  exit $LASTEXITCODE
-}
-
-npm --workspace apps/codeseex-ui run build
 if ($LASTEXITCODE -ne 0) {
   exit $LASTEXITCODE
 }

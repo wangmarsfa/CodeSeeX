@@ -1,18 +1,36 @@
 # Architecture Notes
 
-CodeSeeX Next separates long-lived proxy behavior from the desktop window.
+CodeSeeX separates the Codex-facing proxy pipeline from the desktop management surface.
 
 ```text
-Codex App -> 127.0.0.1:8787/v1 -> codeseex-proxy -> DeepSeek/custom upstream
-                                      |
-                                      +-> SQLite state, logs, usage
-                                      +-> generated model-catalog.json
-                                      +-> generated config.toml snippet
+Codex App -> 127.0.0.1:8787/v1 -> proxy server -> DeepSeek/custom upstream
+                                     |
+                                     +-> protocol conversion
+                                     +-> context compiler
+                                     +-> tool ownership and execution
+                                     +-> SQLite state, logs, usage
+                                     +-> generated model-catalog.json
 
-Tauri tray/window -> local management API -> same proxy state
+Tauri tray/window -> desktop_manager_request command -> manager runtime
+                                                   |
+                                                   +-> TOML config
+                                                   +-> SQLite usage/log queries
+                                                   +-> embedded proxy lifecycle
+
+HTTP /api/* -> thin compatibility/debug adapter -> manager runtime
 ```
 
-The proxy is the product core. The desktop UI is a management surface and must not be required for requests to continue flowing once the service is running.
+The proxy is the product core. The desktop UI is a management surface and must not be required for requests to continue flowing once the service is running. In the Tauri desktop runtime, UI management requests must use commands instead of calling `127.0.0.1` directly; this prevents UI startup from depending on the proxy port and keeps port conflicts visible without killing the window.
+
+The only public compatibility contract for Codex is `/v1/*`. The `/api/*` routes are retained for browser/debug access and should remain thin adapters, not a second source of business logic.
+
+## Runtime Boundaries
+
+- `core`: protocol types, config, model/catalog definitions, URL normalization, and context-safe helpers.
+- `store`: SQLite state, request lifecycle, logs, usage, and durable context facts.
+- `proxy`: HTTP `/v1/*`, upstream conversion, context compilation, tool ownership, hosted tool execution, and the shared manager runtime.
+- `desktop`: Tauri window/tray/autostart/single-instance shell, embedded proxy lifecycle, and command bridge to the manager runtime.
+- `ui`: static WebView assets only; no Node/Vite runtime is required for normal desktop use.
 
 ## Data Directory
 
