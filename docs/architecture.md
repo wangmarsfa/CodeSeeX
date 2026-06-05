@@ -8,13 +8,14 @@ Codex App -> 127.0.0.1:8787/v1 -> proxy server -> DeepSeek/custom upstream
                                      +-> protocol conversion
                                      +-> context compiler
                                      +-> tool ownership and execution
-                                     +-> SQLite state, logs, usage
+                                     +-> in-memory runtime state
+                                     +-> logs/*.jsonl diagnostics
                                      +-> generated model-catalog.json
 
 Tauri tray/window -> desktop_manager_request command -> manager runtime
                                                    |
                                                    +-> TOML config
-                                                   +-> SQLite usage/log queries
+                                                   +-> runtime usage/log file queries
                                                    +-> embedded proxy lifecycle
 
 HTTP /api/* -> thin compatibility/debug adapter -> manager runtime
@@ -27,7 +28,7 @@ The only public compatibility contract for Codex is `/v1/*`. The `/api/*` routes
 ## Runtime Boundaries
 
 - `core`: protocol types, config, model/catalog definitions, URL normalization, and context-safe helpers.
-- `store`: SQLite adapter ledger, request lifecycle, logs, usage, bounded tool facts, and short-lived bridge state.
+- `store`: in-memory request lifecycle/usage, JSONL log IO, and short-lived current-process bridge state.
 - `proxy`: HTTP `/v1/*`, upstream conversion, context compilation, tool ownership, hosted tool execution, and the shared manager runtime.
 - `desktop`: Tauri window/tray/autostart/single-instance shell, embedded proxy lifecycle, and command bridge to the manager runtime.
 - `ui`: static WebView assets only; no Node/Vite runtime is required for normal desktop use.
@@ -37,16 +38,20 @@ The only public compatibility contract for Codex is `/v1/*`. The `/api/*` routes
 Development data lives under `~/.codeseex-next`:
 
 - `config.toml`: readable CodeSeeX config.
-- `codeseex.db`: minimal adapter ledger for request lifecycle, short-lived bridge state, bounded tool facts, compact records, usage, logs, and diagnostics.
 - `model-catalog.json`: generated Codex model catalog.
+- `logs/YYYY-MM-DD.jsonl`: durable local logs for UI and diagnostics.
+- `runtime/`: transient process files such as locks or status snapshots.
+- `cache/`: deletable generated/cache data.
+- `secrets/compact.key`: local key material for CodeSeeX-readable compact payloads.
+- `lang/`: user or third-party language overrides.
 - `extension/tools/<tool>/manifest.json`: optional community tool metadata and explicit command execution declarations.
 
 The `-next` data directory is development-only isolation. The final product remains CodeSeeX, so the release plan should use the normal CodeSeeX data location or an explicit in-app upgrade path rather than framing this as a separate product migration.
 
 ## State Boundary
 
-Codex owns the raw session transcript files and conversation context. CodeSeeX does not parse those files as protocol state and does not duplicate Codex request context into SQLite. When Codex sends a full-context request, the proxy uses it for the current upstream call and stores only a bounded adapter slice for diagnostics and interrupted-turn recovery.
+Codex owns the raw session transcript files and conversation context. CodeSeeX does not parse those files as protocol state and does not duplicate Codex request context into a database. When Codex sends a full-context request, the proxy uses it for the current upstream call and keeps only current-process bridge data needed to finish that request.
 
-The store keeps only the facts needed at the adapter boundary: request lifecycle, short-lived `previous_response_id` bridge data when Codex uses it, bounded tool facts, compact records, usage, and diagnostics. Tool facts are evidence for CodeSeeX-owned tool execution, not a durable replacement for Codex's own tool/event transcript.
+The store keeps only current-process facts needed at the adapter boundary: request lifecycle, short-lived `previous_response_id` bridge data, usage, and diagnostics. Tool facts are evidence for CodeSeeX-owned tool execution during the current request/process, not a durable replacement for Codex's own tool/event transcript.
 
-New state writes are sanitized before persistence, and maintenance sanitizes oversized legacy request payloads in place without deleting request identity. See [state-contract.md](state-contract.md) for the durable state contract.
+Logs are sanitized before file writes. Legacy `codeseex.db` files are ignored rather than used as protocol state. See [state-contract.md](state-contract.md) for the runtime/log state contract.

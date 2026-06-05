@@ -1,10 +1,20 @@
 use axum::body::Bytes;
 use base64::{engine::general_purpose, Engine as _};
+use codeseex_core::AppConfig;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-pub(crate) fn reasoning_response_item(reasoning: &str, visible_summary: bool) -> Value {
+use crate::responses::compaction::{decode_opaque_text, encode_opaque_text};
+
+const REASONING_PREFIX: &str = "codeseex-reasoning-v1:";
+
+pub(crate) fn reasoning_response_item(
+    config: &AppConfig,
+    reasoning: &str,
+    visible_summary: bool,
+) -> Value {
     reasoning_response_item_with_id(
+        config,
         &format!("rs_{}", Uuid::new_v4().simple()),
         reasoning,
         visible_summary,
@@ -12,11 +22,12 @@ pub(crate) fn reasoning_response_item(reasoning: &str, visible_summary: bool) ->
 }
 
 pub(crate) fn reasoning_response_item_with_id(
+    config: &AppConfig,
     id: &str,
     reasoning: &str,
     visible_summary: bool,
 ) -> Value {
-    json!({
+    let mut item = json!({
         "id": id,
         "type": "reasoning",
         "status": "completed",
@@ -29,9 +40,12 @@ pub(crate) fn reasoning_response_item_with_id(
         } else {
             Vec::<Value>::new()
         },
-        "encrypted_content": encode_reasoning_content(reasoning),
         "content": Value::Null
-    })
+    });
+    if let Ok(encrypted_content) = encode_reasoning_content(config, reasoning) {
+        item["encrypted_content"] = Value::String(encrypted_content);
+    }
+    item
 }
 
 pub(crate) fn function_call_sse_added(
@@ -40,20 +54,24 @@ pub(crate) fn function_call_sse_added(
     item: &Value,
     sequence: &mut u64,
 ) -> Bytes {
+    let mut added_item = json!({
+        "id": item["id"],
+        "type": "function_call",
+        "status": "in_progress",
+        "call_id": item["call_id"],
+        "name": item["name"],
+        "arguments": ""
+    });
+    if let Some(namespace) = item.get("namespace") {
+        added_item["namespace"] = namespace.clone();
+    }
     sse_bytes(
         "response.output_item.added",
         json!({
             "type": "response.output_item.added",
             "response_id": response_id,
             "output_index": output_index,
-            "item": {
-                "id": item["id"],
-                "type": "function_call",
-                "status": "in_progress",
-                "call_id": item["call_id"],
-                "name": item["name"],
-                "arguments": ""
-            },
+            "item": added_item,
             "sequence_number": next_sequence(sequence)
         }),
     )
@@ -250,13 +268,14 @@ pub(crate) fn hidden_reasoning_item_sse_events(
 }
 
 pub(crate) fn reasoning_done_sse_events(
+    config: &AppConfig,
     response_id: &str,
     output_index: u64,
     item_id: &str,
     reasoning: &str,
     sequence: &mut u64,
 ) -> (Bytes, Value) {
-    let item = reasoning_response_item_with_id(item_id, reasoning, true);
+    let item = reasoning_response_item_with_id(config, item_id, reasoning, true);
     let mut bytes = sse_bytes(
         "response.reasoning_summary_text.done",
         json!({
@@ -641,19 +660,19 @@ pub(crate) fn function_call_sse_done(
     item: &Value,
     sequence: &mut u64,
 ) -> Bytes {
-    let mut bytes = sse_bytes(
-        "response.function_call_arguments.done",
-        json!({
-            "type": "response.function_call_arguments.done",
-            "response_id": response_id,
-            "item_id": item["id"],
-            "output_index": output_index,
-            "name": item["name"],
-            "arguments": item["arguments"],
-            "sequence_number": next_sequence(sequence)
-        }),
-    )
-    .to_vec();
+    let mut arguments_done = json!({
+        "type": "response.function_call_arguments.done",
+        "response_id": response_id,
+        "item_id": item["id"],
+        "output_index": output_index,
+        "name": item["name"],
+        "arguments": item["arguments"],
+        "sequence_number": next_sequence(sequence)
+    });
+    if let Some(namespace) = item.get("namespace") {
+        arguments_done["namespace"] = namespace.clone();
+    }
+    let mut bytes = sse_bytes("response.function_call_arguments.done", arguments_done).to_vec();
     let done = sse_bytes(
         "response.output_item.done",
         json!({
@@ -706,15 +725,19 @@ pub(crate) fn sse_bytes(event: &str, payload: Value) -> Bytes {
     Bytes::from(format!("event: {event}\ndata: {data}\n\n"))
 }
 
-fn encode_reasoning_content(text: &str) -> String {
-    general_purpose::STANDARD.encode(text.as_bytes())
+fn encode_reasoning_content(config: &AppConfig, text: &str) -> anyhow::Result<String> {
+    encode_opaque_text(config, REASONING_PREFIX, text)
 }
 
-pub(crate) fn decode_reasoning_content(value: &str) -> Option<String> {
-    general_purpose::STANDARD
-        .decode(value.trim())
+pub(crate) fn decode_reasoning_content(config: &AppConfig, value: &str) -> Option<String> {
+    decode_opaque_text(config, REASONING_PREFIX, value)
         .ok()
-        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .or_else(|| {
+            general_purpose::STANDARD
+                .decode(value.trim())
+                .ok()
+                .and_then(|bytes| String::from_utf8(bytes).ok())
+        })
 }
 
 pub(crate) fn take_sse_frame(buffer: &mut String) -> Option<String> {

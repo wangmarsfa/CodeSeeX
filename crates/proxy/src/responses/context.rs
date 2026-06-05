@@ -8,6 +8,7 @@ use codeseex_core::context::{
 };
 use codeseex_core::models::{DEFAULT_CONTEXT_WINDOW, DEFAULT_EFFECTIVE_CONTEXT_PERCENT};
 use codeseex_core::protocol::ChatMessage;
+use codeseex_core::AppConfig;
 use codeseex_store::RequestStatus;
 use serde_json::{json, Value};
 use std::collections::{BTreeSet, HashSet};
@@ -132,6 +133,7 @@ async fn response_history_context(
             let tool_messages = response_output_tool_call_messages_for_replay(
                 &record.response,
                 &next_tool_output_ids,
+                &config,
             );
             if !tool_messages.is_empty() {
                 messages.extend(tool_messages);
@@ -721,19 +723,29 @@ fn response_text_is_display_only(text: &str) -> bool {
 
 #[cfg(test)]
 pub(crate) fn response_output_tool_call_messages(response: &Value) -> Vec<ChatMessage> {
-    response_output_tool_call_messages_inner(response, None)
+    response_output_tool_call_messages_inner(response, None, &AppConfig::default())
+}
+
+#[cfg(test)]
+pub(crate) fn response_output_tool_call_messages_with_config(
+    response: &Value,
+    config: &AppConfig,
+) -> Vec<ChatMessage> {
+    response_output_tool_call_messages_inner(response, None, config)
 }
 
 fn response_output_tool_call_messages_for_replay(
     response: &Value,
     next_tool_output_ids: &HashSet<String>,
+    config: &AppConfig,
 ) -> Vec<ChatMessage> {
-    response_output_tool_call_messages_inner(response, Some(next_tool_output_ids))
+    response_output_tool_call_messages_inner(response, Some(next_tool_output_ids), config)
 }
 
 fn response_output_tool_call_messages_inner(
     response: &Value,
     required_tool_output_ids: Option<&HashSet<String>>,
+    config: &AppConfig,
 ) -> Vec<ChatMessage> {
     let Some(output) = response.get("output").and_then(Value::as_array) else {
         return Vec::new();
@@ -757,7 +769,7 @@ fn response_output_tool_call_messages_inner(
         }
     }
     let assistant_text = response_output_text(response).unwrap_or_default();
-    let reasoning_text = response_output_reasoning_text(response).unwrap_or_default();
+    let reasoning_text = response_output_reasoning_text(response, config).unwrap_or_default();
     let message = if reasoning_text.trim().is_empty() {
         ChatMessage::assistant_tool_calls(calls, assistant_text)
     } else {
@@ -766,21 +778,21 @@ fn response_output_tool_call_messages_inner(
     vec![message]
 }
 
-fn response_output_reasoning_text(response: &Value) -> Option<String> {
+fn response_output_reasoning_text(response: &Value, config: &AppConfig) -> Option<String> {
     let output = response.get("output")?.as_array()?;
     let parts = output
         .iter()
         .filter(|item| item.get("type").and_then(Value::as_str) == Some("reasoning"))
-        .filter_map(reasoning_text_from_item)
+        .filter_map(|item| reasoning_text_from_item(item, config))
         .filter(|text| !text.trim().is_empty())
         .collect::<Vec<_>>();
     (!parts.is_empty()).then(|| parts.join("\n\n"))
 }
 
-fn reasoning_text_from_item(item: &Value) -> Option<String> {
+fn reasoning_text_from_item(item: &Value, config: &AppConfig) -> Option<String> {
     item.get("encrypted_content")
         .and_then(Value::as_str)
-        .and_then(decode_reasoning_content)
+        .and_then(|value| decode_reasoning_content(config, value))
         .filter(|text| !text.trim().is_empty())
         .or_else(|| {
             item.get("summary")
@@ -1228,9 +1240,7 @@ mod tests {
     async fn history_drops_unresolved_client_tool_call_for_normal_followup() {
         let dir =
             std::env::temp_dir().join(format!("codeseex-next-context-{}", Uuid::new_v4().simple()));
-        let store = Store::open(&dir.join("state.sqlite"))
-            .await
-            .expect("open store");
+        let store = Store::open(&dir).await.expect("open store");
         let state = ProxyState {
             config: Arc::new(AppConfig {
                 data_dir: dir.clone(),
@@ -1314,9 +1324,7 @@ mod tests {
     async fn history_keeps_parent_client_tool_call_for_matching_output() {
         let dir =
             std::env::temp_dir().join(format!("codeseex-next-context-{}", Uuid::new_v4().simple()));
-        let store = Store::open(&dir.join("state.sqlite"))
-            .await
-            .expect("open store");
+        let store = Store::open(&dir).await.expect("open store");
         let state = ProxyState {
             config: Arc::new(AppConfig {
                 data_dir: dir.clone(),
@@ -1408,12 +1416,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn current_web_search_call_without_output_recovers_persisted_fact() {
+    async fn current_web_search_call_without_output_does_not_recover_global_persisted_fact() {
         let dir =
             std::env::temp_dir().join(format!("codeseex-next-context-{}", Uuid::new_v4().simple()));
-        let store = Store::open(&dir.join("state.sqlite"))
-            .await
-            .expect("open store");
+        let store = Store::open(&dir).await.expect("open store");
         let state = ProxyState {
             config: Arc::new(AppConfig {
                 data_dir: dir.clone(),
@@ -1478,21 +1484,20 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        assert!(joined.contains("Verified CodeSeeX tool execution facts"));
+        assert!(!joined.contains("Verified CodeSeeX tool execution facts"));
         assert!(joined.contains("Shanghai weather"));
-        assert!(joined.contains("light rain"));
-        assert_eq!(built.diagnostic["recovered_tool_facts"].as_u64(), Some(1));
+        assert!(!joined.contains("light rain"));
+        assert_eq!(built.diagnostic["recovered_tool_facts"].as_u64(), Some(0));
 
         let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
-    async fn empty_client_web_search_call_recovers_fact_when_prior_final_text_matches() {
+    async fn empty_client_web_search_call_does_not_recover_global_fact_when_prior_final_text_matches(
+    ) {
         let dir =
             std::env::temp_dir().join(format!("codeseex-next-context-{}", Uuid::new_v4().simple()));
-        let store = Store::open(&dir.join("state.sqlite"))
-            .await
-            .expect("open store");
+        let store = Store::open(&dir).await.expect("open store");
         let state = ProxyState {
             config: Arc::new(AppConfig {
                 data_dir: dir.clone(),
@@ -1569,9 +1574,9 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        assert!(joined.contains("Verified CodeSeeX tool execution facts"));
-        assert!(joined.contains("missing_url"));
-        assert_eq!(built.diagnostic["recovered_tool_facts"].as_u64(), Some(1));
+        assert!(!joined.contains("Verified CodeSeeX tool execution facts"));
+        assert!(!joined.contains("missing_url"));
+        assert_eq!(built.diagnostic["recovered_tool_facts"].as_u64(), Some(0));
 
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -1614,9 +1619,7 @@ mod tests {
     async fn compact_response_replay_replaces_parent_history() {
         let dir =
             std::env::temp_dir().join(format!("codeseex-next-context-{}", Uuid::new_v4().simple()));
-        let store = Store::open(&dir.join("state.sqlite"))
-            .await
-            .expect("open store");
+        let store = Store::open(&dir).await.expect("open store");
         let config = AppConfig {
             data_dir: dir.clone(),
             ..Default::default()

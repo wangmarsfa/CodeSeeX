@@ -13,7 +13,7 @@ Acceptance criteria:
 - `/v1/models` lists `deepseek-v4-flash` and `deepseek-v4-pro`.
 - `/v1/chat/completions` forwards JSON and streaming requests to the configured upstream.
 - `/v1/responses` accepts basic Codex Responses input and maps non-tool output back to Responses-shaped results.
-- Request checkpoints, failures, completions, and notable events are written to SQLite.
+- Request lifecycle and usage are tracked in current-process runtime state; notable events are written to `logs/*.jsonl`.
 
 Explicitly out of scope:
 
@@ -61,9 +61,8 @@ Current progress:
 - Function/tool/MCP-like request items are retained as verified facts when they cannot be represented as legal chat protocol messages.
 - Known tool call outputs are replayed as legal Chat `assistant.tool_calls` / `tool` pairs when the previous response contains the matching native call.
 - Inline `data:` URLs in tool facts are redacted to deterministic size/hash markers to protect prompt caching from binary payloads.
-- Request checkpoints persist context diagnostics, including current message count and verified fact count.
-- `/v1/responses/compact` returns a local readable compaction item without fake `encrypted_content`.
-- `.\scripts\context-fidelity-smoke-windows.ps1` starts a fake upstream plus the real proxy and verifies instructions, model mapping, `previous_response_id` history, verified tool facts, completed parent output, failed parent safe replay, streaming parent persistence, manual compaction replay, native MCP/external tool passthrough and result replay, community command-tool execution, streaming built-in tool execution, and inline image redaction.
+- Context diagnostics are written to bounded logs, including current message count and verified fact count.
+- `/v1/responses/compact` returns a readable summary plus a CodeSeeX-owned opaque `encrypted_content` payload, not fake OpenAI server state.
 
 ## M4 Tool System
 
@@ -85,8 +84,8 @@ Current progress:
 - Codex-native MCP/external tool declarations from Responses `tools` are normalized into upstream Chat function tools, then mapped back to native Responses `function_call` items for Codex execution.
 - MCP/external `function_call_output` turns replay as legal Chat tool pairs only when the referenced previous response contains the matching function call; otherwise they remain verified facts.
 - `/v1/responses` now supports tool loops in non-streaming and streaming mode: system `web_search`, plus configurable built-ins `list_directory`, `read_file_range`, and `workspace_search`.
-- Streaming regular built-in/community tool calls are emitted as display-only/proxy diagnostic output, then CodeSeeX executes the bounded tool, persists the verified fact, and continues the upstream stream. Apply Patch uses native `custom_tool_call` events and is executed by Codex.
-- Built-in tool calls write separate call/result events and persist verified tool facts to SQLite for later `previous_response_id` reconstruction.
+- Streaming regular built-in/community tool calls are emitted as display-only/proxy diagnostic output, then CodeSeeX executes the bounded tool, keeps current-request facts, and continues the upstream stream. Apply Patch uses native `custom_tool_call` events and is executed by Codex.
+- Built-in tool calls write separate call/result events to `logs/*.jsonl`; verified tool facts stay scoped to the current request/process bridge.
 - Configurable built-in and community execution is gated by the persisted enabled-tool list; system tools are always enabled. Read-only tools revalidate workspace boundaries before touching files, and Web Search returns compact text-only evidence.
 - Community tool manifests are discovered from `~/.codeseex-next/extension/tools/<tool>/manifest.json` for the desktop Tools page.
 - Community tools default to disabled and can persist safe UI config fields into the existing TOML `[tools.settings]` table.

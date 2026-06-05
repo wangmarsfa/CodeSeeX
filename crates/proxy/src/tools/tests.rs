@@ -21,6 +21,20 @@ fn executable_tool_checks_enabled_allowlist() {
 }
 
 #[test]
+fn malformed_tool_arguments_return_invalid_arguments() {
+    let result = execute_tool_in_context(
+        &ToolExecutionContext::default(),
+        "list_directory",
+        r#"{"path":"."#,
+    );
+
+    assert_eq!(
+        result.get("error").and_then(Value::as_str),
+        Some("invalid_arguments")
+    );
+}
+
+#[test]
 fn read_file_range_supports_tail_and_text_output() {
     let root = temp_workspace("read-range-tail");
     fs::create_dir_all(&root).expect("create temp workspace");

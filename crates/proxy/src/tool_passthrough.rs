@@ -90,6 +90,14 @@ struct ToolDeclaration {
 
 fn normalize_tool_declarations(tool: &Value, index: usize) -> Vec<ToolDeclaration> {
     let namespace = namespace_from_tool(tool);
+    let tool_type = tool
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if tool_type == "mcp" && tool.get("tools").and_then(Value::as_array).is_none() {
+        return Vec::new();
+    }
     if let Some(nested_tools) = tool.get("tools").and_then(Value::as_array) {
         if namespace.is_some() {
             return nested_tools
@@ -272,10 +280,23 @@ fn unique_tool_name(
     let mut candidate = prefix.clone();
     let mut suffix = 2_u32;
     while entries.contains_key(&candidate) {
-        candidate = sanitize_tool_name(&format!("{prefix}_{suffix}"));
+        candidate = suffixed_tool_name(&prefix, suffix);
         suffix += 1;
+        if suffix > 10_000 {
+            return suffixed_tool_name(&format!("tool_{}", Uuid::new_v4().simple()), 2);
+        }
     }
     candidate
+}
+
+fn suffixed_tool_name(prefix: &str, suffix: u32) -> String {
+    let suffix = format!("_{suffix}");
+    let max_prefix_chars = 64_usize.saturating_sub(suffix.chars().count());
+    let mut base = prefix.chars().take(max_prefix_chars).collect::<String>();
+    if base.trim_matches('_').is_empty() {
+        base = "tool".to_owned();
+    }
+    sanitize_tool_name(&format!("{base}{suffix}"))
 }
 
 fn sanitize_tool_name(name: &str) -> String {
@@ -339,5 +360,50 @@ mod tests {
             Some("smoke_server")
         );
         assert_eq!(item.get("name").and_then(Value::as_str), Some("smoke_add"));
+    }
+
+    #[test]
+    fn mcp_server_without_nested_tools_is_not_callable_function() {
+        let context = ToolContext::from_request_tools(Some(&json!([
+            {
+                "type": "mcp",
+                "server_label": "node_repl"
+            }
+        ])));
+
+        assert!(context.upstream_tools.is_empty());
+        assert!(!context.has_external_tool("node_repl"));
+    }
+
+    #[test]
+    fn duplicate_long_tool_names_get_distinct_bounded_names() {
+        let long = "a".repeat(64);
+        let context = ToolContext::from_request_tools(Some(&json!([
+            {
+                "type": "function",
+                "function": {
+                    "name": long,
+                    "description": "first",
+                    "parameters": { "type": "object", "properties": {} }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": long,
+                    "description": "second",
+                    "parameters": { "type": "object", "properties": {} }
+                }
+            }
+        ])));
+        let names = context
+            .upstream_tools
+            .iter()
+            .filter_map(|tool| tool.pointer("/function/name").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+
+        assert_eq!(names.len(), 2);
+        assert_ne!(names[0], names[1]);
+        assert!(names.iter().all(|name| name.chars().count() <= 64));
     }
 }

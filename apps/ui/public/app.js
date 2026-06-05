@@ -432,7 +432,9 @@ async function refresh(options = {}) {
     const data = await apiJson("/api/status", { cache: "no-store" });
     await syncConfigIfChanged(data.config_version);
     renderStatus(data);
-    updateLatestLogs(data.events || [], { force: Boolean(options.forceLogs) });
+    if (Array.isArray(data.events)) {
+      updateLatestLogs(data.events, { force: Boolean(options.forceLogs) });
+    }
     maybeRefreshUsage(data.runtime || {}, options);
   } catch (error) {
     latestRunning = false;

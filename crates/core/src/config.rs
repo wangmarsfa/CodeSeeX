@@ -166,7 +166,7 @@ impl AppConfig {
         self.data_dir.join("model-catalog.json")
     }
 
-    pub fn database_path(&self) -> PathBuf {
+    pub fn legacy_database_path(&self) -> PathBuf {
         self.data_dir.join("codeseex.db")
     }
 

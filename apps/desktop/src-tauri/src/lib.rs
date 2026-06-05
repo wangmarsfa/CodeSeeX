@@ -32,6 +32,9 @@ struct ProxyRuntime {
     error: Option<String>,
     shutdown: Option<oneshot::Sender<()>>,
     generation: u64,
+    host: Option<String>,
+    port: Option<u16>,
+    base_url: Option<String>,
 }
 
 impl Default for ProxyRuntime {
@@ -41,6 +44,9 @@ impl Default for ProxyRuntime {
             error: None,
             shutdown: None,
             generation: 0,
+            host: None,
+            port: None,
+            base_url: None,
         }
     }
 }
@@ -49,6 +55,9 @@ impl Default for ProxyRuntime {
 struct ProxyRuntimeStatus {
     status: String,
     error: Option<String>,
+    host: Option<String>,
+    port: Option<u16>,
+    base_url: Option<String>,
 }
 
 #[tauri::command]
@@ -124,6 +133,22 @@ async fn desktop_manager_request(
                 "embedded_proxy_error".to_owned(),
                 proxy.error.map(Value::String).unwrap_or(Value::Null),
             );
+            if let Some(base_url) = proxy.base_url.clone() {
+                object.insert("base_url".to_owned(), Value::String(base_url.clone()));
+                if let Some(runtime) = object.get_mut("runtime").and_then(Value::as_object_mut) {
+                    runtime.insert("base_url".to_owned(), Value::String(base_url));
+                }
+            }
+            if let Some(port) = proxy.port {
+                if let Some(runtime) = object.get_mut("runtime").and_then(Value::as_object_mut) {
+                    runtime.insert("port".to_owned(), Value::from(port));
+                }
+            }
+            if let Some(host) = proxy.host.clone() {
+                if let Some(runtime) = object.get_mut("runtime").and_then(Value::as_object_mut) {
+                    runtime.insert("host".to_owned(), Value::String(host));
+                }
+            }
         }
     }
     Ok(response)
@@ -227,6 +252,12 @@ fn start_embedded_proxy(app: AppHandle) -> Result<(), String> {
 
     tauri::async_runtime::spawn(async move {
         let config = AppConfig::load();
+        let endpoint = ProxyRuntimeEndpoint {
+            host: config.host.clone(),
+            port: config.port,
+            base_url: config.proxy_base_url(),
+        };
+        set_proxy_runtime_endpoint_if_generation(&app, generation, endpoint);
         let running_app = app.clone();
         let result = codeseex_proxy::serve_with_shutdown(
             config,
@@ -360,6 +391,9 @@ fn set_proxy_runtime_status(
     proxy.error = error;
     if clear_shutdown {
         proxy.shutdown = None;
+        proxy.host = None;
+        proxy.port = None;
+        proxy.base_url = None;
     }
     Ok(())
 }
@@ -380,7 +414,33 @@ fn set_proxy_runtime_status_if_generation(
         proxy.error = error;
         if clear_shutdown {
             proxy.shutdown = None;
+            proxy.host = None;
+            proxy.port = None;
+            proxy.base_url = None;
         }
+    };
+}
+
+#[derive(Debug, Clone)]
+struct ProxyRuntimeEndpoint {
+    host: String,
+    port: u16,
+    base_url: String,
+}
+
+fn set_proxy_runtime_endpoint_if_generation(
+    app: &AppHandle,
+    generation: u64,
+    endpoint: ProxyRuntimeEndpoint,
+) {
+    let state = app.state::<DesktopRuntime>();
+    if let Ok(mut proxy) = state.proxy.lock() {
+        if proxy.generation != generation {
+            return;
+        }
+        proxy.host = Some(endpoint.host);
+        proxy.port = Some(endpoint.port);
+        proxy.base_url = Some(endpoint.base_url);
     };
 }
 
@@ -391,10 +451,16 @@ fn proxy_runtime_status(state: &DesktopRuntime) -> ProxyRuntimeStatus {
         .map(|proxy| ProxyRuntimeStatus {
             status: proxy.status.clone(),
             error: proxy.error.clone(),
+            host: proxy.host.clone(),
+            port: proxy.port,
+            base_url: proxy.base_url.clone(),
         })
         .unwrap_or_else(|_| ProxyRuntimeStatus {
             status: "failed".to_owned(),
             error: Some("desktop proxy status lock was poisoned".to_owned()),
+            host: None,
+            port: None,
+            base_url: None,
         })
 }
 

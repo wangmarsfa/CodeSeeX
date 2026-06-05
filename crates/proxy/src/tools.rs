@@ -1,4 +1,4 @@
-﻿use regex::RegexBuilder;
+use regex::RegexBuilder;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::fs;
@@ -39,7 +39,10 @@ pub(crate) fn execute_tool_in_context(
     name: &str,
     arguments: &str,
 ) -> Value {
-    let args = parse_arguments(arguments);
+    let args = match parse_arguments(arguments) {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
     match name {
         "list_directory" => list_directory(context, &args),
         "read_file_range" => read_file_range(context, &args),
@@ -61,19 +64,23 @@ pub async fn execute_tool_with_client(
     arguments: &str,
 ) -> Value {
     if name == "web_search" {
-        return web::execute(
-            client,
-            config.web_search_proxy,
-            &parse_arguments(arguments),
-            messages,
-        )
-        .await;
+        let args = match parse_arguments(arguments) {
+            Ok(value) => value,
+            Err(error) => return error,
+        };
+        return web::execute(client, config.web_search_proxy, &args, messages).await;
     }
     execute_tool_in_context(context, name, arguments)
 }
 
-fn parse_arguments(arguments: &str) -> Value {
-    serde_json::from_str(arguments).unwrap_or_else(|_| json!({}))
+fn parse_arguments(arguments: &str) -> Result<Value, Value> {
+    serde_json::from_str(arguments).map_err(|error| {
+        json!({
+            "ok": false,
+            "error": "invalid_arguments",
+            "message": format!("Tool arguments must be valid JSON: {error}")
+        })
+    })
 }
 
 fn resolve_inside_workspace(

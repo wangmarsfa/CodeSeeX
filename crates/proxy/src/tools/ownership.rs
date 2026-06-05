@@ -52,7 +52,8 @@ pub(crate) fn partition_tool_calls(
     external_tool_context: &crate::tool_passthrough::ToolContext,
 ) -> ToolCallPartition {
     let mut partition = ToolCallPartition::default();
-    for call in tool_calls {
+    for mut call in tool_calls {
+        call.name = canonical_tool_name(&call.name).to_owned();
         match resolve_tool_owner(&call.name, community_tools, external_tool_context) {
             ToolOwner::CodexNative(_) => partition.native.push(call),
             ToolOwner::CodeseexHosted(HostedTool::WebSearch) => partition.hosted.push(call),
@@ -94,7 +95,15 @@ pub(crate) fn is_native_apply_patch_tool(name: &str) -> bool {
 }
 
 pub(crate) fn is_web_search_tool(name: &str) -> bool {
-    matches!(name, "web_search" | "web_search_preview")
+    canonical_tool_name(name) == "web_search"
+}
+
+pub(crate) fn canonical_tool_name(name: &str) -> &str {
+    if name == "web_search_preview" {
+        "web_search"
+    } else {
+        name
+    }
 }
 
 pub(crate) fn proxy_executed_calls_in_order(

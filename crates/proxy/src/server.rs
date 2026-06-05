@@ -54,7 +54,7 @@ use axum::http::{header, HeaderMap, Response, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use codeseex_core::context::redact_inline_data_urls;
+use codeseex_core::context::{redact_inline_data_urls, request_looks_like_codex_full_context};
 use codeseex_core::models::available_models;
 use codeseex_core::protocol::ChatMessage;
 use codeseex_core::{AppConfig, UserConfig};
@@ -83,7 +83,7 @@ where
     F: Future<Output = ()> + Send + 'static,
     L: FnOnce() + Send + 'static,
 {
-    let store = Store::open(&config.database_path()).await?;
+    let store = Store::open(&config.data_dir).await?;
     let maintenance = store
         .run_maintenance(
             UserConfig::read_from(&config.config_path())
@@ -91,25 +91,18 @@ where
                 .log_retention_days(),
         )
         .await?;
-    if maintenance.deleted_events > 0
-        || maintenance.sanitized_requests > 0
-        || maintenance.request_sanitize_limit_reached
-    {
+    if maintenance.deleted_events > 0 {
         let _ = store
             .record_event(
                 "info",
-                "state_maintenance_completed",
-                "CodeSeeX state maintenance completed.",
+                "log_maintenance_completed",
+                "CodeSeeX log maintenance completed.",
                 Some(&json!({
                     "log_retention_days": maintenance.log_retention_days,
-                    "deleted_events": maintenance.deleted_events,
-                                        "sanitized_requests": maintenance.sanitized_requests,
-                                        "request_sanitize_batches": maintenance.request_sanitize_batches,
-                                        "request_sanitize_limit_reached": maintenance.request_sanitize_limit_reached,
-                                        "vacuumed_storage": maintenance.vacuumed_storage
-                                    })),
-                                )
-                                .await;
+                    "deleted_log_files": maintenance.deleted_events
+                })),
+            )
+            .await;
     }
     let recovered = store
         .recover_interrupted_requests("proxy_started_with_in_progress_checkpoint")
@@ -351,19 +344,24 @@ async fn responses_compact(
     State(state): State<ProxyState>,
     Json(input): Json<Value>,
 ) -> impl IntoResponse {
-    let id = input
-        .get("id")
-        .and_then(Value::as_str)
-        .map(str::to_owned)
-        .unwrap_or_else(|| format!("resp_{}", Uuid::new_v4().simple()));
+    let id = response_id_from_input(&input);
     let previous = input.get("previous_response_id").and_then(Value::as_str);
     let config = state.active_config();
     let model = response_model_from_input(&config, &input);
     let started_at = now_seconds();
+    if let Err(response) = ensure_new_response_id(&state, &id, previous).await {
+        return response;
+    }
+    let resolved_previous =
+        match resolve_previous_response_id(&state, &id, &model, previous, &input).await {
+            Ok(previous) => previous,
+            Err(response) => return response,
+        };
+    let previous_for_context = resolved_previous.as_deref();
 
     if let Err(error) = state
         .store
-        .checkpoint_request(&id, previous, Some(&model), &input)
+        .checkpoint_request(&id, previous_for_context, Some(&model), &input)
         .await
     {
         return json_error(
@@ -378,12 +376,16 @@ async fn responses_compact(
             "info",
             "context_compaction_started",
             "Context compaction requested.",
-            Some(&json!({ "id": id, "previous_response_id": previous })),
+            Some(&json!({
+                "id": id,
+                "previous_response_id": previous,
+                "resolved_previous_response_id": previous_for_context
+            })),
         )
         .await;
 
     let compaction_id = format!("cmp_{}", Uuid::new_v4().simple());
-    let built_context = build_response_context(&state, &input, previous).await;
+    let built_context = build_response_context(&state, &input, previous_for_context).await;
     let compact = match build_compaction_item(
         &config,
         &compaction_id,
@@ -504,15 +506,31 @@ async fn responses(
     headers: HeaderMap,
     Json(input): Json<Value>,
 ) -> impl IntoResponse {
-    let id = input
-        .get("id")
-        .and_then(Value::as_str)
-        .map(str::to_owned)
-        .unwrap_or_else(|| format!("resp_{}", Uuid::new_v4().simple()));
+    let id = response_id_from_input(&input);
     let previous = input.get("previous_response_id").and_then(Value::as_str);
     let config = state.active_config();
     let model = response_model_from_input(&config, &input);
-    let built_context = build_response_context(&state, &input, previous).await;
+    if let Err(response) = ensure_new_response_id(&state, &id, previous).await {
+        return response;
+    }
+    let resolved_previous =
+        match resolve_previous_response_id(&state, &id, &model, previous, &input).await {
+            Ok(previous) => previous,
+            Err(response) => return response,
+        };
+    let previous_for_context = resolved_previous.as_deref();
+    if let Err(error) = state
+        .store
+        .checkpoint_request(&id, previous_for_context, Some(&model), &input)
+        .await
+    {
+        return json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "state_checkpoint_failed",
+            error.to_string(),
+        );
+    }
+    let built_context = build_response_context(&state, &input, previous_for_context).await;
     let tool_execution_context = crate::tools::ToolExecutionContext::from_request(&input);
     let mut context_diagnostic = built_context.diagnostic.clone();
     if let Some(object) = context_diagnostic.as_object_mut() {
@@ -575,17 +593,6 @@ async fn responses(
         .to_owned();
     if let Err(error) = state
         .store
-        .checkpoint_request(&id, previous, Some(&upstream_model), &input)
-        .await
-    {
-        return json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "state_checkpoint_failed",
-            error.to_string(),
-        );
-    }
-    if let Err(error) = state
-        .store
         .replace_request_turn_messages(
             &id,
             &chat_messages_to_values(&built_context.current_messages),
@@ -619,6 +626,7 @@ async fn responses(
                 "id": id,
                 "endpoint": "/v1/responses",
                 "previous_response_id": previous,
+                "resolved_previous_response_id": previous_for_context,
                 "history_messages": history_message_count,
                 "context": context_diagnostic,
                 "requested_model": model,
@@ -758,6 +766,7 @@ async fn responses(
                                 }
                             }
                             let mut response = chat_completion_to_response(
+                                &config,
                                 &id,
                                 &model,
                                 result.chat,
@@ -766,15 +775,18 @@ async fn responses(
                             prepend_response_output_items(&mut response, result.response_items);
                             response
                         }
-                        ToolLoopResult::ClientToolCalls(chat) => {
-                            chat_completion_tool_calls_to_response(
+                        ToolLoopResult::ClientToolCalls(result) => {
+                            let mut response = chat_completion_tool_calls_to_response(
+                                &config,
                                 &id,
                                 &model,
-                                chat,
+                                result.chat,
                                 &community_tools,
                                 &external_tool_context,
                                 show_thinking_enabled(&config),
-                            )
+                            );
+                            prepend_response_output_items(&mut response, result.response_items);
+                            response
                         }
                     };
                     if append_auto_compaction_if_safe(&mut mapped, auto_compaction.as_ref()) {
@@ -876,8 +888,175 @@ fn upstream_error_detail(body_json: Option<&Value>, bytes: &[u8]) -> Value {
         .unwrap_or_else(|| compact_line(&String::from_utf8_lossy(bytes), 2_000));
     json!({
         "message": message,
-        "body": compact_line(&String::from_utf8_lossy(bytes), 4_000)
+        "body": {
+            "omitted": true,
+            "bytes": bytes.len(),
+            "note": "Raw upstream error bodies are not logged to avoid leaking secrets or prompt content."
+        }
     })
+}
+
+fn response_id_from_input(input: &Value) -> String {
+    input
+        .get("id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("resp_{}", Uuid::new_v4().simple()))
+}
+
+async fn ensure_new_response_id(
+    state: &ProxyState,
+    request_id: &str,
+    previous: Option<&str>,
+) -> Result<(), Response<Body>> {
+    if previous
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_some_and(|previous| previous == request_id)
+    {
+        return Err(json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_response_id",
+            "response id must not equal previous_response_id".to_owned(),
+        ));
+    }
+    match state.store.response_status(request_id).await {
+        Ok(Some(status)) => Err(json_error(
+            StatusCode::CONFLICT,
+            "duplicate_response_id",
+            format!("response id '{request_id}' already exists with status {status:?}"),
+        )),
+        Ok(None) => Ok(()),
+        Err(error) => Err(json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "state_response_id_check_failed",
+            error.to_string(),
+        )),
+    }
+}
+
+async fn resolve_previous_response_id(
+    state: &ProxyState,
+    request_id: &str,
+    model: &str,
+    previous: Option<&str>,
+    input: &Value,
+) -> Result<Option<String>, Response<Body>> {
+    let Some(previous) = previous.filter(|value| !value.trim().is_empty()) else {
+        return Ok(None);
+    };
+    match state.store.response_status(previous).await {
+        Ok(Some(RequestStatus::Completed)) => Ok(Some(previous.to_owned())),
+        Ok(Some(status)) if request_looks_like_codex_full_context(input) => {
+            let _ = state
+                .store
+                .record_event(
+                    "warn",
+                    "previous_response_not_completed_full_context_used",
+                    "previous_response_id was not completed; CodeSeeX used the full context sent by Codex instead.",
+                    Some(&json!({
+                        "id": request_id,
+                        "previous_response_id": previous,
+                        "previous_status": status,
+                        "input_items": input
+                            .get("input")
+                            .and_then(Value::as_array)
+                            .map(Vec::len)
+                            .unwrap_or(0)
+                    })),
+                )
+                .await;
+            Ok(None)
+        }
+        Ok(Some(status)) => {
+            let detail = json!({
+                "id": request_id,
+                "previous_response_id": previous,
+                "previous_status": status,
+                "error": "previous_response_id is not completed in this CodeSeeX process; send full context instead"
+            });
+            let _ = state
+                .store
+                .checkpoint_request(request_id, Some(previous), Some(model), input)
+                .await;
+            let _ = state
+                .store
+                .finish_request(request_id, RequestStatus::Failed, None, Some(&detail))
+                .await;
+            let _ = state
+                .store
+                .record_event(
+                    "error",
+                    "previous_response_not_completed",
+                    "previous_response_id is not completed in this CodeSeeX process.",
+                    Some(&detail),
+                )
+                .await;
+            Err(json_error(
+                StatusCode::CONFLICT,
+                "previous_response_not_completed",
+                "previous_response_id is not completed in this CodeSeeX process; send full context instead"
+                    .to_owned(),
+            ))
+        }
+        Ok(None) if request_looks_like_codex_full_context(input) => {
+            let _ = state
+                .store
+                .record_event(
+                    "warn",
+                    "previous_response_unavailable_full_context_used",
+                    "previous_response_id was unavailable; CodeSeeX used the full context sent by Codex instead.",
+                    Some(&json!({
+                        "id": request_id,
+                        "previous_response_id": previous,
+                        "input_items": input
+                            .get("input")
+                            .and_then(Value::as_array)
+                            .map(Vec::len)
+                            .unwrap_or(0)
+                    })),
+                )
+                .await;
+            Ok(None)
+        }
+        Ok(None) => {
+            let detail = json!({
+                "id": request_id,
+                "previous_response_id": previous,
+                "error": "previous_response_id is not available in this CodeSeeX process; send full context instead"
+            });
+            let _ = state
+                .store
+                .checkpoint_request(request_id, Some(previous), Some(model), input)
+                .await;
+            let _ = state
+                .store
+                .finish_request(request_id, RequestStatus::Failed, None, Some(&detail))
+                .await;
+            let _ = state
+                .store
+                .record_event(
+                    "error",
+                    "previous_response_unavailable",
+                    "previous_response_id is not available in this CodeSeeX process.",
+                    Some(&detail),
+                )
+                .await;
+            Err(json_error(
+                StatusCode::CONFLICT,
+                "previous_response_unavailable",
+                "previous_response_id is not available in this CodeSeeX process; send full context instead"
+                    .to_owned(),
+            ))
+        }
+        Err(error) => Err(json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "state_previous_response_check_failed",
+            error.to_string(),
+        )),
+    }
 }
 
 fn response_model_from_input(config: &AppConfig, input: &Value) -> String {
@@ -1080,6 +1259,28 @@ struct StreamingResponseParams {
     auto_compaction: Option<Value>,
 }
 
+struct StreamingRequestGuard {
+    store: codeseex_store::Store,
+    response_id: String,
+}
+
+impl Drop for StreamingRequestGuard {
+    fn drop(&mut self) {
+        let store = self.store.clone();
+        let response_id = self.response_id.clone();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                let _ = store
+                    .interrupt_request_if_in_progress(
+                        &response_id,
+                        "stream dropped before request completion",
+                    )
+                    .await;
+            });
+        }
+    }
+}
+
 fn response_stream_from_chat(params: StreamingResponseParams) -> axum::response::Response {
     let StreamingResponseParams {
         response_id,
@@ -1095,8 +1296,13 @@ fn response_stream_from_chat(params: StreamingResponseParams) -> axum::response:
         external_tool_context,
         auto_compaction,
     } = params;
+    let guard = StreamingRequestGuard {
+        store: state.store.clone(),
+        response_id: response_id.clone(),
+    };
     let stream: BoxStream<'static, Result<Bytes, std::io::Error>> = Box::pin(
         async_stream::try_stream! {
+            let _stream_guard = guard;
             io_result(())?;
             let created_at = now_seconds();
             let mut sequence = 0_u64;
@@ -1163,6 +1369,7 @@ fn response_stream_from_chat(params: StreamingResponseParams) -> axum::response:
                             if reasoning_open {
                                 if let Some(current_output_index) = reasoning_output_index {
                                     let (bytes, item) = reasoning_done_sse_events(
+                                        &config,
                                         &response_id,
                                         current_output_index,
                                         &reasoning_item_id,
@@ -1173,7 +1380,7 @@ fn response_stream_from_chat(params: StreamingResponseParams) -> axum::response:
                                     output.push(item);
                                 }
                             } else {
-                                let item = reasoning_response_item(&turn_reasoning, false);
+                                let item = reasoning_response_item(&config, &turn_reasoning, false);
                                 let current_output_index = output_index;
                                 output_index += 1;
                                 yield hidden_reasoning_item_sse_events(

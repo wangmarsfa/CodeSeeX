@@ -169,31 +169,49 @@ fn visible_compaction_text(item: &Value) -> Option<String> {
 }
 
 fn encode_compaction_payload(config: &AppConfig, payload: &CompactionPayload) -> Result<String> {
+    let plaintext = serde_json::to_vec(payload)?;
+    encode_opaque_bytes(config, COMPACTION_PREFIX, &plaintext)
+}
+
+fn decode_compaction_payload(config: &AppConfig, value: &str) -> Result<CompactionPayload> {
+    let plaintext = decode_opaque_bytes(config, COMPACTION_PREFIX, value)?;
+    Ok(serde_json::from_slice(&plaintext)?)
+}
+
+pub(crate) fn encode_opaque_text(config: &AppConfig, prefix: &str, text: &str) -> Result<String> {
+    encode_opaque_bytes(config, prefix, text.as_bytes())
+}
+
+pub(crate) fn decode_opaque_text(config: &AppConfig, prefix: &str, value: &str) -> Result<String> {
+    let plaintext = decode_opaque_bytes(config, prefix, value)?;
+    Ok(String::from_utf8(plaintext)?)
+}
+
+fn encode_opaque_bytes(config: &AppConfig, prefix: &str, plaintext: &[u8]) -> Result<String> {
     let key = compaction_key(config)?;
     let cipher = Aes256Gcm::new_from_slice(&key).context("invalid compaction key")?;
     let nonce_bytes = nonce_bytes();
     let nonce = Nonce::from_slice(&nonce_bytes);
-    let plaintext = serde_json::to_vec(payload)?;
     let encrypted = cipher
-        .encrypt(nonce, plaintext.as_slice())
-        .map_err(|error| anyhow::anyhow!("failed to encrypt compaction payload: {error}"))?;
+        .encrypt(nonce, plaintext)
+        .map_err(|error| anyhow::anyhow!("failed to encrypt opaque payload: {error}"))?;
     let (ciphertext, tag) = encrypted.split_at(encrypted.len().saturating_sub(16));
     Ok(format!(
-        "{COMPACTION_PREFIX}{}.{}.{}",
+        "{prefix}{}.{}.{}",
         general_purpose::URL_SAFE_NO_PAD.encode(nonce_bytes),
         general_purpose::URL_SAFE_NO_PAD.encode(tag),
         general_purpose::URL_SAFE_NO_PAD.encode(ciphertext)
     ))
 }
 
-fn decode_compaction_payload(config: &AppConfig, value: &str) -> Result<CompactionPayload> {
+fn decode_opaque_bytes(config: &AppConfig, prefix: &str, value: &str) -> Result<Vec<u8>> {
     let raw = value.trim();
     let encoded = raw
-        .strip_prefix(COMPACTION_PREFIX)
-        .context("not a CodeSeeX compaction payload")?;
+        .strip_prefix(prefix)
+        .context("not a CodeSeeX opaque payload")?;
     let parts = encoded.split('.').collect::<Vec<_>>();
     if parts.len() != 3 {
-        anyhow::bail!("invalid compaction payload segment count");
+        anyhow::bail!("invalid opaque payload segment count");
     }
     let nonce = general_purpose::URL_SAFE_NO_PAD.decode(parts[0])?;
     let tag = general_purpose::URL_SAFE_NO_PAD.decode(parts[1])?;
@@ -204,20 +222,26 @@ fn decode_compaction_payload(config: &AppConfig, value: &str) -> Result<Compacti
     let cipher = Aes256Gcm::new_from_slice(&key).context("invalid compaction key")?;
     let plaintext = cipher
         .decrypt(Nonce::from_slice(&nonce), encrypted.as_slice())
-        .map_err(|error| anyhow::anyhow!("failed to decrypt compaction payload: {error}"))?;
-    Ok(serde_json::from_slice(&plaintext)?)
+        .map_err(|error| anyhow::anyhow!("failed to decrypt opaque payload: {error}"))?;
+    Ok(plaintext)
 }
 
 fn compaction_key(config: &AppConfig) -> Result<[u8; 32]> {
     let secret = if let Ok(secret) = std::env::var("CODESEEX_COMPACTION_SECRET") {
         secret
     } else {
-        let path = config.data_dir.join("compact.key");
+        let path = compaction_secret_path(config);
+        let legacy_path = legacy_compaction_secret_path(config);
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
         match fs::read_to_string(&path) {
             Ok(value) if !value.trim().is_empty() => value,
+            _ if legacy_path.exists() => {
+                let value = read_existing_compaction_secret(&legacy_path)?;
+                let _ = fs::write(&path, value.as_bytes());
+                value
+            }
             _ => {
                 let value = format!("codeseex-next-{}", Uuid::new_v4().simple());
                 match fs::OpenOptions::new()
@@ -238,6 +262,14 @@ fn compaction_key(config: &AppConfig) -> Result<[u8; 32]> {
     let mut key = [0_u8; 32];
     key.copy_from_slice(&digest);
     Ok(key)
+}
+
+fn compaction_secret_path(config: &AppConfig) -> std::path::PathBuf {
+    config.data_dir.join("secrets").join("compact.key")
+}
+
+fn legacy_compaction_secret_path(config: &AppConfig) -> std::path::PathBuf {
+    config.data_dir.join("compact.key")
 }
 
 fn read_existing_compaction_secret(path: &std::path::Path) -> Result<String> {

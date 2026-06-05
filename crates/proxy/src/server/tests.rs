@@ -1,5 +1,8 @@
 use super::*;
-use crate::responses::context::{response_history_messages, response_output_tool_call_messages};
+use crate::responses::context::{
+    response_history_messages, response_output_tool_call_messages,
+    response_output_tool_call_messages_with_config,
+};
 use crate::tools::chat_protocol::assistant_message_from_chat_tool_subset;
 use crate::tools::ownership::ChatToolCall;
 use codeseex_core::config::UpstreamConfig;
@@ -41,7 +44,7 @@ async fn serve_with_shutdown_exits_after_listening() {
     let data_dir = temp_workspace("serve-shutdown");
     let mut config = test_config(data_dir.clone());
     config.port = 0;
-    let database_path = config.database_path();
+    let database_path = config.legacy_database_path();
     let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
@@ -59,7 +62,10 @@ async fn serve_with_shutdown_exits_after_listening() {
 
     assert!(started_rx.await.is_ok(), "listening callback should run");
     assert!(result.is_ok(), "server should stop cleanly: {result:?}");
-    std::fs::remove_file(&database_path).expect("database handle should be released on shutdown");
+    assert!(
+        !database_path.exists(),
+        "CodeSeeX should not create codeseex.db for runtime state"
+    );
     let _ = std::fs::remove_dir_all(data_dir);
 }
 
@@ -317,6 +323,7 @@ fn maps_chat_usage_to_responses_usage_shape() {
 
 #[test]
 fn mapped_response_keeps_codex_completion_metadata() {
+    let config = test_config(temp_workspace("mapped-response"));
     let chat = json!({
         "choices": [{
             "message": { "role": "assistant", "content": "ok" }
@@ -324,7 +331,7 @@ fn mapped_response_keeps_codex_completion_metadata() {
         "usage": { "prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12 }
     });
 
-    let response = chat_completion_to_response("resp_test", "deepseek-v4-pro", chat, true);
+    let response = chat_completion_to_response(&config, "resp_test", "deepseek-v4-pro", chat, true);
 
     assert_eq!(response["status"], "completed");
     assert_eq!(response["error"], Value::Null);
@@ -501,6 +508,7 @@ fn mixed_native_and_code_tool_replay_keeps_only_executed_code_tools() {
 
 #[test]
 fn internal_code_tools_keep_codeseex_ownership_without_client_function_calls() {
+    let config = test_config(temp_workspace("tool-calls-response"));
     let chat = json!({
         "choices": [{
             "message": {
@@ -547,6 +555,7 @@ fn internal_code_tools_keep_codeseex_ownership_without_client_function_calls() {
     ])));
 
     let response = chat_completion_tool_calls_to_response(
+        &config,
         "resp_test",
         "deepseek-v4-pro",
         chat,
@@ -607,6 +616,7 @@ fn internal_code_tools_do_not_trigger_external_passthrough() {
 
 #[test]
 fn web_search_maps_to_native_response_item_not_proxy_tool_item() {
+    let config = test_config(temp_workspace("web-search-response"));
     let chat = json!({
         "choices": [{
             "message": {
@@ -624,6 +634,7 @@ fn web_search_maps_to_native_response_item_not_proxy_tool_item() {
         }]
     });
     let response = chat_completion_tool_calls_to_response(
+        &config,
         "resp_web",
         "deepseek-v4-pro",
         chat,
@@ -765,7 +776,7 @@ async fn streaming_closes_thinking_before_final_content() {
         Uuid::new_v4().simple()
     ));
     let config = test_config_with_upstream(data_dir, fake_addr);
-    let store = Store::open(&config.database_path()).await.unwrap();
+    let store = Store::open(&config.data_dir).await.unwrap();
     let proxy_state = ProxyState {
         config: Arc::new(config),
         client: reqwest::Client::new(),
@@ -829,7 +840,7 @@ async fn streaming_internal_tools_execute_inside_proxy_without_client_function_c
         Uuid::new_v4().simple()
     ));
     let config = test_config_with_upstream(data_dir, fake_addr);
-    let store = Store::open(&config.database_path()).await.unwrap();
+    let store = Store::open(&config.data_dir).await.unwrap();
     let proxy_state = ProxyState {
         config: Arc::new(config),
         client: reqwest::Client::new(),
@@ -924,6 +935,142 @@ async fn streaming_internal_tools_execute_inside_proxy_without_client_function_c
 }
 
 #[tokio::test]
+async fn responses_missing_previous_response_id_returns_conflict_without_upstream_call() {
+    let fake_state = FakeUpstreamState::default();
+    let fake_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let fake_addr = fake_listener.local_addr().unwrap();
+    let fake_app = Router::new()
+        .route("/chat/completions", post(fake_final_chat_completions))
+        .with_state(fake_state.clone());
+    tokio::spawn(async move {
+        axum::serve(fake_listener, fake_app).await.unwrap();
+    });
+
+    let data_dir = temp_workspace("missing-previous-conflict");
+    let config = test_config_with_upstream(data_dir.clone(), fake_addr);
+    let store = Store::open(&config.data_dir).await.unwrap();
+    let proxy_state = ProxyState {
+        config: Arc::new(config),
+        client: reqwest::Client::new(),
+        store: store.clone(),
+    };
+    let proxy_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    let proxy_app = Router::new()
+        .route("/v1/responses", post(responses))
+        .with_state(proxy_state);
+    tokio::spawn(async move {
+        axum::serve(proxy_listener, proxy_app).await.unwrap();
+    });
+
+    let response = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/responses"))
+        .json(&json!({
+            "id": "resp_missing_previous",
+            "model": "deepseek-v4-pro",
+            "previous_response_id": "resp_not_in_process",
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "continue" }]
+            }]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let text = response.text().await.unwrap();
+    assert!(text.contains("previous_response_unavailable"), "{text}");
+    assert_eq!(
+        fake_state
+            .requests
+            .lock()
+            .expect("fake upstream lock poisoned")
+            .len(),
+        0,
+        "missing in-process parent must not call upstream"
+    );
+    let summary = store.runtime_summary(10).await.unwrap();
+    assert_eq!(summary.request_count, 0);
+    assert_eq!(summary.failed_request_count, 1);
+
+    let _ = std::fs::remove_dir_all(data_dir);
+}
+
+#[tokio::test]
+async fn responses_missing_previous_response_id_allows_codex_full_context() {
+    let fake_state = FakeUpstreamState::default();
+    let fake_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let fake_addr = fake_listener.local_addr().unwrap();
+    let fake_app = Router::new()
+        .route("/chat/completions", post(fake_final_chat_completions))
+        .with_state(fake_state.clone());
+    tokio::spawn(async move {
+        axum::serve(fake_listener, fake_app).await.unwrap();
+    });
+
+    let data_dir = temp_workspace("missing-previous-full-context");
+    let config = test_config_with_upstream(data_dir.clone(), fake_addr);
+    let store = Store::open(&config.data_dir).await.unwrap();
+    let proxy_state = ProxyState {
+        config: Arc::new(config),
+        client: reqwest::Client::new(),
+        store: store.clone(),
+    };
+    let proxy_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    let proxy_app = Router::new()
+        .route("/v1/responses", post(responses))
+        .with_state(proxy_state);
+    tokio::spawn(async move {
+        axum::serve(proxy_listener, proxy_app).await.unwrap();
+    });
+
+    let input_items = (0..81)
+        .map(|index| {
+            json!({
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": format!("full context item {index}") }]
+            })
+        })
+        .collect::<Vec<_>>();
+    let response = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/responses"))
+        .json(&json!({
+            "id": "resp_full_context_after_restart",
+            "model": "deepseek-v4-pro",
+            "previous_response_id": "resp_not_in_process",
+            "prompt_cache_key": "thread-full-context",
+            "instructions": "answer briefly",
+            "tools": [],
+            "input": input_items
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        fake_state
+            .requests
+            .lock()
+            .expect("fake upstream lock poisoned")
+            .len(),
+        1
+    );
+    let chain = store
+        .response_context_chain("resp_full_context_after_restart", 1)
+        .await
+        .unwrap();
+    assert_eq!(chain[0].previous_response_id, None);
+    assert_eq!(chain[0].input["input"].as_array().unwrap().len(), 0);
+
+    let _ = std::fs::remove_dir_all(data_dir);
+}
+
+#[tokio::test]
 async fn current_input_tool_outputs_replay_as_chat_tool_protocol() {
     let fake_state = FakeUpstreamState::default();
     let fake_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
@@ -940,7 +1087,7 @@ async fn current_input_tool_outputs_replay_as_chat_tool_protocol() {
         Uuid::new_v4().simple()
     ));
     let config = test_config_with_upstream(data_dir, fake_addr);
-    let store = Store::open(&config.database_path()).await.unwrap();
+    let store = Store::open(&config.data_dir).await.unwrap();
     let proxy_state = ProxyState {
         config: Arc::new(config),
         client: reqwest::Client::new(),
@@ -1039,7 +1186,7 @@ async fn previous_response_history_pairs_tool_outputs_with_parent_calls() {
         Uuid::new_v4().simple()
     ));
     let config = test_config(data_dir);
-    let store = Store::open(&config.database_path()).await.unwrap();
+    let store = Store::open(&config.data_dir).await.unwrap();
     let state = ProxyState {
         config: Arc::new(config),
         client: reqwest::Client::new(),
@@ -1142,7 +1289,7 @@ async fn previous_response_history_prefers_persisted_turn_messages() {
         Uuid::new_v4().simple()
     ));
     let config = test_config(data_dir);
-    let store = Store::open(&config.database_path()).await.unwrap();
+    let store = Store::open(&config.data_dir).await.unwrap();
     let state = ProxyState {
         config: Arc::new(config),
         client: reqwest::Client::new(),
@@ -1228,7 +1375,7 @@ async fn streaming_mixed_internal_and_external_tools_runs_internal_first() {
         Uuid::new_v4().simple()
     ));
     let config = test_config_with_upstream(data_dir, fake_addr);
-    let store = Store::open(&config.database_path()).await.unwrap();
+    let store = Store::open(&config.data_dir).await.unwrap();
     let proxy_state = ProxyState {
         config: Arc::new(config),
         client: reqwest::Client::new(),
@@ -1322,7 +1469,7 @@ async fn non_streaming_web_search_emits_replayable_output_item() {
         Uuid::new_v4().simple()
     ));
     let config = test_config_with_upstream(data_dir, fake_addr);
-    let store = Store::open(&config.database_path()).await.unwrap();
+    let store = Store::open(&config.data_dir).await.unwrap();
     let proxy_state = ProxyState {
         config: Arc::new(config),
         client: reqwest::Client::new(),
@@ -1413,7 +1560,7 @@ async fn streaming_web_search_emits_replayable_output_item() {
         Uuid::new_v4().simple()
     ));
     let config = test_config_with_upstream(data_dir, fake_addr);
-    let store = Store::open(&config.database_path()).await.unwrap();
+    let store = Store::open(&config.data_dir).await.unwrap();
     let proxy_state = ProxyState {
         config: Arc::new(config),
         client: reqwest::Client::new(),
@@ -1485,7 +1632,8 @@ async fn streaming_web_search_emits_replayable_output_item() {
 }
 
 #[tokio::test]
-async fn responses_recover_web_search_facts_when_client_returns_call_without_output() {
+async fn responses_do_not_recover_global_web_search_facts_when_client_returns_call_without_output()
+{
     let fake_state = FakeUpstreamState::default();
     let fake_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let fake_addr = fake_listener.local_addr().unwrap();
@@ -1504,7 +1652,7 @@ async fn responses_recover_web_search_facts_when_client_returns_call_without_out
         Uuid::new_v4().simple()
     ));
     let config = test_config_with_upstream(data_dir.clone(), fake_addr);
-    let store = Store::open(&config.database_path()).await.unwrap();
+    let store = Store::open(&config.data_dir).await.unwrap();
     store
         .checkpoint_request(
             "resp_prior_web",
@@ -1588,7 +1736,7 @@ async fn responses_recover_web_search_facts_when_client_returns_call_without_out
     assert_eq!(requests.len(), 1);
     let upstream_messages = serde_json::to_string(&requests[0]["messages"]).unwrap();
     assert!(
-        upstream_messages.contains("Verified CodeSeeX tool execution facts"),
+        upstream_messages.contains("Verified prior tool/request facts from the client context"),
         "{upstream_messages}"
     );
     assert!(
@@ -1596,7 +1744,7 @@ async fn responses_recover_web_search_facts_when_client_returns_call_without_out
         "{upstream_messages}"
     );
     assert!(
-        upstream_messages.contains("light rain"),
+        !upstream_messages.contains("light rain"),
         "{upstream_messages}"
     );
 
@@ -1604,7 +1752,7 @@ async fn responses_recover_web_search_facts_when_client_returns_call_without_out
 }
 
 #[tokio::test]
-async fn responses_recover_empty_web_search_call_when_prior_final_text_matches() {
+async fn responses_do_not_recover_global_empty_web_search_fact_when_prior_final_text_matches() {
     let fake_state = FakeUpstreamState::default();
     let fake_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let fake_addr = fake_listener.local_addr().unwrap();
@@ -1623,7 +1771,7 @@ async fn responses_recover_empty_web_search_call_when_prior_final_text_matches()
         Uuid::new_v4().simple()
     ));
     let config = test_config_with_upstream(data_dir.clone(), fake_addr);
-    let store = Store::open(&config.database_path()).await.unwrap();
+    let store = Store::open(&config.data_dir).await.unwrap();
     store
         .checkpoint_request(
             "resp_prior_web",
@@ -1719,11 +1867,11 @@ async fn responses_recover_empty_web_search_call_when_prior_final_text_matches()
     assert_eq!(requests.len(), 1);
     let upstream_messages = serde_json::to_string(&requests[0]["messages"]).unwrap();
     assert!(
-        upstream_messages.contains("Verified CodeSeeX tool execution facts"),
+        upstream_messages.contains("Verified prior tool/request facts from the client context"),
         "{upstream_messages}"
     );
     assert!(
-        upstream_messages.contains("missing_url"),
+        !upstream_messages.contains("missing_url"),
         "{upstream_messages}"
     );
 
@@ -1754,7 +1902,7 @@ async fn streaming_apply_patch_returns_native_custom_tool_call() {
     let patch_file = patch_dir.join("hello.txt");
     let _ = std::fs::remove_file(&patch_file);
     let config = test_config_with_upstream(data_dir, fake_addr);
-    let store = Store::open(&config.database_path()).await.unwrap();
+    let store = Store::open(&config.data_dir).await.unwrap();
     let proxy_state = ProxyState {
         config: Arc::new(config),
         client: reqwest::Client::new(),
@@ -1824,10 +1972,11 @@ async fn streaming_apply_patch_returns_native_custom_tool_call() {
 
 #[test]
 fn reconstructed_tool_call_history_keeps_reasoning_content_field() {
+    let config = test_config(temp_workspace("reasoning-replay"));
     let reasoning = "read the file before answering";
     let response = json!({
         "output": [
-            reasoning_response_item(reasoning, false),
+            reasoning_response_item(&config, reasoning, false),
             {
                 "type": "function_call",
                 "call_id": "call_prev",
@@ -1836,8 +1985,12 @@ fn reconstructed_tool_call_history_keeps_reasoning_content_field() {
             }
         ]
     });
+    assert!(response["output"][0]["encrypted_content"]
+        .as_str()
+        .unwrap()
+        .starts_with("codeseex-reasoning-v1:"));
 
-    let messages = response_output_tool_call_messages(&response);
+    let messages = response_output_tool_call_messages_with_config(&response, &config);
     let serialized = serde_json::to_value(&messages[0]).unwrap();
 
     assert_eq!(messages.len(), 1);
@@ -1849,6 +2002,56 @@ fn reconstructed_tool_call_history_keeps_reasoning_content_field() {
         serialized["tool_calls"][0]["function"]["name"],
         "read_file_range"
     );
+}
+
+#[test]
+fn reasoning_item_empty_content_is_safe_only_when_replay_payload_exists() {
+    let config = test_config(temp_workspace("reasoning-empty-content-compare"));
+    let reasoning = "read the file before answering";
+    let call = json!({
+        "type": "function_call",
+        "call_id": "call_prev",
+        "name": "read_file_range",
+        "arguments": "{\"path\":\"README.md\"}"
+    });
+
+    let encrypted_response = json!({
+        "output": [reasoning_response_item(&config, reasoning, false), call.clone()]
+    });
+    let summary_response = json!({
+        "output": [
+            {
+                "type": "reasoning",
+                "status": "completed",
+                "summary": [{ "type": "summary_text", "text": reasoning }],
+                "content": []
+            },
+            call.clone()
+        ]
+    });
+    let empty_response = json!({
+        "output": [
+            {
+                "type": "reasoning",
+                "status": "completed",
+                "summary": [],
+                "content": []
+            },
+            call
+        ]
+    });
+
+    for response in [encrypted_response, summary_response] {
+        let messages = response_output_tool_call_messages_with_config(&response, &config);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].content, "");
+        assert_eq!(messages[0].reasoning_content.as_deref(), Some(reasoning));
+    }
+
+    let messages = response_output_tool_call_messages_with_config(&empty_response, &config);
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].content, "");
+    assert_ne!(messages[0].reasoning_content.as_deref(), Some(reasoning));
 }
 
 #[test]

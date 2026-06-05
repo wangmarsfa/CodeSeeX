@@ -1,6 +1,7 @@
 param(
   [string]$VsDevCmd = $env:CODESEEX_VSDEVCMD,
   [string]$DevRoot = "D:\DevTools\CodeSeeXNext",
+  [string]$DataDir = "D:\DevTools\CodeSeeXNext\Data",
   [switch]$NoBuild,
   [switch]$BuildOnly,
   [switch]$KeepExisting
@@ -45,8 +46,11 @@ $env:CARGO_HOME = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $Dev
 $env:CARGO_TARGET_DIR = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { Join-Path $DevRoot "CargoTarget" }
 $env:TEMP = Join-Path $DevRoot "Temp"
 $env:TMP = $env:TEMP
+if (-not $env:CODESEEX_DATA_DIR) {
+  $env:CODESEEX_DATA_DIR = $DataDir
+}
 
-New-Item -ItemType Directory -Force -Path $env:CARGO_HOME, $env:CARGO_TARGET_DIR, $env:TEMP, $LogDir | Out-Null
+New-Item -ItemType Directory -Force -Path $env:CARGO_HOME, $env:CARGO_TARGET_DIR, $env:TEMP, $env:CODESEEX_DATA_DIR, $LogDir | Out-Null
 
 function Resolve-VsDevCmd {
   param([string]$Requested)

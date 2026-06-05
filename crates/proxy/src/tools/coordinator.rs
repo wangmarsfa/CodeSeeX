@@ -31,7 +31,7 @@ pub(crate) struct ToolLoopContext<'a> {
 
 pub(crate) enum ToolLoopResult {
     FinalChat(ToolLoopResponse),
-    ClientToolCalls(Value),
+    ClientToolCalls(ToolLoopResponse),
 }
 
 pub(crate) struct ToolLoopResponse {
@@ -94,7 +94,10 @@ pub(crate) async fn complete_chat_with_tools(
                 .append_request_turn_messages(context.request_id, &[stored_assistant])
                 .await
                 .map_err(|error| format!("failed to persist client tool turn message: {error}"))?;
-            return Ok(ToolLoopResult::ClientToolCalls(chat));
+            return Ok(ToolLoopResult::ClientToolCalls(ToolLoopResponse {
+                chat,
+                response_items,
+            }));
         }
         if has_client_tools {
             let _ = context
@@ -220,7 +223,10 @@ pub(crate) async fn complete_chat_with_tools(
             messages.push(tool_message);
         }
         if has_client_tools {
-            return Ok(ToolLoopResult::ClientToolCalls(chat));
+            return Ok(ToolLoopResult::ClientToolCalls(ToolLoopResponse {
+                chat,
+                response_items,
+            }));
         }
         completed_tool_iterations += 1;
         let response = crate::upstream::post_chat_completions(

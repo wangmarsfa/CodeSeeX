@@ -11,6 +11,7 @@ use codeseex_core::{AppConfig, UserConfig};
 use codeseex_store::Store;
 use serde::Serialize;
 use serde_json::{json, Value};
+use std::env;
 use std::sync::Arc;
 
 #[derive(Debug, Clone)]
@@ -30,7 +31,7 @@ impl ManagerRuntime {
     pub async fn open(config: AppConfig) -> anyhow::Result<Self> {
         let timeout = std::time::Duration::from_millis(config.upstream.timeout_ms);
         Ok(Self {
-            store: Store::open(&config.database_path()).await?,
+            store: Store::open(&config.data_dir).await?,
             client: reqwest::Client::builder().timeout(timeout).build()?,
             config: Arc::new(config),
         })
@@ -96,12 +97,6 @@ impl ManagerRuntime {
     pub async fn status(&self) -> Value {
         let config = self.active_config();
         let runtime = self.store.runtime_overview().await.ok();
-        let events = self
-            .store
-            .recent_visible_events(30, None)
-            .await
-            .map(|(events, _)| events)
-            .unwrap_or_default();
         json!({
             "ok": true,
             "running": true,
@@ -128,7 +123,6 @@ impl ManagerRuntime {
                 "total_output_tokens": 0,
                 "average_ms": 0
             },
-            "events": events,
             "upstream": {
                 "base_url": config.upstream.base_url,
                 "official_v1_compat": config.upstream.official_v1_compat
@@ -179,6 +173,8 @@ impl ManagerRuntime {
         let mut payload = json!({
             "config_version": config_version(&config),
             "PROXY_PORT": proxy.and_then(|value| value.port).unwrap_or(config.port).to_string(),
+            "PROXY_PORT_EFFECTIVE": config.port.to_string(),
+            "PROXY_PORT_SOURCE": proxy_port_source(proxy.and_then(|value| value.port)),
             "DEEPSEEK_BASE_URL": upstream_base_url,
             "DEEPSEEK_OFFICIAL_V1_COMPAT": upstream.and_then(|value| value.official_v1_compat).unwrap_or(config.upstream.official_v1_compat).to_string(),
             "UPSTREAM_MODEL_OVERRIDE": model_override_to_ui(model_override),
@@ -219,57 +215,56 @@ impl ManagerRuntime {
     pub async fn save_config(&self, payload: Value) -> ManagerJsonResponse {
         let config = self.active_config();
         let existing_config = UserConfig::read_from(&config.config_path()).unwrap_or_default();
+        let existing_retention_days = existing_config.log_retention_days();
         let user_config = user_config_from_payload(&payload, existing_config, &config);
         match user_config.write_atomic(&config.config_path()) {
             Ok(()) => {
-                let maintenance = match self
-                    .store
-                    .run_maintenance(user_config.log_retention_days())
-                    .await
-                {
-                    Ok(report) => {
-                        if report.deleted_events > 0
-                            || report.sanitized_requests > 0
-                            || report.request_sanitize_limit_reached
-                        {
+                let new_retention_days = user_config.log_retention_days();
+                let maintenance = if new_retention_days == existing_retention_days {
+                    json!({
+                        "ok": true,
+                        "skipped": true,
+                        "reason": "log retention days unchanged"
+                    })
+                } else {
+                    match self.store.run_maintenance(new_retention_days).await {
+                        Ok(report) => {
+                            if report.deleted_events > 0 {
+                                let _ = self
+                                    .store
+                                    .record_event(
+                                        "info",
+                                        "log_maintenance_completed",
+                                        "CodeSeeX log maintenance completed.",
+                                        Some(&json!({
+                                            "log_retention_days": report.log_retention_days,
+                                            "deleted_log_files": report.deleted_events
+                                        })),
+                                    )
+                                    .await;
+                            }
+                            json!({
+                                "ok": true,
+                                "log_retention_days": report.log_retention_days,
+                                "deleted_events": report.deleted_events,
+                                "sanitized_requests": report.sanitized_requests,
+                                "request_sanitize_batches": report.request_sanitize_batches,
+                                "request_sanitize_limit_reached": report.request_sanitize_limit_reached,
+                                "vacuumed_storage": report.vacuumed_storage
+                            })
+                        }
+                        Err(error) => {
                             let _ = self
                                 .store
                                 .record_event(
-                                    "info",
-                                    "state_maintenance_completed",
-                                    "CodeSeeX state maintenance completed.",
-                                    Some(&json!({
-                                        "log_retention_days": report.log_retention_days,
-                                        "deleted_events": report.deleted_events,
-                                        "sanitized_requests": report.sanitized_requests,
-                                        "request_sanitize_batches": report.request_sanitize_batches,
-                                        "request_sanitize_limit_reached": report.request_sanitize_limit_reached,
-                                        "vacuumed_storage": report.vacuumed_storage
-                                    })),
+                                    "error",
+                                    "log_maintenance_failed",
+                                    "CodeSeeX failed to prune expired logs.",
+                                    Some(&json!({ "error": error.to_string() })),
                                 )
                                 .await;
+                            json!({ "ok": false, "error": error.to_string() })
                         }
-                        json!({
-                            "ok": true,
-                            "log_retention_days": report.log_retention_days,
-                            "deleted_events": report.deleted_events,
-                            "sanitized_requests": report.sanitized_requests,
-                            "request_sanitize_batches": report.request_sanitize_batches,
-                            "request_sanitize_limit_reached": report.request_sanitize_limit_reached,
-                            "vacuumed_storage": report.vacuumed_storage
-                        })
-                    }
-                    Err(error) => {
-                        let _ = self
-                            .store
-                            .record_event(
-                                "error",
-                                "state_maintenance_failed",
-                                "CodeSeeX failed to prune expired events.",
-                                Some(&json!({ "error": error.to_string() })),
-                            )
-                            .await;
-                        json!({ "ok": false, "error": error.to_string() })
                     }
                 };
                 let _ = self
@@ -528,6 +523,16 @@ fn status(status: u16, body: Value) -> ManagerJsonResponse {
     ManagerJsonResponse { status, body }
 }
 
+fn proxy_port_source(configured_port: Option<u16>) -> &'static str {
+    if env::var("CODESEEX_PORT").is_ok() {
+        "env"
+    } else if configured_port.is_some() {
+        "config"
+    } else {
+        "default"
+    }
+}
+
 fn web_search_proxy_to_ui(value: codeseex_core::WebSearchProxyMode) -> &'static str {
     match value {
         codeseex_core::WebSearchProxyMode::System => "system",
@@ -653,6 +658,28 @@ mod tests {
             Some("not_applicable_without_desktop_runtime")
         );
 
+        let _ = std::fs::remove_dir_all(config.data_dir);
+    }
+
+    #[tokio::test]
+    async fn status_does_not_embed_log_events() {
+        let config = temp_config("status-no-events");
+        let runtime = ManagerRuntime::open(config.clone())
+            .await
+            .expect("open manager runtime");
+        runtime
+            .store
+            .record_event("info", "test_event", "event should stay in logs", None)
+            .await
+            .expect("record event");
+
+        let status = runtime.status().await;
+
+        assert!(status.get("events").is_none());
+        assert_eq!(
+            status.pointer("/runtime/status").and_then(Value::as_str),
+            Some("running")
+        );
         let _ = std::fs::remove_dir_all(config.data_dir);
     }
 

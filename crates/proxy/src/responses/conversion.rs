@@ -6,10 +6,12 @@ use crate::tools::ownership::{partition_tool_calls, proxy_executed_calls_in_orde
 use crate::tools::response_items::{
     native_apply_patch_response_item_from_chat_call, proxy_visible_response_items,
 };
+use codeseex_core::AppConfig;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
 pub(crate) fn chat_completion_to_response(
+    config: &AppConfig,
     id: &str,
     model: &str,
     chat: Value,
@@ -29,7 +31,11 @@ pub(crate) fn chat_completion_to_response(
         .unwrap_or_default();
     let mut output = Vec::new();
     if !reasoning.trim().is_empty() {
-        output.push(reasoning_response_item(reasoning, visible_thinking_enabled));
+        output.push(reasoning_response_item(
+            config,
+            reasoning,
+            visible_thinking_enabled,
+        ));
     }
     output.push(json!({
         "id": format!("msg_{}", Uuid::new_v4().simple()),
@@ -54,6 +60,7 @@ pub(crate) fn chat_completion_to_response(
 }
 
 pub(crate) fn chat_completion_tool_calls_to_response(
+    config: &AppConfig,
     id: &str,
     model: &str,
     chat: Value,
@@ -68,7 +75,11 @@ pub(crate) fn chat_completion_tool_calls_to_response(
         .and_then(Value::as_str)
         .filter(|text| !text.trim().is_empty())
     {
-        output.push(reasoning_response_item(reasoning, visible_thinking_enabled));
+        output.push(reasoning_response_item(
+            config,
+            reasoning,
+            visible_thinking_enabled,
+        ));
     }
     if let Some(text) = chat
         .pointer("/choices/0/message/content")

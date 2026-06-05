@@ -8,6 +8,7 @@ const MAX_FACT_TEXT_CHARS: usize = 4096;
 const MAX_FACTS: usize = 128;
 const MAX_TOOL_OUTPUT_CHARS: usize = 12_000;
 const MAX_MESSAGE_CONTENT_CHARS: usize = 24_000;
+pub const CODEX_FULL_CONTEXT_INPUT_ITEMS_THRESHOLD: usize = 80;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ContextDiagnostic {
@@ -31,6 +32,20 @@ pub fn responses_input_to_messages(input: &Value) -> Vec<ChatMessage> {
 
 pub fn compile_responses_input(input: &Value) -> CompiledResponsesInput {
     compile_responses_input_with_tool_outputs(input, &HashSet::new())
+}
+
+pub fn request_looks_like_codex_full_context(value: &Value) -> bool {
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    if object.get("instructions").is_none() || object.get("tools").is_none() {
+        return false;
+    }
+    object
+        .get("input")
+        .and_then(Value::as_array)
+        .map(|items| items.len() > CODEX_FULL_CONTEXT_INPUT_ITEMS_THRESHOLD)
+        .unwrap_or(false)
 }
 
 pub fn compile_responses_input_with_tool_outputs(

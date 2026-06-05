@@ -22,15 +22,16 @@ This checklist is the migration guardrail for replacing the Electron implementat
 - `response.completed` includes stable Codex metadata: `error`, `incomplete_details`, and `parallel_tool_calls`.
 - Upstream URL normalization supports official DeepSeek and custom OpenAI-compatible/local deployments.
 
-## P0 Context And State
+## P0 Context And Runtime State
 
-- Request lifecycle is durable in SQLite from request start: in progress, completed, failed, and interrupted.
-- Long `previous_response_id` chains are reconstructed without low fixed-depth truncation.
-- Completed parent turns replay assistant final text or legal tool pairs.
-- Failed/interrupted parent turns replay user input and verified facts only, never partial assistant final text.
-- Tool facts outrank assistant self-description during replay.
+- Request lifecycle is tracked in current-process runtime state: in progress, completed, failed, and interrupted.
+- Restart clears recent request/usage state; CodeSeeX must not recreate Codex conversation state from local storage.
+- `previous_response_id` chains are supported only while the referenced state is available in the current process.
+- Completed parent turns in the current process can replay assistant final text or legal tool pairs.
+- Failed/interrupted parent turns do not become durable assistant context.
+- Tool facts are scoped to the current request/process bridge and must not become a global durable fact pool.
 - Inline `data:` URLs are redacted to deterministic size/hash markers before entering model-visible text context.
-- Manual compact produces explicit readable compaction items, not fake `encrypted_content`.
+- Manual compact produces explicit readable summaries plus CodeSeeX-owned opaque `encrypted_content`, not fake OpenAI server state.
 - Compact summaries never override verified tool facts.
 
 ## P0 Tool Parity
@@ -56,6 +57,7 @@ This checklist is the migration guardrail for replacing the Electron implementat
 - Autostart starts to tray without forcing the main window open.
 - Single-instance guard prevents duplicate desktop processes.
 - The manager exposes Overview, Configuration, Tools, Logs/Usage, and About/Update status.
+- Logs/Usage show current-process usage plus file-backed logs; recent request state is not preserved across restart.
 - `config.toml` remains copy-only; CodeSeeX does not edit the user's Codex config.
 
 ## P1 Product Parity

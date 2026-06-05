@@ -1,41 +1,58 @@
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Duration, Utc};
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use serde_json::{json, Value};
-use sqlx::{
-    sqlite::{SqliteConnectOptions, SqliteJournalMode, SqliteSynchronous},
-    Row, SqlitePool,
-};
-use std::collections::HashSet;
-use std::path::Path;
-use std::time::Duration as StdDuration;
+use codeseex_core::context::request_looks_like_codex_full_context;
+use regex::Regex;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Map, Value};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::hash::{Hash, Hasher};
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
-const MAX_STORAGE_STRING_CHARS: usize = 64 * 1024;
-const MAX_STORAGE_JSON_BYTES: usize = 512 * 1024;
-const COMPACT_STORAGE_STRING_CHARS: usize = 4 * 1024;
-const COMPACT_STORAGE_ARRAY_HEAD_ITEMS: usize = 80;
-const COMPACT_STORAGE_ARRAY_TAIL_ITEMS: usize = 20;
-const COMPACT_STORAGE_OBJECT_KEYS: usize = 128;
-const MAX_STORAGE_TOOL_FACTS_PER_REQUEST: usize = 100;
-const CODEX_FULL_CONTEXT_INPUT_ITEMS_THRESHOLD: usize = 80;
-const CODEX_FULL_CONTEXT_TURN_MESSAGES_THRESHOLD: usize = 80;
-const CODEX_FULL_CONTEXT_STORAGE_TAIL_ITEMS: usize = 32;
-const RECENT_TOOL_FACT_RETENTION_HOURS: i64 = 24;
-const TOOL_FACT_OMITTED_PREFIX: &str = "[CodeSeeX storage omitted ";
-const TOOL_FACT_OMITTED_SUFFIX: &str = " older tool fact(s) after exceeding durable state budget]";
-const MAINTENANCE_LARGE_FIELD_BYTES: i64 = 256 * 1024;
-#[cfg(not(test))]
-const MAINTENANCE_REQUEST_BATCH: i64 = 200;
-#[cfg(test)]
-const MAINTENANCE_REQUEST_BATCH: i64 = 8;
-const MAINTENANCE_REQUEST_MAX_BATCHES: usize = 20;
+const MAX_RUNTIME_REQUESTS: usize = 2_048;
+const MAX_RUNTIME_TURNS: usize = 500;
+const MAX_TURN_MESSAGES_PER_REQUEST: usize = 256;
+const MAX_TOOL_FACTS_PER_REQUEST: usize = 100;
+const MAX_LOG_STRING_CHARS: usize = 4_096;
+const MAX_MEMORY_STRING_CHARS: usize = 64 * 1024;
+const MAX_MEMORY_ARRAY_ITEMS: usize = 256;
+const IN_PROGRESS_TTL_SECONDS: i64 = 6 * 60 * 60;
+const LOG_TAIL_CHUNK_BYTES: u64 = 64 * 1024;
+
+static STORE_REGISTRY: OnceLock<Mutex<HashMap<PathBuf, Weak<Mutex<StoreInner>>>>> = OnceLock::new();
 
 #[derive(Debug, Clone)]
 pub struct Store {
-    pool: SqlitePool,
+    data_dir: Arc<PathBuf>,
+    logs_dir: Arc<PathBuf>,
+    legacy_database_path: Arc<PathBuf>,
+    inner: Arc<Mutex<StoreInner>>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Default)]
+struct StoreInner {
+    requests: HashMap<String, StoredRequest>,
+    request_order: VecDeque<String>,
+    next_event_id: i64,
+}
+
+#[derive(Debug, Clone)]
+struct StoredRequest {
+    id: String,
+    previous_response_id: Option<String>,
+    status: RequestStatus,
+    model: Option<String>,
+    input: Value,
+    response: Value,
+    turn_messages: Vec<Value>,
+    tool_facts: Vec<String>,
+    diagnostic: Option<Value>,
+    created_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EventRecord {
     pub id: i64,
     pub level: String,
@@ -83,17 +100,6 @@ pub struct MaintenanceReport {
     pub vacuumed_storage: bool,
 }
 
-struct RequestSanitizeReport {
-    sanitized_requests: u64,
-    batches: u64,
-    limit_reached: bool,
-}
-
-struct RequestSanitizeBatch {
-    fetched: u64,
-    changed: u64,
-}
-
 #[derive(Debug, Clone, Serialize)]
 pub struct StoredResponse {
     pub id: String,
@@ -120,116 +126,55 @@ pub enum RequestStatus {
     Interrupted,
 }
 
-impl RequestStatus {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::InProgress => "in_progress",
-            Self::Completed => "completed",
-            Self::Failed => "failed",
-            Self::Interrupted => "interrupted",
-        }
-    }
-
-    fn from_str(value: &str) -> Self {
-        match value {
-            "completed" => Self::Completed,
-            "failed" => Self::Failed,
-            "interrupted" => Self::Interrupted,
-            _ => Self::InProgress,
-        }
-    }
-}
-
-fn parse_json_field<T: DeserializeOwned>(label: &str, text: &str) -> Result<T> {
-    serde_json::from_str(text).with_context(|| format!("parse {label}"))
-}
-
-fn parse_optional_json_field<T: DeserializeOwned>(
-    label: &str,
-    text: Option<&str>,
-) -> Result<Option<T>> {
-    text.map(|value| parse_json_field(label, value)).transpose()
-}
-
 impl Store {
+    fn lock_inner(&self) -> Result<std::sync::MutexGuard<'_, StoreInner>> {
+        self.inner
+            .lock()
+            .map_err(|_| anyhow::anyhow!("store runtime lock was poisoned"))
+    }
+
     pub async fn open(path: &Path) -> Result<Self> {
-        if let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .with_context(|| format!("create data directory {}", parent.display()))?;
+        let data_dir = data_dir_from_store_path(path);
+        ensure_data_dir_layout(&data_dir)
+            .await
+            .with_context(|| format!("initialize CodeSeeX data dir {}", data_dir.display()))?;
+        let data_dir = std::fs::canonicalize(&data_dir).unwrap_or(data_dir);
+        let inner = shared_runtime_inner(&data_dir)?;
+        Ok(Self {
+            logs_dir: Arc::new(data_dir.join("logs")),
+            legacy_database_path: Arc::new(data_dir.join("codeseex.db")),
+            data_dir: Arc::new(data_dir),
+            inner,
+        })
+    }
+
+    pub async fn close(&self) {}
+
+    pub async fn run_maintenance(&self, log_retention_days: u16) -> Result<MaintenanceReport> {
+        ensure_data_dir_layout(&self.data_dir).await?;
+        let log_retention_days = log_retention_days.clamp(1, 365);
+        let deleted_events = prune_old_logs(&self.logs_dir, log_retention_days).await?;
+        if self.legacy_database_path.exists() {
+            let _ = self
+                .record_event(
+                    "warn",
+                    "legacy_database_ignored",
+                    "Legacy codeseex.db was ignored; CodeSeeX runtime state now uses memory and logs files.",
+                    Some(&json!({
+                        "path": self.legacy_database_path.to_string_lossy(),
+                        "note": "The file is not deleted automatically."
+                    })),
+                )
+                .await;
         }
-        let options = SqliteConnectOptions::new()
-            .filename(path)
-            .create_if_missing(true)
-            .foreign_keys(true)
-            .journal_mode(SqliteJournalMode::Wal)
-            .synchronous(SqliteSynchronous::Normal)
-            .busy_timeout(StdDuration::from_secs(5));
-        let pool = SqlitePool::connect_with(options).await?;
-        let store = Self { pool };
-        store.migrate().await?;
-        Ok(store)
-    }
-
-    pub async fn close(&self) {
-        self.pool.close().await;
-    }
-
-    pub async fn migrate(&self) -> Result<()> {
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS requests (
-              id TEXT PRIMARY KEY,
-              previous_response_id TEXT,
-              status TEXT NOT NULL,
-              model TEXT,
-              input_json TEXT NOT NULL,
-              response_json TEXT,
-              turn_messages_json TEXT,
-              tool_facts_json TEXT,
-              diagnostic_json TEXT,
-              created_at TEXT NOT NULL,
-              updated_at TEXT NOT NULL
-            );
-            "#,
-        )
-        .execute(&self.pool)
-        .await?;
-
-        ensure_column(&self.pool, "requests", "tool_facts_json", "TEXT").await?;
-        ensure_column(&self.pool, "requests", "turn_messages_json", "TEXT").await?;
-
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS events (
-              id INTEGER PRIMARY KEY AUTOINCREMENT,
-              level TEXT NOT NULL,
-              event_type TEXT NOT NULL,
-              message TEXT NOT NULL,
-              detail_json TEXT,
-              created_at TEXT NOT NULL
-            );
-            "#,
-        )
-        .execute(&self.pool)
-        .await?;
-
-        sqlx::query(
-            "CREATE INDEX IF NOT EXISTS idx_requests_status_updated_at ON requests(status, updated_at DESC);",
-        )
-        .execute(&self.pool)
-        .await?;
-        sqlx::query(
-            "CREATE INDEX IF NOT EXISTS idx_requests_previous_response_id ON requests(previous_response_id);",
-        )
-        .execute(&self.pool)
-        .await?;
-        sqlx::query(
-            "CREATE INDEX IF NOT EXISTS idx_events_level_created_at ON events(level, created_at DESC, id DESC);",
-        )
-        .execute(&self.pool)
-        .await?;
-        Ok(())
+        Ok(MaintenanceReport {
+            log_retention_days,
+            deleted_events,
+            sanitized_requests: 0,
+            request_sanitize_batches: 0,
+            request_sanitize_limit_reached: false,
+            vacuumed_storage: false,
+        })
     }
 
     pub async fn checkpoint_request(
@@ -239,277 +184,47 @@ impl Store {
         model: Option<&str>,
         input: &Value,
     ) -> Result<()> {
-        let now = Utc::now().to_rfc3339();
-        sqlx::query(
-            r#"
-            INSERT INTO requests (id, previous_response_id, status, model, input_json, created_at, updated_at)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)
-            ON CONFLICT(id) DO UPDATE SET
-              previous_response_id = excluded.previous_response_id,
-              status = excluded.status,
-              model = excluded.model,
-              input_json = excluded.input_json,
-              response_json = NULL,
-              turn_messages_json = NULL,
-              tool_facts_json = NULL,
-              diagnostic_json = NULL,
-              updated_at = excluded.updated_at;
-            "#,
-        )
-        .bind(id)
-        .bind(previous_response_id)
-        .bind(RequestStatus::InProgress.as_str())
-        .bind(model)
-        .bind(storage_request_input_json_string(
-            previous_response_id,
-            input,
-        )?)
-        .bind(now)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
-    pub async fn run_maintenance(&self, log_retention_days: u16) -> Result<MaintenanceReport> {
-        let log_retention_days = log_retention_days.clamp(1, 365);
-        let cutoff = Utc::now()
-            .checked_sub_signed(Duration::days(i64::from(log_retention_days)))
-            .unwrap_or_else(Utc::now)
-            .to_rfc3339();
-        let deleted_events = sqlx::query(
-            r#"
-            DELETE FROM events
-            WHERE created_at < ?1;
-            "#,
-        )
-        .bind(cutoff)
-        .execute(&self.pool)
-        .await?
-        .rows_affected();
-        let request_sanitize = self.sanitize_large_request_payloads().await?;
-        let vacuumed_storage = if deleted_events > 0 || request_sanitize.sanitized_requests > 0 {
-            self.vacuum_storage().await?;
-            true
-        } else {
-            false
+        let now = Utc::now();
+        let mut inner = self.lock_inner()?;
+        if inner.requests.contains_key(id) {
+            bail!("request id '{id}' already exists in this CodeSeeX process");
+        }
+        let request = StoredRequest {
+            id: id.to_owned(),
+            previous_response_id: previous_response_id.map(str::to_owned),
+            status: RequestStatus::InProgress,
+            model: model.map(str::to_owned),
+            input: request_input_for_runtime(previous_response_id, input),
+            response: Value::Null,
+            turn_messages: Vec::new(),
+            tool_facts: Vec::new(),
+            diagnostic: None,
+            created_at: now,
+            updated_at: now,
         };
-        Ok(MaintenanceReport {
-            log_retention_days,
-            deleted_events,
-            sanitized_requests: request_sanitize.sanitized_requests,
-            request_sanitize_batches: request_sanitize.batches,
-            request_sanitize_limit_reached: request_sanitize.limit_reached,
-            vacuumed_storage,
-        })
-    }
-
-    async fn vacuum_storage(&self) -> Result<()> {
-        sqlx::query("PRAGMA wal_checkpoint(TRUNCATE);")
-            .execute(&self.pool)
-            .await?;
-        sqlx::query("VACUUM;").execute(&self.pool).await?;
+        inner.requests.insert(id.to_owned(), request);
+        push_request_order(&mut inner.request_order, id);
+        prune_runtime_requests(&mut inner);
         Ok(())
-    }
-
-    async fn sanitize_large_request_payloads(&self) -> Result<RequestSanitizeReport> {
-        let mut sanitized_requests = 0_u64;
-        let mut batches = 0_u64;
-        for _ in 0..MAINTENANCE_REQUEST_MAX_BATCHES {
-            let batch = self.sanitize_large_request_payload_batch().await?;
-            if batch.fetched == 0 {
-                return Ok(RequestSanitizeReport {
-                    sanitized_requests,
-                    batches,
-                    limit_reached: false,
-                });
-            }
-            batches = batches.saturating_add(1);
-            sanitized_requests = sanitized_requests.saturating_add(batch.changed);
-            if batch.fetched < MAINTENANCE_REQUEST_BATCH as u64 || batch.changed == 0 {
-                return Ok(RequestSanitizeReport {
-                    sanitized_requests,
-                    batches,
-                    limit_reached: false,
-                });
-            }
-        }
-        Ok(RequestSanitizeReport {
-            sanitized_requests,
-            batches,
-            limit_reached: true,
-        })
-    }
-
-    async fn sanitize_large_request_payload_batch(&self) -> Result<RequestSanitizeBatch> {
-        let rows = sqlx::query(
-            r#"
-            SELECT id, previous_response_id, input_json, response_json, turn_messages_json, tool_facts_json, diagnostic_json
-            FROM requests
-            WHERE length(input_json) > ?1
-               OR COALESCE(length(response_json), 0) > ?1
-               OR COALESCE(length(turn_messages_json), 0) > ?1
-               OR COALESCE(length(tool_facts_json), 0) > ?1
-               OR COALESCE(length(diagnostic_json), 0) > ?1
-               OR (
-                    previous_response_id IS NULL
-                    AND input_json LIKE '%"prompt_cache_key"%'
-                    AND input_json LIKE '%"instructions"%'
-                    AND input_json LIKE '%"tools"%'
-               )
-            ORDER BY updated_at ASC
-            LIMIT ?2;
-            "#,
-        )
-        .bind(MAINTENANCE_LARGE_FIELD_BYTES)
-        .bind(MAINTENANCE_REQUEST_BATCH)
-        .fetch_all(&self.pool)
-        .await?;
-
-        let fetched = rows.len() as u64;
-        let mut changed = 0_u64;
-        for row in rows {
-            let id: String = row.try_get("id")?;
-            let previous_response_id: Option<String> = row.try_get("previous_response_id")?;
-            let input_json: String = row.try_get("input_json")?;
-            let response_json: Option<String> = row.try_get("response_json")?;
-            let turn_messages_json: Option<String> = row.try_get("turn_messages_json")?;
-            let tool_facts_json: Option<String> = row.try_get("tool_facts_json")?;
-            let diagnostic_json: Option<String> = row.try_get("diagnostic_json")?;
-
-            let input_value: Value = parse_json_field("requests.input_json", &input_json)?;
-            let next_input_json =
-                storage_request_input_json_string(previous_response_id.as_deref(), &input_value)?;
-            let next_response_json =
-                sanitize_json_text("requests.response_json", response_json.as_deref())?;
-            let next_turn_messages_json = sanitize_value_array_json_text(
-                "requests.turn_messages_json",
-                stored_input_is_codex_full_context_slice(&next_input_json),
-                turn_messages_json.as_deref(),
-            )?;
-            let next_tool_facts_json = sanitize_tool_facts_json_text(
-                "requests.tool_facts_json",
-                tool_facts_json.as_deref(),
-            )?;
-            let next_diagnostic_json =
-                sanitize_json_text("requests.diagnostic_json", diagnostic_json.as_deref())?;
-
-            if next_input_json == input_json
-                && next_response_json == response_json
-                && next_turn_messages_json == turn_messages_json
-                && next_tool_facts_json == tool_facts_json
-                && next_diagnostic_json == diagnostic_json
-            {
-                continue;
-            }
-
-            sqlx::query(
-                r#"
-                UPDATE requests
-                SET input_json = ?2,
-                    response_json = ?3,
-                    turn_messages_json = ?4,
-                    tool_facts_json = ?5,
-                    diagnostic_json = ?6
-                WHERE id = ?1;
-                "#,
-            )
-            .bind(&id)
-            .bind(next_input_json)
-            .bind(next_response_json)
-            .bind(next_turn_messages_json)
-            .bind(next_tool_facts_json)
-            .bind(next_diagnostic_json)
-            .execute(&self.pool)
-            .await?;
-            changed = changed.saturating_add(1);
-        }
-        Ok(RequestSanitizeBatch { fetched, changed })
     }
 
     pub async fn runtime_summary(&self, turn_limit: u32) -> Result<RuntimeSummary> {
-        let active_requests = count_by_status(&self.pool, "in_progress").await?;
-        let request_count = count_by_status(&self.pool, "completed").await?;
-        let failed_request_count = count_failed(&self.pool).await?;
-        let limit = i64::from(turn_limit.clamp(1, 500));
-        let rows = sqlx::query(
-            r#"
-            SELECT id, status, model, input_json, response_json, created_at, updated_at
-            FROM requests
-            WHERE status = 'completed'
-            ORDER BY updated_at DESC
-            LIMIT ?1;
-            "#,
-        )
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await?;
-
-        let mut newest_first = Vec::with_capacity(rows.len());
-        for row in rows {
-            newest_first.push(turn_from_row(&row)?);
+        let inner = self.lock_inner()?;
+        let mut turns = completed_turns(&inner);
+        let limit = usize::try_from(turn_limit.clamp(1, 500)).unwrap_or(120);
+        if turns.len() > limit {
+            turns.drain(0..turns.len() - limit);
         }
-        let last_turn = newest_first.first().cloned();
-        let mut turn_history = newest_first;
-        turn_history.reverse();
-        let total_cached_input_tokens = turn_history
-            .iter()
-            .map(|turn| turn.cached_input_tokens)
-            .sum();
-        let total_cache_miss_input_tokens = turn_history
-            .iter()
-            .map(|turn| turn.cache_miss_input_tokens)
-            .sum();
-        let total_output_tokens = turn_history.iter().map(|turn| turn.output_tokens).sum();
-        let average_ms = if turn_history.is_empty() {
-            0
-        } else {
-            turn_history.iter().map(|turn| turn.request_ms).sum::<u64>()
-                / u64::try_from(turn_history.len()).unwrap_or(1)
-        };
-        let last_request_at = last_turn.as_ref().map(|turn| turn.completed_at.clone());
-        Ok(RuntimeSummary {
-            active_requests,
-            request_count,
-            failed_request_count,
-            last_request_at,
-            last_turn,
-            turn_history,
-            total_cached_input_tokens,
-            total_cache_miss_input_tokens,
-            total_output_tokens,
-            average_ms,
-        })
+        Ok(runtime_summary_from_inner(&inner, turns))
     }
 
     pub async fn runtime_overview(&self) -> Result<RuntimeSummary> {
-        let active_requests = count_by_status(&self.pool, "in_progress").await?;
-        let request_count = count_by_status(&self.pool, "completed").await?;
-        let failed_request_count = count_failed(&self.pool).await?;
-        let row = sqlx::query(
-            r#"
-            SELECT id, status, model, response_json, created_at, updated_at
-            FROM requests
-            WHERE status = 'completed'
-            ORDER BY updated_at DESC
-            LIMIT 1;
-            "#,
-        )
-        .fetch_optional(&self.pool)
-        .await?;
-        let last_turn = row.as_ref().map(turn_from_overview_row).transpose()?;
-        let last_request_at = last_turn.as_ref().map(|turn| turn.completed_at.clone());
-        Ok(RuntimeSummary {
-            active_requests,
-            request_count,
-            failed_request_count,
-            last_request_at,
-            last_turn,
-            turn_history: Vec::new(),
-            total_cached_input_tokens: 0,
-            total_cache_miss_input_tokens: 0,
-            total_output_tokens: 0,
-            average_ms: 0,
-        })
+        let inner = self.lock_inner()?;
+        let mut turns = completed_turns(&inner);
+        if turns.len() > 1 {
+            turns.drain(0..turns.len() - 1);
+        }
+        Ok(runtime_summary_from_inner(&inner, turns))
     }
 
     pub async fn recent_events(
@@ -517,44 +232,7 @@ impl Store {
         limit: u32,
         before: Option<&str>,
     ) -> Result<(Vec<EventRecord>, bool)> {
-        let limit = i64::from(limit.clamp(1, 200));
-        let fetch_limit = limit + 1;
-        let rows = if let Some(before) = before.filter(|value| !value.trim().is_empty()) {
-            sqlx::query(
-                r#"
-                SELECT id, level, event_type, message, detail_json, created_at
-                FROM events
-                WHERE created_at < ?1
-                ORDER BY created_at DESC, id DESC
-                LIMIT ?2;
-                "#,
-            )
-            .bind(before)
-            .bind(fetch_limit)
-            .fetch_all(&self.pool)
-            .await?
-        } else {
-            sqlx::query(
-                r#"
-                SELECT id, level, event_type, message, detail_json, created_at
-                FROM events
-                ORDER BY created_at DESC, id DESC
-                LIMIT ?1;
-                "#,
-            )
-            .bind(fetch_limit)
-            .fetch_all(&self.pool)
-            .await?
-        };
-
-        let has_more = rows.len() > usize::try_from(limit).unwrap_or(200);
-        let mut events = rows
-            .into_iter()
-            .take(usize::try_from(limit).unwrap_or(200))
-            .map(|row| event_from_row(&row))
-            .collect::<Result<Vec<_>>>()?;
-        events.reverse();
-        Ok((events, has_more))
+        read_log_events(&self.logs_dir, limit, before, false).await
     }
 
     pub async fn recent_visible_events(
@@ -562,45 +240,7 @@ impl Store {
         limit: u32,
         before: Option<&str>,
     ) -> Result<(Vec<EventRecord>, bool)> {
-        let limit = i64::from(limit.clamp(1, 200));
-        let fetch_limit = limit + 1;
-        let rows = if let Some(before) = before.filter(|value| !value.trim().is_empty()) {
-            sqlx::query(
-                r#"
-                SELECT id, level, event_type, message, detail_json, created_at
-                FROM events
-                WHERE level <> 'debug' AND created_at < ?1
-                ORDER BY created_at DESC, id DESC
-                LIMIT ?2;
-                "#,
-            )
-            .bind(before)
-            .bind(fetch_limit)
-            .fetch_all(&self.pool)
-            .await?
-        } else {
-            sqlx::query(
-                r#"
-                SELECT id, level, event_type, message, detail_json, created_at
-                FROM events
-                WHERE level <> 'debug'
-                ORDER BY created_at DESC, id DESC
-                LIMIT ?1;
-                "#,
-            )
-            .bind(fetch_limit)
-            .fetch_all(&self.pool)
-            .await?
-        };
-
-        let has_more = rows.len() > usize::try_from(limit).unwrap_or(200);
-        let mut events = rows
-            .into_iter()
-            .take(usize::try_from(limit).unwrap_or(200))
-            .map(|row| event_from_row(&row))
-            .collect::<Result<Vec<_>>>()?;
-        events.reverse();
-        Ok((events, has_more))
+        read_log_events(&self.logs_dir, limit, before, true).await
     }
 
     pub async fn response_context_chain(
@@ -608,186 +248,100 @@ impl Store {
         previous_response_id: &str,
         max_depth: u32,
     ) -> Result<Vec<StoredResponse>> {
+        let inner = self.lock_inner()?;
+        let Some(root) = inner.requests.get(previous_response_id) else {
+            bail!("previous_response_id '{previous_response_id}' is not available in this CodeSeeX process; send full context instead");
+        };
+        if root.status != RequestStatus::Completed {
+            bail!(
+                "previous_response_id '{previous_response_id}' is {:?}, not completed; send full context instead",
+                root.status
+            );
+        }
         let mut cursor = Some(previous_response_id.to_owned());
-        let mut seen = HashSet::new();
         let mut newest_first = Vec::new();
+        let mut visited = HashSet::new();
         let max_depth = max_depth.clamp(1, 10_000);
-
         for _ in 0..max_depth {
             let Some(id) = cursor.take() else {
                 break;
             };
-            if !seen.insert(id.clone()) {
-                break;
+            if !visited.insert(id.clone()) {
+                bail!("previous_response_id chain contains a cycle at '{id}'");
             }
-            let row = sqlx::query(
-                r#"
-                SELECT id, previous_response_id, status, input_json, response_json, turn_messages_json, tool_facts_json
-                FROM requests
-                WHERE id = ?1
-                LIMIT 1;
-                "#,
-            )
-            .bind(&id)
-            .fetch_optional(&self.pool)
-            .await?;
-            let Some(row) = row else {
-                break;
+            let Some(request) = inner.requests.get(&id) else {
+                bail!(
+                    "previous_response_id chain is incomplete at '{id}'; send full context instead"
+                );
             };
-            let input_json: String = row.try_get("input_json")?;
-            let response_json: Option<String> = row.try_get("response_json")?;
-            let turn_messages_json: Option<String> = row.try_get("turn_messages_json")?;
-            let tool_facts_json: Option<String> = row.try_get("tool_facts_json")?;
-            let previous_response_id: Option<String> = row.try_get("previous_response_id")?;
-            let status: String = row.try_get("status")?;
+            if request.status != RequestStatus::Completed {
+                bail!(
+                    "previous_response_id chain contains {:?} request '{id}'; send full context instead",
+                    request.status
+                );
+            }
             newest_first.push(StoredResponse {
-                id: row.try_get("id")?,
-                previous_response_id: previous_response_id.clone(),
-                status: RequestStatus::from_str(&status),
-                input: parse_json_field("requests.input_json", &input_json)?,
-                response: parse_optional_json_field(
-                    "requests.response_json",
-                    response_json.as_deref(),
-                )?
-                .unwrap_or(Value::Null),
-                turn_messages: parse_optional_json_field(
-                    "requests.turn_messages_json",
-                    turn_messages_json.as_deref(),
-                )?
-                .unwrap_or_default(),
-                tool_facts: parse_optional_json_field(
-                    "requests.tool_facts_json",
-                    tool_facts_json.as_deref(),
-                )?
-                .unwrap_or_default(),
+                id: request.id.clone(),
+                previous_response_id: request.previous_response_id.clone(),
+                status: request.status,
+                input: request.input.clone(),
+                response: request.response.clone(),
+                turn_messages: request.turn_messages.clone(),
+                tool_facts: request.tool_facts.clone(),
             });
-            cursor = previous_response_id;
+            cursor = request.previous_response_id.clone();
         }
-
         newest_first.reverse();
         Ok(newest_first)
     }
 
-    pub async fn append_request_tool_fact(&self, id: &str, fact: &str) -> Result<()> {
-        let row = sqlx::query(
-            r#"
-            SELECT tool_facts_json
-            FROM requests
-            WHERE id = ?1
-            LIMIT 1;
-            "#,
-        )
-        .bind(id)
-        .fetch_optional(&self.pool)
-        .await?;
+    pub async fn contains_response(&self, id: &str) -> Result<bool> {
+        let inner = self.lock_inner()?;
+        Ok(inner.requests.contains_key(id))
+    }
 
-        let existing_facts = row.and_then(|row| {
-            row.try_get::<Option<String>, _>("tool_facts_json")
-                .ok()
-                .flatten()
-        });
-        let mut facts: Vec<String> =
-            parse_optional_json_field("requests.tool_facts_json", existing_facts.as_deref())?
-                .unwrap_or_default();
-        facts.push(fact.to_owned());
-        let now = Utc::now().to_rfc3339();
-        let result = sqlx::query(
-            r#"
-            UPDATE requests
-            SET tool_facts_json = ?2,
-                updated_at = ?3
-            WHERE id = ?1;
-            "#,
-        )
-        .bind(id)
-        .bind(storage_tool_facts_json_string(&facts)?)
-        .bind(now)
-        .execute(&self.pool)
-        .await?;
-        if result.rows_affected() == 0 {
+    pub async fn response_status(&self, id: &str) -> Result<Option<RequestStatus>> {
+        let inner = self.lock_inner()?;
+        Ok(inner.requests.get(id).map(|request| request.status))
+    }
+
+    pub async fn append_request_tool_fact(&self, id: &str, fact: &str) -> Result<()> {
+        let mut inner = self.lock_inner()?;
+        let Some(request) = inner.requests.get_mut(id) else {
             bail!("request '{id}' was not found while appending tool facts");
+        };
+        request.tool_facts.push(sanitize_log_string(fact));
+        if request.tool_facts.len() > MAX_TOOL_FACTS_PER_REQUEST {
+            let omitted = request.tool_facts.len() - MAX_TOOL_FACTS_PER_REQUEST;
+            request.tool_facts.drain(0..omitted);
+            request.tool_facts.insert(
+                0,
+                format!("[CodeSeeX runtime omitted {omitted} older tool fact(s)]"),
+            );
         }
+        request.updated_at = Utc::now();
         Ok(())
     }
 
-    pub async fn recent_tool_facts(&self, limit: u32) -> Result<Vec<String>> {
-        let records = self.recent_tool_fact_records(limit).await?;
-        Ok(records
-            .into_iter()
-            .flat_map(|record| record.tool_facts)
-            .collect())
+    pub async fn recent_tool_facts(&self, _limit: u32) -> Result<Vec<String>> {
+        Ok(Vec::new())
     }
 
-    pub async fn recent_tool_fact_records(&self, limit: u32) -> Result<Vec<RecentToolFactRecord>> {
-        let limit = i64::from(limit.clamp(1, 1_000));
-        let cutoff = Utc::now()
-            .checked_sub_signed(Duration::hours(RECENT_TOOL_FACT_RETENTION_HOURS))
-            .unwrap_or_else(Utc::now)
-            .to_rfc3339();
-        let rows = sqlx::query(
-            r#"
-            SELECT response_json, tool_facts_json
-            FROM requests
-            WHERE tool_facts_json IS NOT NULL
-              AND updated_at >= ?1
-            ORDER BY updated_at DESC
-            LIMIT ?2;
-            "#,
-        )
-        .bind(cutoff)
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await?;
-
-        let mut records = Vec::new();
-        for row in rows {
-            let response_json = row.try_get::<Option<String>, _>("response_json")?;
-            let Some(json) = row.try_get::<Option<String>, _>("tool_facts_json")? else {
-                continue;
-            };
-            let facts: Vec<String> = parse_json_field("requests.tool_facts_json", &json)?;
-            records.push(RecentToolFactRecord {
-                response: parse_optional_json_field(
-                    "requests.response_json",
-                    response_json.as_deref(),
-                )?
-                .unwrap_or(Value::Null),
-                tool_facts: facts,
-            });
-        }
-        Ok(records)
+    pub async fn recent_tool_fact_records(&self, _limit: u32) -> Result<Vec<RecentToolFactRecord>> {
+        Ok(Vec::new())
     }
 
     pub async fn replace_request_turn_messages(&self, id: &str, messages: &[Value]) -> Result<()> {
-        let now = Utc::now().to_rfc3339();
-        let row = sqlx::query("SELECT input_json FROM requests WHERE id = ?1 LIMIT 1;")
-            .bind(id)
-            .fetch_optional(&self.pool)
-            .await?;
-        let slice_codex_full_context = row
-            .as_ref()
-            .and_then(|row| row.try_get::<String, _>("input_json").ok())
-            .map(|text| stored_input_is_codex_full_context_slice(&text))
-            .unwrap_or(false);
-        let result = sqlx::query(
-            r#"
-            UPDATE requests
-            SET turn_messages_json = ?2,
-                updated_at = ?3
-            WHERE id = ?1;
-            "#,
-        )
-        .bind(id)
-        .bind(storage_turn_messages_json_string(
-            slice_codex_full_context,
-            messages,
-        )?)
-        .bind(now)
-        .execute(&self.pool)
-        .await?;
-        if result.rows_affected() == 0 {
+        let mut inner = self.lock_inner()?;
+        let Some(request) = inner.requests.get_mut(id) else {
             bail!("request '{id}' was not found while replacing turn messages");
+        };
+        let mut values = messages.iter().map(memory_json_value).collect::<Vec<_>>();
+        if values.len() > MAX_TURN_MESSAGES_PER_REQUEST {
+            values.drain(0..values.len() - MAX_TURN_MESSAGES_PER_REQUEST);
         }
+        request.turn_messages = values;
+        request.updated_at = Utc::now();
         Ok(())
     }
 
@@ -795,28 +349,19 @@ impl Store {
         if messages.is_empty() {
             return Ok(());
         }
-        let row = sqlx::query(
-            r#"
-            SELECT turn_messages_json
-            FROM requests
-            WHERE id = ?1
-            LIMIT 1;
-            "#,
-        )
-        .bind(id)
-        .fetch_optional(&self.pool)
-        .await?;
-
-        let existing_json = row.and_then(|row| {
-            row.try_get::<Option<String>, _>("turn_messages_json")
-                .ok()
-                .flatten()
-        });
-        let mut existing: Vec<Value> =
-            parse_optional_json_field("requests.turn_messages_json", existing_json.as_deref())?
-                .unwrap_or_default();
-        existing.extend(messages.iter().cloned());
-        self.replace_request_turn_messages(id, &existing).await
+        let mut inner = self.lock_inner()?;
+        let Some(request) = inner.requests.get_mut(id) else {
+            bail!("request '{id}' was not found while appending turn messages");
+        };
+        request
+            .turn_messages
+            .extend(messages.iter().map(memory_json_value));
+        if request.turn_messages.len() > MAX_TURN_MESSAGES_PER_REQUEST {
+            let drop_count = request.turn_messages.len() - MAX_TURN_MESSAGES_PER_REQUEST;
+            request.turn_messages.drain(0..drop_count);
+        }
+        request.updated_at = Utc::now();
+        Ok(())
     }
 
     pub async fn finish_request(
@@ -826,104 +371,59 @@ impl Store {
         response: Option<&Value>,
         diagnostic: Option<&Value>,
     ) -> Result<()> {
-        let now = Utc::now().to_rfc3339();
-        let result = sqlx::query(
-            r#"
-            UPDATE requests
-            SET status = ?2,
-                response_json = ?3,
-                diagnostic_json = COALESCE(?4, diagnostic_json),
-                updated_at = ?5
-            WHERE id = ?1;
-            "#,
-        )
-        .bind(id)
-        .bind(status.as_str())
-        .bind(response.map(storage_json_string).transpose()?)
-        .bind(diagnostic.map(storage_json_string).transpose()?)
-        .bind(now)
-        .execute(&self.pool)
-        .await?;
-        if result.rows_affected() == 0 {
+        let mut inner = self.lock_inner()?;
+        let Some(request) = inner.requests.get_mut(id) else {
             bail!("request '{id}' was not found while finishing request");
+        };
+        request.status = status;
+        if let Some(response) = response {
+            request.response = memory_json_value(response);
         }
+        if let Some(diagnostic) = diagnostic {
+            request.diagnostic = Some(memory_json_value(diagnostic));
+        }
+        request.updated_at = Utc::now();
+        Ok(())
+    }
+
+    pub async fn interrupt_request_if_in_progress(&self, id: &str, reason: &str) -> Result<bool> {
+        let mut inner = self.lock_inner()?;
+        let Some(request) = inner.requests.get_mut(id) else {
+            return Ok(false);
+        };
+        if request.status != RequestStatus::InProgress {
+            return Ok(false);
+        }
+        request.status = RequestStatus::Interrupted;
+        request.diagnostic = Some(json!({ "reason": reason }));
+        request.updated_at = Utc::now();
+        Ok(true)
+    }
+
+    pub async fn update_request_diagnostic(&self, id: &str, diagnostic: &Value) -> Result<()> {
+        let mut inner = self.lock_inner()?;
+        let Some(request) = inner.requests.get_mut(id) else {
+            bail!("request '{id}' was not found while updating diagnostics");
+        };
+        request.diagnostic = Some(memory_json_value(diagnostic));
+        request.updated_at = Utc::now();
         Ok(())
     }
 
     pub async fn recover_interrupted_requests(&self, reason: &str) -> Result<Vec<String>> {
-        let rows = sqlx::query(
-            r#"
-            SELECT id, diagnostic_json
-            FROM requests
-            WHERE status = 'in_progress'
-            ORDER BY updated_at ASC;
-            "#,
-        )
-        .fetch_all(&self.pool)
-        .await?;
-        if rows.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let interrupted_at = Utc::now().to_rfc3339();
-        let mut ids = Vec::with_capacity(rows.len());
-        for row in rows {
-            let id: String = row.try_get("id")?;
-            let diagnostic_json: Option<String> = row.try_get("diagnostic_json")?;
-            let mut diagnostic = diagnostic_json
-                .as_deref()
-                .and_then(|text| serde_json::from_str::<Value>(text).ok())
-                .filter(Value::is_object)
-                .unwrap_or_else(|| json!({}));
-            if let Some(object) = diagnostic.as_object_mut() {
-                object.insert(
-                    "lifecycle".to_owned(),
-                    json!({
-                        "status": "interrupted",
-                        "interrupted_at": interrupted_at,
-                        "interruption_reason": reason
-                    }),
-                );
+        let mut inner = self.lock_inner()?;
+        let now = Utc::now();
+        let mut interrupted = Vec::new();
+        for request in inner.requests.values_mut() {
+            if request.status != RequestStatus::InProgress {
+                continue;
             }
-            sqlx::query(
-                r#"
-                UPDATE requests
-                SET status = ?2,
-                    diagnostic_json = ?3,
-                    updated_at = ?4
-                WHERE id = ?1 AND status = 'in_progress';
-                "#,
-            )
-            .bind(&id)
-            .bind(RequestStatus::Interrupted.as_str())
-            .bind(serde_json::to_string(&diagnostic)?)
-            .bind(&interrupted_at)
-            .execute(&self.pool)
-            .await?;
-            ids.push(id);
+            request.status = RequestStatus::Interrupted;
+            request.diagnostic = Some(json!({ "reason": reason }));
+            request.updated_at = now;
+            interrupted.push(request.id.clone());
         }
-        Ok(ids)
-    }
-
-    pub async fn update_request_diagnostic(&self, id: &str, diagnostic: &Value) -> Result<()> {
-        let now = Utc::now().to_rfc3339();
-        let result = sqlx::query(
-            r#"
-            UPDATE requests
-            SET diagnostic_json = ?2,
-                updated_at = ?3
-            WHERE id = ?1;
-            "#,
-        )
-        .bind(id)
-        .bind(storage_json_string(diagnostic)?)
-        .bind(now)
-        .execute(&self.pool)
-        .await?;
-        if result.rows_affected() == 0 {
-            bail!("request '{id}' was not found while updating diagnostics");
-        }
-        Ok(())
+        Ok(interrupted)
     }
 
     pub async fn record_event(
@@ -933,86 +433,345 @@ impl Store {
         message: &str,
         detail: Option<&Value>,
     ) -> Result<()> {
-        let now = Utc::now().to_rfc3339();
-        sqlx::query(
-            r#"
-            INSERT INTO events (level, event_type, message, detail_json, created_at)
-            VALUES (?1, ?2, ?3, ?4, ?5);
-            "#,
-        )
-        .bind(level)
-        .bind(event_type)
-        .bind(message)
-        .bind(detail.map(storage_json_string).transpose()?)
-        .bind(now)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
+        let id = {
+            let mut inner = self.lock_inner()?;
+            inner.next_event_id = inner.next_event_id.saturating_add(1);
+            inner.next_event_id
+        };
+        let event = EventRecord {
+            id,
+            level: level.trim().to_ascii_lowercase(),
+            event_type: event_type.trim().to_owned(),
+            message: message.trim().to_owned(),
+            detail: detail.map(redact_log_value),
+            ts: Utc::now().to_rfc3339(),
+        };
+        append_log_event(&self.logs_dir, &event).await
     }
 }
 
-async fn count_by_status(pool: &SqlitePool, status: &str) -> Result<u64> {
-    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM requests WHERE status = ?1;")
-        .bind(status)
-        .fetch_one(pool)
-        .await?;
-    Ok(u64::try_from(count).unwrap_or(0))
+fn data_dir_from_store_path(path: &Path) -> PathBuf {
+    if path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| name.eq_ignore_ascii_case("codeseex.db") || name.ends_with(".sqlite"))
+        .unwrap_or(false)
+    {
+        return path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf();
+    }
+    path.to_path_buf()
 }
 
-async fn ensure_column(
-    pool: &SqlitePool,
-    table: &str,
-    column: &str,
-    definition: &str,
-) -> Result<()> {
-    let pragma = format!("PRAGMA table_info({table});");
-    let rows = sqlx::query(&pragma).fetch_all(pool).await?;
-    let exists = rows.iter().any(|row| {
-        row.try_get::<String, _>("name")
-            .map(|name| name == column)
-            .unwrap_or(false)
-    });
-    if !exists {
-        let alter = format!("ALTER TABLE {table} ADD COLUMN {column} {definition};");
-        sqlx::query(&alter).execute(pool).await?;
+fn shared_runtime_inner(data_dir: &Path) -> Result<Arc<Mutex<StoreInner>>> {
+    let registry = STORE_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut registry = registry
+        .lock()
+        .map_err(|_| anyhow::anyhow!("store registry lock was poisoned"))?;
+    if let Some(existing) = registry.get(data_dir).and_then(Weak::upgrade) {
+        return Ok(existing);
+    }
+    let inner = Arc::new(Mutex::new(StoreInner::default()));
+    registry.insert(data_dir.to_path_buf(), Arc::downgrade(&inner));
+    Ok(inner)
+}
+
+async fn ensure_data_dir_layout(data_dir: &Path) -> Result<()> {
+    std::fs::create_dir_all(data_dir)?;
+    for name in [
+        "extension",
+        "extension/tools",
+        "lang",
+        "logs",
+        "cache",
+        "runtime",
+        "secrets",
+    ] {
+        std::fs::create_dir_all(data_dir.join(name))?;
     }
     Ok(())
 }
 
-async fn count_failed(pool: &SqlitePool) -> Result<u64> {
-    let count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM requests WHERE status IN ('failed', 'interrupted');",
-    )
-    .fetch_one(pool)
-    .await?;
-    Ok(u64::try_from(count).unwrap_or(0))
+async fn prune_old_logs(logs_dir: &Path, retention_days: u16) -> Result<u64> {
+    let cutoff = Utc::now()
+        .checked_sub_signed(Duration::days(i64::from(retention_days)))
+        .unwrap_or_else(Utc::now);
+    let mut deleted = 0_u64;
+    let entries = match std::fs::read_dir(logs_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error.into()),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        let Ok(modified) = metadata.modified() else {
+            continue;
+        };
+        let modified: DateTime<Utc> = modified.into();
+        if modified >= cutoff {
+            continue;
+        }
+        if std::fs::remove_file(&path).is_ok() {
+            deleted = deleted.saturating_add(1);
+        }
+    }
+    Ok(deleted)
 }
 
-fn turn_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<RequestTurn> {
-    let id: String = row.try_get("id")?;
-    let model: Option<String> = row.try_get("model")?;
-    let input_json: String = row.try_get("input_json")?;
-    let response_json: Option<String> = row.try_get("response_json")?;
-    let created_at: String = row.try_get("created_at")?;
-    let updated_at: String = row.try_get("updated_at")?;
-    let input = serde_json::from_str::<Value>(&input_json).unwrap_or(Value::Null);
-    let response = response_json
-        .as_deref()
-        .and_then(|text| serde_json::from_str::<Value>(text).ok())
-        .unwrap_or(Value::Null);
-    let empty_usage = Value::Null;
-    let usage = usage_value(&response).unwrap_or(&empty_usage);
-    let requested_model = input
-        .get("model")
-        .and_then(Value::as_str)
-        .or_else(|| {
-            input
-                .pointer("/metadata/requested_model")
-                .and_then(Value::as_str)
+async fn append_log_event(logs_dir: &Path, event: &EventRecord) -> Result<()> {
+    let logs_dir = logs_dir.to_path_buf();
+    let event = event.clone();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        std::fs::create_dir_all(&logs_dir)?;
+        let path = logs_dir.join(format!("{}.jsonl", Utc::now().format("%Y-%m-%d")));
+        let mut line = serde_json::to_string(&event)?;
+        line.push('\n');
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?;
+        file.write_all(line.as_bytes())?;
+        Ok(())
+    })
+    .await
+    .map_err(|error| anyhow::anyhow!("log writer task failed: {error}"))?
+}
+
+async fn read_log_events(
+    logs_dir: &Path,
+    limit: u32,
+    before: Option<&str>,
+    visible_only: bool,
+) -> Result<(Vec<EventRecord>, bool)> {
+    let logs_dir = logs_dir.to_path_buf();
+    let before = before.map(str::to_owned);
+    tokio::task::spawn_blocking(move || {
+        read_log_events_sync(&logs_dir, limit, before.as_deref(), visible_only)
+    })
+    .await
+    .map_err(|error| anyhow::anyhow!("log reader task failed: {error}"))?
+}
+
+fn read_log_events_sync(
+    logs_dir: &Path,
+    limit: u32,
+    before: Option<&str>,
+    visible_only: bool,
+) -> Result<(Vec<EventRecord>, bool)> {
+    let limit = usize::try_from(limit.clamp(1, 1_000)).unwrap_or(120);
+    let mut files = Vec::new();
+    let entries = match std::fs::read_dir(logs_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((Vec::new(), false));
+        }
+        Err(error) => return Err(error.into()),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) == Some("jsonl") {
+            files.push(path);
+        }
+    }
+    files.sort();
+    files.reverse();
+    let mut events = Vec::new();
+    for path in files {
+        collect_recent_events_from_file(&path, limit + 1, before, visible_only, &mut events)?;
+        if events.len() > limit {
+            break;
+        }
+    }
+    events.sort_by(|a, b| a.ts.cmp(&b.ts).then(a.id.cmp(&b.id)));
+    let has_more = events.len() > limit;
+    if has_more {
+        events.drain(0..events.len() - limit);
+    }
+    Ok((events, has_more))
+}
+
+fn collect_recent_events_from_file(
+    path: &Path,
+    target: usize,
+    before: Option<&str>,
+    visible_only: bool,
+    events: &mut Vec<EventRecord>,
+) -> Result<()> {
+    let mut file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    let mut offset = file.metadata()?.len();
+    let mut carry = Vec::new();
+    while offset > 0 && events.len() <= target {
+        let read_len = LOG_TAIL_CHUNK_BYTES.min(offset);
+        offset -= read_len;
+        file.seek(SeekFrom::Start(offset))?;
+        let mut chunk = vec![0_u8; usize::try_from(read_len).unwrap_or(0)];
+        file.read_exact(&mut chunk)?;
+        chunk.extend_from_slice(&carry);
+        let parts = chunk.split(|byte| *byte == b'\n').collect::<Vec<_>>();
+        let start = if offset > 0 {
+            carry = parts.first().copied().unwrap_or_default().to_vec();
+            1
+        } else {
+            carry.clear();
+            0
+        };
+        for line in parts[start..].iter().rev() {
+            if line.is_empty() {
+                continue;
+            }
+            let Ok(event) = serde_json::from_slice::<EventRecord>(line) else {
+                continue;
+            };
+            if visible_only && event.level == "debug" {
+                continue;
+            }
+            if let Some(before) = before {
+                if event.ts.as_str() >= before {
+                    continue;
+                }
+            }
+            events.push(event);
+            if events.len() > target {
+                return Ok(());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn push_request_order(order: &mut VecDeque<String>, id: &str) {
+    if let Some(index) = order.iter().position(|existing| existing == id) {
+        order.remove(index);
+    }
+    order.push_back(id.to_owned());
+}
+
+fn prune_runtime_requests(inner: &mut StoreInner) {
+    mark_stale_in_progress_requests(inner);
+    let mut scanned = 0_usize;
+    while inner.requests.len() > MAX_RUNTIME_REQUESTS {
+        let Some(id) = inner.request_order.pop_front() else {
+            break;
+        };
+        if matches!(
+            inner.requests.get(&id).map(|request| request.status),
+            Some(RequestStatus::InProgress)
+        ) {
+            inner.request_order.push_back(id);
+            scanned = scanned.saturating_add(1);
+            if scanned >= inner.request_order.len() {
+                break;
+            }
+            continue;
+        }
+        inner.requests.remove(&id);
+        scanned = 0;
+    }
+}
+
+fn mark_stale_in_progress_requests(inner: &mut StoreInner) {
+    let now = Utc::now();
+    for request in inner.requests.values_mut() {
+        if request.status != RequestStatus::InProgress {
+            continue;
+        }
+        if now.signed_duration_since(request.created_at).num_seconds() < IN_PROGRESS_TTL_SECONDS {
+            continue;
+        }
+        request.status = RequestStatus::Interrupted;
+        request.diagnostic = Some(json!({
+            "reason": "in_progress request exceeded runtime TTL",
+            "ttl_seconds": IN_PROGRESS_TTL_SECONDS
+        }));
+        request.updated_at = now;
+    }
+}
+
+fn completed_turns(inner: &StoreInner) -> Vec<RequestTurn> {
+    let mut turns = inner
+        .request_order
+        .iter()
+        .filter_map(|id| inner.requests.get(id))
+        .filter(|request| request.status == RequestStatus::Completed)
+        .filter_map(turn_from_request)
+        .collect::<Vec<_>>();
+    if turns.len() > MAX_RUNTIME_TURNS {
+        turns.drain(0..turns.len() - MAX_RUNTIME_TURNS);
+    }
+    turns
+}
+
+fn runtime_summary_from_inner(
+    inner: &StoreInner,
+    turn_history: Vec<RequestTurn>,
+) -> RuntimeSummary {
+    let active_requests = inner
+        .requests
+        .values()
+        .filter(|request| request.status == RequestStatus::InProgress)
+        .count() as u64;
+    let request_count = inner
+        .requests
+        .values()
+        .filter(|request| request.status == RequestStatus::Completed)
+        .count() as u64;
+    let failed_request_count = inner
+        .requests
+        .values()
+        .filter(|request| {
+            matches!(
+                request.status,
+                RequestStatus::Failed | RequestStatus::Interrupted
+            )
         })
-        .unwrap_or_else(|| model.as_deref().unwrap_or(""))
-        .to_owned();
-    let model = model.unwrap_or_else(|| requested_model.clone());
+        .count() as u64;
+    let last_turn = turn_history.last().cloned();
+    let last_request_at = last_turn.as_ref().map(|turn| turn.completed_at.clone());
+    let total_cached_input_tokens = turn_history
+        .iter()
+        .map(|turn| turn.cached_input_tokens)
+        .sum();
+    let total_cache_miss_input_tokens = turn_history
+        .iter()
+        .map(|turn| turn.cache_miss_input_tokens)
+        .sum();
+    let total_output_tokens = turn_history.iter().map(|turn| turn.output_tokens).sum();
+    let average_ms = if turn_history.is_empty() {
+        0
+    } else {
+        turn_history.iter().map(|turn| turn.request_ms).sum::<u64>()
+            / u64::try_from(turn_history.len()).unwrap_or(1)
+    };
+    RuntimeSummary {
+        active_requests,
+        request_count,
+        failed_request_count,
+        last_request_at,
+        last_turn,
+        turn_history,
+        total_cached_input_tokens,
+        total_cache_miss_input_tokens,
+        total_output_tokens,
+        average_ms,
+    }
+}
+
+fn turn_from_request(request: &StoredRequest) -> Option<RequestTurn> {
+    let usage = usage_value(&request.response).unwrap_or(&Value::Null);
     let cached_input_tokens = first_u64(
         usage,
         &[
@@ -1026,14 +785,15 @@ fn turn_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<RequestTurn> {
     .or_else(|| {
         usage
             .pointer("/input_tokens_details/cached_tokens")
-            .and_then(Value::as_u64)
+            .and_then(value_to_u64)
     })
     .or_else(|| {
         usage
             .pointer("/prompt_tokens_details/cached_tokens")
-            .and_then(Value::as_u64)
+            .and_then(value_to_u64)
     })
     .unwrap_or(0);
+    let input_tokens = first_u64(usage, &["input_tokens", "prompt_tokens"]).unwrap_or(0);
     let cache_miss_input_tokens = first_u64(
         usage,
         &[
@@ -1043,121 +803,35 @@ fn turn_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<RequestTurn> {
             "cache_miss_tokens",
         ],
     )
-    .unwrap_or_else(|| {
-        let input_tokens = first_u64(usage, &["input_tokens", "prompt_tokens"]).unwrap_or(0);
-        input_tokens.saturating_sub(cached_input_tokens)
-    });
-    let output_tokens = first_u64(
-        usage,
-        &[
-            "output_tokens",
-            "completion_tokens",
-            "reasoning_output_tokens",
-        ],
-    )
-    .unwrap_or(0);
+    .unwrap_or_else(|| input_tokens.saturating_sub(cached_input_tokens));
+    let output_tokens = first_u64(usage, &["output_tokens", "completion_tokens"]).unwrap_or(0);
     let total_tokens = first_u64(usage, &["total_tokens"]).unwrap_or_else(|| {
         cached_input_tokens
             .saturating_add(cache_miss_input_tokens)
             .saturating_add(output_tokens)
     });
-    Ok(RequestTurn {
-        id,
-        model,
-        requested_model,
-        completed_at: updated_at.clone(),
+    Some(RequestTurn {
+        id: request.id.clone(),
+        model: request
+            .response
+            .get("model")
+            .and_then(Value::as_str)
+            .or(request.model.as_deref())
+            .unwrap_or_default()
+            .to_owned(),
+        requested_model: request
+            .input
+            .get("model")
+            .and_then(Value::as_str)
+            .or(request.model.as_deref())
+            .unwrap_or_default()
+            .to_owned(),
+        completed_at: request.updated_at.to_rfc3339(),
         cached_input_tokens,
         cache_miss_input_tokens,
         output_tokens,
         total_tokens,
-        request_ms: duration_ms(&created_at, &updated_at),
-    })
-}
-
-fn turn_from_overview_row(row: &sqlx::sqlite::SqliteRow) -> Result<RequestTurn> {
-    let id: String = row.try_get("id")?;
-    let model = row
-        .try_get::<Option<String>, _>("model")?
-        .unwrap_or_default();
-    let response_json: Option<String> = row.try_get("response_json")?;
-    let created_at: String = row.try_get("created_at")?;
-    let updated_at: String = row.try_get("updated_at")?;
-    let response = response_json
-        .as_deref()
-        .and_then(|text| serde_json::from_str::<Value>(text).ok())
-        .unwrap_or(Value::Null);
-    let empty_usage = Value::Null;
-    let usage = usage_value(&response).unwrap_or(&empty_usage);
-    let cached_input_tokens = first_u64(
-        usage,
-        &[
-            "cached_input_tokens",
-            "input_cached_tokens",
-            "prompt_cache_hit_tokens",
-            "cache_hit_input_tokens",
-            "cached_tokens",
-        ],
-    )
-    .or_else(|| {
-        usage
-            .pointer("/input_tokens_details/cached_tokens")
-            .and_then(Value::as_u64)
-    })
-    .or_else(|| {
-        usage
-            .pointer("/prompt_tokens_details/cached_tokens")
-            .and_then(Value::as_u64)
-    })
-    .unwrap_or(0);
-    let cache_miss_input_tokens = first_u64(
-        usage,
-        &[
-            "cache_miss_input_tokens",
-            "input_cache_miss_tokens",
-            "prompt_cache_miss_tokens",
-            "cache_miss_tokens",
-        ],
-    )
-    .unwrap_or_else(|| {
-        let input_tokens = first_u64(usage, &["input_tokens", "prompt_tokens"]).unwrap_or(0);
-        input_tokens.saturating_sub(cached_input_tokens)
-    });
-    let output_tokens = first_u64(
-        usage,
-        &[
-            "output_tokens",
-            "completion_tokens",
-            "reasoning_output_tokens",
-        ],
-    )
-    .unwrap_or(0);
-    let total_tokens = first_u64(usage, &["total_tokens"]).unwrap_or_else(|| {
-        cached_input_tokens
-            .saturating_add(cache_miss_input_tokens)
-            .saturating_add(output_tokens)
-    });
-    Ok(RequestTurn {
-        id,
-        model: model.clone(),
-        requested_model: model,
-        completed_at: updated_at.clone(),
-        cached_input_tokens,
-        cache_miss_input_tokens,
-        output_tokens,
-        total_tokens,
-        request_ms: duration_ms(&created_at, &updated_at),
-    })
-}
-
-fn event_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<EventRecord> {
-    let detail_json: Option<String> = row.try_get("detail_json")?;
-    Ok(EventRecord {
-        id: row.try_get("id")?,
-        level: row.try_get("level")?,
-        event_type: row.try_get("event_type")?,
-        message: row.try_get("message")?,
-        detail: detail_json.and_then(|text| serde_json::from_str(&text).ok()),
-        ts: row.try_get("created_at")?,
+        request_ms: request_ms(request.created_at, request.updated_at),
     })
 }
 
@@ -1165,1459 +839,505 @@ fn usage_value(response: &Value) -> Option<&Value> {
     response
         .get("usage")
         .or_else(|| response.pointer("/response/usage"))
+        .or_else(|| response.pointer("/choices/0/usage"))
 }
 
 fn first_u64(value: &Value, keys: &[&str]) -> Option<u64> {
     keys.iter()
-        .find_map(|key| value.get(*key).and_then(number_like_u64))
+        .filter_map(|key| value.get(*key))
+        .find_map(value_to_u64)
 }
 
-fn number_like_u64(value: &Value) -> Option<u64> {
-    value.as_u64().or_else(|| value.as_str()?.parse().ok())
+fn value_to_u64(value: &Value) -> Option<u64> {
+    value.as_u64().or_else(|| {
+        value
+            .as_f64()
+            .filter(|value| value.is_finite() && *value >= 0.0)
+            .map(|value| value as u64)
+    })
 }
 
-fn duration_ms(start: &str, end: &str) -> u64 {
-    let Ok(start) = DateTime::parse_from_rfc3339(start) else {
-        return 0;
-    };
-    let Ok(end) = DateTime::parse_from_rfc3339(end) else {
-        return 0;
-    };
-    let millis = end
-        .with_timezone(&Utc)
-        .signed_duration_since(start.with_timezone(&Utc))
+fn request_ms(created_at: DateTime<Utc>, updated_at: DateTime<Utc>) -> u64 {
+    let millis = updated_at
+        .signed_duration_since(created_at)
         .num_milliseconds();
     u64::try_from(millis).unwrap_or(0)
 }
 
-fn storage_request_input_json_string(
-    previous_response_id: Option<&str>,
-    value: &Value,
-) -> Result<String> {
-    let value = request_input_for_storage(previous_response_id, value);
-    storage_json_string(&value)
-}
-
-fn request_input_for_storage(previous_response_id: Option<&str>, value: &Value) -> Value {
+fn request_input_for_runtime(_previous_response_id: Option<&str>, value: &Value) -> Value {
     let Some(object) = value.as_object() else {
-        return value.clone();
+        return memory_json_value(value);
     };
-    let mut stored = serde_json::Map::new();
+    let mut stored = Map::new();
     for key in ["model", "prompt_cache_key"] {
         if let Some(value) = object.get(key) {
-            stored.insert(key.to_owned(), value.clone());
+            stored.insert(key.to_owned(), memory_json_value(value));
         }
     }
-
     if let Some(input) = object.get("input") {
-        let full_context = request_looks_like_codex_full_context(previous_response_id, value);
-        stored.insert(
-            "input".to_owned(),
-            if full_context {
-                tail_slice_value(input, CODEX_FULL_CONTEXT_STORAGE_TAIL_ITEMS)
-            } else {
-                input.clone()
-            },
-        );
-        if full_context {
-            let (original_input_bytes, original_input_hash) = json_value_storage_stats(input);
+        if request_looks_like_codex_full_context(value) {
+            let item_count = input.as_array().map(Vec::len).unwrap_or(0);
+            stored.insert("input".to_owned(), Value::Array(Vec::new()));
             stored.insert(
-                "_codeseex_storage".to_owned(),
+                "_codeseex_runtime".to_owned(),
                 json!({
-                    "mode": "codex_full_context_slice",
-                    "reason": "Codex already owns and resends full conversation context; CodeSeeX stores only bounded adapter replay state.",
-                    "original_input_items": input.as_array().map(Vec::len).unwrap_or(0),
-                    "retained_tail_items": input.as_array().map(|items| items.len().min(CODEX_FULL_CONTEXT_STORAGE_TAIL_ITEMS)).unwrap_or(0),
-                    "original_input_bytes": original_input_bytes,
-                    "original_input_hash": original_input_hash
+                    "mode": "codex_full_context_not_stored",
+                    "reason": "Codex owns and resends full conversation context; CodeSeeX keeps no duplicate transcript.",
+                    "original_input_items": item_count,
+                    "original_input_hash": stable_hash_hex(&serde_json::to_vec(input).unwrap_or_default())
                 }),
             );
-        }
-        return Value::Object(stored);
-    }
-
-    if let Some(messages) = object.get("messages") {
-        stored.insert("messages".to_owned(), messages.clone());
-        return Value::Object(stored);
-    }
-
-    value.clone()
-}
-
-fn request_looks_like_codex_full_context(
-    previous_response_id: Option<&str>,
-    value: &Value,
-) -> bool {
-    if previous_response_id.is_some() {
-        return false;
-    }
-    let Some(object) = value.as_object() else {
-        return false;
-    };
-    if object.get("prompt_cache_key").is_none()
-        || object.get("instructions").is_none()
-        || object.get("tools").is_none()
-    {
-        return false;
-    }
-    object
-        .get("input")
-        .and_then(Value::as_array)
-        .map(|items| items.len() > CODEX_FULL_CONTEXT_INPUT_ITEMS_THRESHOLD)
-        .unwrap_or(false)
-}
-
-fn storage_turn_messages_json_string(
-    slice_codex_full_context: bool,
-    values: &[Value],
-) -> Result<String> {
-    let values = turn_messages_for_storage(slice_codex_full_context, values);
-    storage_json_array_string(&values)
-}
-
-fn turn_messages_for_storage(slice_codex_full_context: bool, values: &[Value]) -> Vec<Value> {
-    if !slice_codex_full_context || values.len() <= CODEX_FULL_CONTEXT_TURN_MESSAGES_THRESHOLD {
-        return values.to_vec();
-    }
-    tail_slice(values, CODEX_FULL_CONTEXT_STORAGE_TAIL_ITEMS)
-}
-
-fn stored_input_is_codex_full_context_slice(text: &str) -> bool {
-    text.contains("\"mode\":\"codex_full_context_slice\"")
-        || text.contains("\"mode\": \"codex_full_context_slice\"")
-}
-
-fn tail_slice_value(value: &Value, limit: usize) -> Value {
-    value
-        .as_array()
-        .map(|items| Value::Array(tail_slice(items, limit)))
-        .unwrap_or_else(|| value.clone())
-}
-
-fn tail_slice<T: Clone>(items: &[T], limit: usize) -> Vec<T> {
-    let start = items.len().saturating_sub(limit);
-    items[start..].to_vec()
-}
-
-fn json_value_storage_stats(value: &Value) -> (usize, String) {
-    let serialized = serde_json::to_string(value).unwrap_or_default();
-    (serialized.len(), stable_hash_hex(serialized.as_bytes()))
-}
-
-fn storage_json_string(value: &Value) -> Result<String> {
-    let sanitized = sanitize_json_for_storage(value);
-    let serialized = serde_json::to_string(&sanitized)?;
-    if serialized.len() <= MAX_STORAGE_JSON_BYTES {
-        return Ok(serialized);
-    }
-
-    let compacted = compact_json_for_storage(&sanitized);
-    let compacted_serialized = serde_json::to_string(&compacted)?;
-    if compacted_serialized.len() <= MAX_STORAGE_JSON_BYTES {
-        return Ok(compacted_serialized);
-    }
-
-    Ok(serde_json::to_string(&json!({
-        "_codeseex_storage_notice": "json payload omitted after exceeding durable state budget",
-        "original_bytes": serialized.len(),
-        "compacted_bytes": compacted_serialized.len(),
-        "hash": stable_hash_hex(serialized.as_bytes())
-    }))?)
-}
-
-fn storage_json_array_string(values: &[Value]) -> Result<String> {
-    let value = Value::Array(values.iter().map(sanitize_json_for_storage).collect());
-    let serialized = serde_json::to_string(&value)?;
-    if serialized.len() <= MAX_STORAGE_JSON_BYTES {
-        return Ok(serialized);
-    }
-
-    let compacted = compact_json_for_storage(&value);
-    let compacted_serialized = serde_json::to_string(&compacted)?;
-    if compacted_serialized.len() <= MAX_STORAGE_JSON_BYTES {
-        return Ok(compacted_serialized);
-    }
-
-    Ok(serde_json::to_string(&vec![json!({
-        "_codeseex_storage_notice": "json array payload omitted after exceeding durable state budget",
-        "original_bytes": serialized.len(),
-        "compacted_bytes": compacted_serialized.len(),
-        "hash": stable_hash_hex(serialized.as_bytes())
-    })])?)
-}
-
-fn storage_tool_facts_json_string(facts: &[String]) -> Result<String> {
-    let mut prior_omitted = 0_usize;
-    let mut sanitized = facts
-        .iter()
-        .enumerate()
-        .filter_map(|(index, fact)| {
-            if index == 0 {
-                if let Some(count) = omitted_tool_fact_count(fact) {
-                    prior_omitted = prior_omitted.saturating_add(count);
-                    return None;
-                }
-            }
-            Some(fact)
-        })
-        .map(|fact| sanitize_string_for_storage(fact))
-        .collect::<Vec<_>>();
-    if sanitized.len() > MAX_STORAGE_TOOL_FACTS_PER_REQUEST {
-        let omitted = prior_omitted + sanitized.len() - (MAX_STORAGE_TOOL_FACTS_PER_REQUEST - 1);
-        let tail_start = sanitized.len() - (MAX_STORAGE_TOOL_FACTS_PER_REQUEST - 1);
-        let mut compacted = Vec::with_capacity(MAX_STORAGE_TOOL_FACTS_PER_REQUEST);
-        compacted.push(tool_fact_omitted_marker(omitted));
-        compacted.extend(sanitized.drain(tail_start..));
-        sanitized = compacted;
-    } else if prior_omitted > 0 {
-        let available = MAX_STORAGE_TOOL_FACTS_PER_REQUEST - 1;
-        if sanitized.len() > available {
-            let newly_omitted = sanitized.len() - available;
-            prior_omitted = prior_omitted.saturating_add(newly_omitted);
-            sanitized.drain(0..newly_omitted);
-        }
-        sanitized.insert(0, tool_fact_omitted_marker(prior_omitted));
-    }
-
-    let serialized = serde_json::to_string(&sanitized)?;
-    if serialized.len() <= MAX_STORAGE_JSON_BYTES {
-        return Ok(serialized);
-    }
-
-    let compacted = sanitized
-        .into_iter()
-        .map(|fact| truncate_storage_string(&fact, COMPACT_STORAGE_STRING_CHARS))
-        .collect::<Vec<_>>();
-    let compacted_serialized = serde_json::to_string(&compacted)?;
-    if compacted_serialized.len() <= MAX_STORAGE_JSON_BYTES {
-        return Ok(compacted_serialized);
-    }
-
-    Ok(serde_json::to_string(&vec![format!(
-        "[CodeSeeX storage omitted tool facts after exceeding durable state budget; original_bytes={}, compacted_bytes={}, hash={}]",
-        serialized.len(),
-        compacted_serialized.len(),
-        stable_hash_hex(serialized.as_bytes())
-    )])?)
-}
-
-fn tool_fact_omitted_marker(count: usize) -> String {
-    format!("{TOOL_FACT_OMITTED_PREFIX}{count}{TOOL_FACT_OMITTED_SUFFIX}")
-}
-
-fn omitted_tool_fact_count(text: &str) -> Option<usize> {
-    text.strip_prefix(TOOL_FACT_OMITTED_PREFIX)?
-        .strip_suffix(TOOL_FACT_OMITTED_SUFFIX)?
-        .parse()
-        .ok()
-}
-
-fn sanitize_json_text(label: &str, text: Option<&str>) -> Result<Option<String>> {
-    text.map(|text| {
-        let value = parse_json_field::<Value>(label, text)?;
-        storage_json_string(&value)
-    })
-    .transpose()
-}
-
-fn sanitize_value_array_json_text(
-    label: &str,
-    slice_codex_full_context: bool,
-    text: Option<&str>,
-) -> Result<Option<String>> {
-    text.map(|text| {
-        let values = parse_json_field::<Vec<Value>>(label, text)?;
-        storage_turn_messages_json_string(slice_codex_full_context, &values)
-    })
-    .transpose()
-}
-
-fn sanitize_tool_facts_json_text(label: &str, text: Option<&str>) -> Result<Option<String>> {
-    text.map(|text| {
-        let facts = parse_json_field::<Vec<String>>(label, text)?;
-        storage_tool_facts_json_string(&facts)
-    })
-    .transpose()
-}
-
-fn sanitize_json_for_storage(value: &Value) -> Value {
-    match value {
-        Value::String(text) => Value::String(sanitize_string_for_storage(text)),
-        Value::Array(items) => Value::Array(items.iter().map(sanitize_json_for_storage).collect()),
-        Value::Object(object) => {
-            let mut sanitized = serde_json::Map::with_capacity(object.len());
-            for (key, value) in object {
-                let next = if is_sensitive_storage_key(key) {
-                    Value::String("[redacted sensitive value]".to_owned())
-                } else {
-                    sanitize_json_for_storage(value)
-                };
-                sanitized.insert(key.clone(), next);
-            }
-            Value::Object(sanitized)
-        }
-        other => other.clone(),
-    }
-}
-
-fn sanitize_string_for_storage(text: &str) -> String {
-    let redacted = redact_inline_data_urls_for_storage(text);
-    truncate_storage_string(&redacted, MAX_STORAGE_STRING_CHARS)
-}
-
-fn is_sensitive_storage_key(key: &str) -> bool {
-    let key = key.trim().to_ascii_lowercase();
-    matches!(
-        key.as_str(),
-        "api_key"
-            | "apikey"
-            | "authorization"
-            | "auth"
-            | "bearer"
-            | "token"
-            | "access_token"
-            | "refresh_token"
-            | "password"
-            | "secret"
-            | "client_secret"
-            | "proxy_password"
-    ) || key.ends_with("_api_key")
-        || key.ends_with("_token")
-        || key.ends_with("_secret")
-}
-
-fn redact_inline_data_urls_for_storage(text: &str) -> String {
-    let Some(mut cursor) = text.find("data:") else {
-        return text.to_owned();
-    };
-    let mut output = String::with_capacity(text.len().min(MAX_STORAGE_STRING_CHARS));
-    let mut copied_until = 0;
-    while cursor < text.len() {
-        output.push_str(&text[copied_until..cursor]);
-        let mut end = text.len();
-        for (offset, ch) in text[cursor..].char_indices() {
-            if ch.is_whitespace() || matches!(ch, '"' | '\'' | '<' | '>' | ')' | ']' | '}' | '`') {
-                end = cursor + offset;
-                break;
-            }
-        }
-        let segment = &text[cursor..end];
-        if segment.len() > 1024 || segment.contains(";base64,") {
-            output.push_str(&format!(
-                "[inline-data-url omitted chars={} bytes={} hash={}]",
-                segment.chars().count(),
-                segment.len(),
-                stable_hash_hex(segment.as_bytes())
-            ));
         } else {
-            output.push_str(segment);
+            stored.insert("input".to_owned(), memory_json_value(input));
         }
-        copied_until = end;
-        let Some(next) = text[copied_until..].find("data:") else {
-            break;
-        };
-        cursor = copied_until + next;
+        return Value::Object(stored);
     }
-    output.push_str(&text[copied_until..]);
-    output
+    if let Some(messages) = object.get("messages") {
+        stored.insert("messages".to_owned(), memory_json_value(messages));
+        return Value::Object(stored);
+    }
+    memory_json_value(value)
 }
 
-fn truncate_storage_string(text: &str, max_chars: usize) -> String {
-    let count = text.chars().count();
-    if count <= max_chars {
-        return text.to_owned();
+fn memory_json_value(value: &Value) -> Value {
+    match value {
+        Value::String(value) => Value::String(sanitize_memory_string(value)),
+        Value::Array(values) => {
+            if values.len() <= MAX_MEMORY_ARRAY_ITEMS {
+                return Value::Array(values.iter().map(memory_json_value).collect());
+            }
+            let mut output = values
+                .iter()
+                .take(MAX_MEMORY_ARRAY_ITEMS / 2)
+                .map(memory_json_value)
+                .collect::<Vec<_>>();
+            output.push(json!({
+                "_codeseex_runtime_notice": "array middle omitted from in-memory adapter state",
+                "omitted_items": values.len().saturating_sub(MAX_MEMORY_ARRAY_ITEMS)
+            }));
+            output.extend(
+                values
+                    .iter()
+                    .skip(values.len().saturating_sub(MAX_MEMORY_ARRAY_ITEMS / 2))
+                    .map(memory_json_value),
+            );
+            Value::Array(output)
+        }
+        Value::Object(object) => Value::Object(
+            object
+                .iter()
+                .map(|(key, value)| (key.clone(), memory_json_value(value)))
+                .collect(),
+        ),
+        _ => value.clone(),
     }
-    let keep = max_chars.saturating_sub(96);
-    let prefix = text.chars().take(keep).collect::<String>();
+}
+
+fn redact_log_value(value: &Value) -> Value {
+    match value {
+        Value::String(value) => Value::String(sanitize_log_string(value)),
+        Value::Array(values) => Value::Array(values.iter().map(redact_log_value).collect()),
+        Value::Object(object) => Value::Object(
+            object
+                .iter()
+                .map(|(key, value)| {
+                    if is_sensitive_key(key) {
+                        (key.clone(), Value::String("[redacted]".to_owned()))
+                    } else {
+                        (key.clone(), redact_log_value(value))
+                    }
+                })
+                .collect(),
+        ),
+        _ => value.clone(),
+    }
+}
+
+fn is_sensitive_key(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    key.contains("authorization")
+        || key.contains("api_key")
+        || key.contains("apikey")
+        || key.contains("access_token")
+        || key.contains("refresh_token")
+        || key.contains("secret")
+        || key.contains("password")
+        || key.contains("cookie")
+}
+
+fn sanitize_memory_string(value: &str) -> String {
+    if looks_like_inline_data_url(value) {
+        return format!(
+            "[redacted inline data url; original_chars={}; hash={}]",
+            value.chars().count(),
+            stable_hash_hex(value.as_bytes())
+        );
+    }
+    truncate_chars_with_hash(value, MAX_MEMORY_STRING_CHARS)
+}
+
+fn sanitize_log_string(value: &str) -> String {
+    if looks_like_inline_data_url(value) {
+        return format!(
+            "[redacted inline data url; original_chars={}; hash={}]",
+            value.chars().count(),
+            stable_hash_hex(value.as_bytes())
+        );
+    }
+    truncate_chars_with_hash(&redact_secret_text(value), MAX_LOG_STRING_CHARS)
+}
+
+fn looks_like_inline_data_url(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    lower.contains("data:") && lower.contains(";base64,")
+}
+
+fn truncate_chars_with_hash(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_owned();
+    }
+    let prefix = value.chars().take(max_chars).collect::<String>();
     format!(
-        "{prefix}...[truncated chars={} bytes={} hash={}]",
-        count,
-        text.len(),
-        stable_hash_hex(text.as_bytes())
+        "{}\n[CodeSeeX omitted {} chars; hash={}]",
+        prefix,
+        value.chars().count().saturating_sub(max_chars),
+        stable_hash_hex(value.as_bytes())
     )
 }
 
-fn compact_json_for_storage(value: &Value) -> Value {
-    match value {
-        Value::String(text) => {
-            Value::String(truncate_storage_string(text, COMPACT_STORAGE_STRING_CHARS))
-        }
-        Value::Array(items) => compact_json_array_for_storage(items),
-        Value::Object(object) => {
-            let mut compacted = serde_json::Map::with_capacity(object.len());
-            for (index, (key, value)) in object.iter().enumerate() {
-                if index >= COMPACT_STORAGE_OBJECT_KEYS {
-                    compacted.insert(
-                        "_codeseex_storage_omitted_keys".to_owned(),
-                        json!(object.len() - COMPACT_STORAGE_OBJECT_KEYS),
-                    );
-                    break;
-                }
-                compacted.insert(key.clone(), compact_json_for_storage(value));
-            }
-            Value::Object(compacted)
-        }
-        other => other.clone(),
-    }
-}
-
-fn compact_json_array_for_storage(items: &[Value]) -> Value {
-    let keep_all = COMPACT_STORAGE_ARRAY_HEAD_ITEMS + COMPACT_STORAGE_ARRAY_TAIL_ITEMS;
-    if items.len() <= keep_all {
-        return Value::Array(items.iter().map(compact_json_for_storage).collect());
-    }
-
-    let tail_start = items.len().saturating_sub(COMPACT_STORAGE_ARRAY_TAIL_ITEMS);
-    let mut compacted = Vec::with_capacity(keep_all + 1);
-    compacted.extend(
-        items
-            .iter()
-            .take(COMPACT_STORAGE_ARRAY_HEAD_ITEMS)
-            .map(compact_json_for_storage),
-    );
-    compacted.push(json!({
-        "_codeseex_storage_notice": "array items omitted after exceeding durable state budget",
-        "omitted_items": tail_start.saturating_sub(COMPACT_STORAGE_ARRAY_HEAD_ITEMS),
-        "total_items": items.len()
-    }));
-    compacted.extend(items.iter().skip(tail_start).map(compact_json_for_storage));
-    Value::Array(compacted)
+fn redact_secret_text(value: &str) -> String {
+    static PATTERNS: OnceLock<Vec<Regex>> = OnceLock::new();
+    let patterns = PATTERNS.get_or_init(|| {
+        [
+            r#"(?i)(authorization\s*[:=]\s*)(bearer\s+)?[A-Za-z0-9._~+/=-]{8,}"#,
+            r#"(?i)((api[_-]?key|apikey|access[_-]?token|refresh[_-]?token|secret|password|cookie)\s*["']?\s*[:=]\s*["']?)[^"',\s}]{4,}"#,
+        ]
+        .iter()
+        .filter_map(|pattern| Regex::new(pattern).ok())
+        .collect()
+    });
+    patterns.iter().fold(value.to_owned(), |text, pattern| {
+        pattern.replace_all(&text, "${1}[redacted]").to_string()
+    })
 }
 
 fn stable_hash_hex(bytes: &[u8]) -> String {
-    let mut hash = 0xcbf29ce484222325_u64;
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    format!("{hash:016x}")
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    #[tokio::test]
-    async fn open_configures_sqlite_for_local_proxy_state() {
-        let path = temp_db_path("sqlite-options");
-        let store = Store::open(&path).await.expect("open store");
-
-        let journal_mode: String = sqlx::query_scalar("PRAGMA journal_mode;")
-            .fetch_one(&store.pool)
-            .await
-            .expect("journal mode");
-        assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
-
-        let synchronous: i64 = sqlx::query_scalar("PRAGMA synchronous;")
-            .fetch_one(&store.pool)
-            .await
-            .expect("synchronous pragma");
-        assert_eq!(synchronous, 1);
-
-        let busy_timeout: i64 = sqlx::query_scalar("PRAGMA busy_timeout;")
-            .fetch_one(&store.pool)
-            .await
-            .expect("busy timeout");
-        assert!(busy_timeout >= 5_000);
-
-        remove_temp_db(store, path).await;
+    fn temp_dir(label: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time before epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("codeseex-store-{label}-{nanos}"))
     }
 
     #[tokio::test]
-    async fn response_context_chain_includes_failed_parent_without_response() {
-        let path = temp_db_path("failed-parent");
-        let store = Store::open(&path).await.expect("open store");
+    async fn open_creates_data_dir_layout_without_database() {
+        let dir = temp_dir("layout");
+        let store = Store::open(&dir.join("codeseex.db"))
+            .await
+            .expect("open store");
+        drop(store);
 
-        let parent_input = json!({
-            "input": [
-                {"type":"function_call_output","call_id":"call_failed","output":"FAILED_FACT_42"},
-                {"role":"user","content":[{"type":"input_text","text":"force upstream failure"}]}
-            ]
-        });
-        store
-            .checkpoint_request(
-                "resp_failed_parent",
-                None,
-                Some("deepseek-v4-pro"),
-                &parent_input,
-            )
-            .await
-            .expect("checkpoint parent");
-        store
-            .finish_request("resp_failed_parent", RequestStatus::Failed, None, None)
-            .await
-            .expect("finish failed parent");
-
-        let child_input = json!({
-            "input": [{"role":"user","content":[{"type":"input_text","text":"recover"}]}]
-        });
-        store
-            .checkpoint_request(
-                "resp_child",
-                Some("resp_failed_parent"),
-                Some("deepseek-v4-pro"),
-                &child_input,
-            )
-            .await
-            .expect("checkpoint child");
-        store
-            .finish_request(
-                "resp_child",
-                RequestStatus::Completed,
-                Some(&json!({"output":[]})),
-                None,
-            )
-            .await
-            .expect("finish child");
-
-        let chain = store
-            .response_context_chain("resp_child", 10)
-            .await
-            .expect("response context chain");
-        assert_eq!(chain.len(), 2);
-        assert_eq!(chain[0].status, RequestStatus::Failed);
-        assert_eq!(chain[0].response, Value::Null);
-        assert!(chain[0].tool_facts.is_empty());
-        assert_eq!(chain[1].status, RequestStatus::Completed);
-
-        remove_temp_db(store, path).await;
+        for name in ["extension", "lang", "logs", "cache", "runtime", "secrets"] {
+            assert!(dir.join(name).is_dir(), "{name} should exist");
+        }
+        assert!(!dir.join("codeseex.db").exists());
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
-    async fn response_context_chain_includes_persisted_tool_facts() {
-        let path = temp_db_path("tool-facts");
-        let store = Store::open(&path).await.expect("open store");
-
-        let input = json!({
-            "input": [{"role":"user","content":[{"type":"input_text","text":"list files"}]}]
-        });
-        store
-            .checkpoint_request("resp_tool", None, Some("deepseek-v4-pro"), &input)
-            .await
-            .expect("checkpoint request");
-        store
-            .append_request_tool_fact(
-                "resp_tool",
-                "tool=list_directory call_id=call_1 ok=true result=Cargo.toml",
-            )
-            .await
-            .expect("append tool fact");
-        store
-            .finish_request(
-                "resp_tool",
-                RequestStatus::Completed,
-                Some(&json!({"output":[]})),
-                None,
-            )
-            .await
-            .expect("finish request");
-
-        let chain = store
-            .response_context_chain("resp_tool", 10)
-            .await
-            .expect("response context chain");
-        assert_eq!(chain.len(), 1);
-        assert_eq!(chain[0].tool_facts.len(), 1);
-        assert!(chain[0].tool_facts[0].contains("list_directory"));
-
-        remove_temp_db(store, path).await;
-    }
-
-    #[tokio::test]
-    async fn recent_tool_facts_returns_persisted_facts() {
-        let path = temp_db_path("recent-tool-facts");
-        let store = Store::open(&path).await.expect("open store");
-
-        let input = json!({
-            "input": [{"role":"user","content":[{"type":"input_text","text":"search"}]}]
-        });
-        store
-            .checkpoint_request("resp_search", None, Some("deepseek-v4-pro"), &input)
-            .await
-            .expect("checkpoint request");
-        store
-            .append_request_tool_fact(
-                "resp_search",
-                "tool=web_search call_id=call_web arguments={\"mode\":\"search\",\"query\":\"Shanghai weather\"} ok=true result={\"summary\":\"rain\"}",
-            )
-            .await
-            .expect("append tool fact");
-
-        let facts = store
-            .recent_tool_facts(10)
-            .await
-            .expect("recent tool facts");
-        assert_eq!(facts.len(), 1);
-        assert!(facts[0].contains("Shanghai weather"));
-
-        remove_temp_db(store, path).await;
-    }
-
-    #[tokio::test]
-    async fn recent_tool_facts_ignores_stale_adapter_facts() {
-        let path = temp_db_path("recent-tool-facts-stale");
-        let store = Store::open(&path).await.expect("open store");
-
-        let input = json!({
-            "input": [{"role":"user","content":[{"type":"input_text","text":"search"}]}]
-        });
-        store
-            .checkpoint_request("resp_old_search", None, Some("deepseek-v4-pro"), &input)
-            .await
-            .expect("checkpoint request");
-        store
-            .append_request_tool_fact(
-                "resp_old_search",
-                "tool=web_search call_id=call_old ok=true result=stale",
-            )
-            .await
-            .expect("append tool fact");
-        let old_ts = Utc::now()
-            .checked_sub_signed(Duration::hours(RECENT_TOOL_FACT_RETENTION_HOURS + 1))
-            .expect("old timestamp")
-            .to_rfc3339();
-        sqlx::query("UPDATE requests SET updated_at = ?2 WHERE id = ?1;")
-            .bind("resp_old_search")
-            .bind(old_ts)
-            .execute(&store.pool)
-            .await
-            .expect("backdate request");
-
-        let facts = store
-            .recent_tool_facts(10)
-            .await
-            .expect("recent tool facts");
-        assert!(facts.is_empty(), "{facts:?}");
-
-        remove_temp_db(store, path).await;
-    }
-
-    #[tokio::test]
-    async fn response_context_chain_includes_persisted_turn_messages() {
-        let path = temp_db_path("turn-messages");
-        let store = Store::open(&path).await.expect("open store");
-
-        let input = json!({
-            "input": [{"role":"user","content":[{"type":"input_text","text":"list files"}]}]
-        });
-        store
-            .checkpoint_request("resp_turn", None, Some("deepseek-v4-pro"), &input)
-            .await
-            .expect("checkpoint request");
-        store
-            .replace_request_turn_messages(
-                "resp_turn",
-                &[
-                    json!({"role":"user","content":"list files"}),
-                    json!({
-                        "role":"assistant",
-                        "content":"",
-                        "reasoning_content":"need directory first",
-                        "tool_calls":[{
-                            "id":"call_1",
-                            "type":"function",
-                            "function":{"name":"list_directory","arguments":"{\"path\":\".\"}"}
-                        }]
-                    }),
-                ],
-            )
-            .await
-            .expect("replace turn messages");
-        store
-            .append_request_turn_messages(
-                "resp_turn",
-                &[json!({"role":"tool","tool_call_id":"call_1","content":"Cargo.toml"})],
-            )
-            .await
-            .expect("append turn message");
-        store
-            .finish_request(
-                "resp_turn",
-                RequestStatus::Completed,
-                Some(&json!({"output":[]})),
-                None,
-            )
-            .await
-            .expect("finish request");
-
-        let chain = store
-            .response_context_chain("resp_turn", 10)
-            .await
-            .expect("response context chain");
-        assert_eq!(chain.len(), 1);
-        assert_eq!(chain[0].turn_messages.len(), 3);
-        assert_eq!(
-            chain[0].turn_messages[1]
-                .get("reasoning_content")
-                .and_then(Value::as_str),
-            Some("need directory first")
-        );
-        assert_eq!(
-            chain[0].turn_messages[2]
-                .get("tool_call_id")
-                .and_then(Value::as_str),
-            Some("call_1")
-        );
-
-        remove_temp_db(store, path).await;
-    }
-
-    #[tokio::test]
-    async fn turn_messages_keep_array_shape_when_structurally_compacted() {
-        let path = temp_db_path("turn-messages-compact");
-        let store = Store::open(&path).await.expect("open store");
-
-        let input = json!({
-            "input": [{"role":"user","content":[{"type":"input_text","text":"many messages"}]}]
-        });
-        store
-            .checkpoint_request("resp_many_turns", None, Some("deepseek-v4-pro"), &input)
-            .await
-            .expect("checkpoint request");
-
-        let messages = (0..4_000)
-            .map(|index| {
-                json!({
-                    "role": "user",
-                    "content": format!("stored turn message {index:04} {}", "m".repeat(256))
-                })
-            })
-            .collect::<Vec<_>>();
-        store
-            .replace_request_turn_messages("resp_many_turns", &messages)
-            .await
-            .expect("replace turn messages");
-
-        let stored_json: String =
-            sqlx::query_scalar("SELECT turn_messages_json FROM requests WHERE id = ?1;")
-                .bind("resp_many_turns")
-                .fetch_one(&store.pool)
-                .await
-                .expect("stored turn messages");
-        assert!(stored_json.len() <= MAX_STORAGE_JSON_BYTES, "{stored_json}");
-        let stored: Vec<Value> =
-            serde_json::from_str(&stored_json).expect("turn messages stay array-shaped");
-        assert_eq!(
-            stored.len(),
-            COMPACT_STORAGE_ARRAY_HEAD_ITEMS + COMPACT_STORAGE_ARRAY_TAIL_ITEMS + 1
-        );
-        assert!(stored_json.contains("array items omitted"), "{stored_json}");
-        assert!(
-            stored_json.contains("stored turn message 0000"),
-            "{stored_json}"
-        );
-        assert!(
-            stored_json.contains("stored turn message 3999"),
-            "{stored_json}"
-        );
-
-        remove_temp_db(store, path).await;
-    }
-
-    #[tokio::test]
-    async fn checkpoint_reuse_clears_stale_response_and_tool_facts() {
-        let path = temp_db_path("checkpoint-reuse");
-        let store = Store::open(&path).await.expect("open store");
-
-        let first_input = json!({
-            "input": [{"role":"user","content":[{"type":"input_text","text":"first"}]}]
-        });
-        store
-            .checkpoint_request("resp_reused", None, Some("deepseek-v4-pro"), &first_input)
-            .await
-            .expect("checkpoint first");
-        store
-            .append_request_tool_fact("resp_reused", "tool=list_directory result=Cargo.toml")
-            .await
-            .expect("append tool fact");
-        store
-            .append_request_turn_messages(
-                "resp_reused",
-                &[json!({"role":"assistant","content":"old turn"})],
-            )
-            .await
-            .expect("append turn message");
-        store
-            .finish_request(
-                "resp_reused",
-                RequestStatus::Completed,
-                Some(&json!({"output":[{"type":"message","content":[{"text":"old"}]}]})),
-                Some(&json!({"old": true})),
-            )
-            .await
-            .expect("finish first");
-
-        let second_input = json!({
-            "input": [{"role":"user","content":[{"type":"input_text","text":"second"}]}]
-        });
-        store
-            .checkpoint_request("resp_reused", None, Some("deepseek-v4-pro"), &second_input)
-            .await
-            .expect("checkpoint second");
-
-        let chain = store
-            .response_context_chain("resp_reused", 10)
-            .await
-            .expect("response context chain");
-        assert_eq!(chain.len(), 1);
-        assert_eq!(chain[0].status, RequestStatus::InProgress);
-        assert_eq!(chain[0].response, Value::Null);
-        assert!(chain[0].tool_facts.is_empty());
-        assert!(chain[0].turn_messages.is_empty());
-        assert_eq!(
-            chain[0]
-                .input
-                .pointer("/input/0/content/0/text")
-                .and_then(Value::as_str),
-            Some("second")
-        );
-
-        remove_temp_db(store, path).await;
-    }
-
-    #[tokio::test]
-    async fn recover_interrupted_requests_marks_stale_in_progress() {
-        let path = temp_db_path("recover-interrupted");
-        let store = Store::open(&path).await.expect("open store");
-        let input = json!({
-            "input": [{"role":"user","content":[{"type":"input_text","text":"hello"}]}]
-        });
-        store
-            .checkpoint_request("resp_stale", None, Some("deepseek-v4-pro"), &input)
-            .await
-            .expect("checkpoint stale");
-
-        let recovered = store
-            .recover_interrupted_requests("proxy_started_with_in_progress_checkpoint")
-            .await
-            .expect("recover interrupted");
-        assert_eq!(recovered, vec!["resp_stale".to_owned()]);
-
-        let chain = store
-            .response_context_chain("resp_stale", 10)
-            .await
-            .expect("response context chain");
-        assert_eq!(chain.len(), 1);
-        assert_eq!(chain[0].status, RequestStatus::Interrupted);
-
-        let overview = store.runtime_overview().await.expect("runtime overview");
-        assert_eq!(overview.active_requests, 0);
-        assert_eq!(overview.failed_request_count, 1);
-
-        remove_temp_db(store, path).await;
-    }
-
-    #[tokio::test]
-    async fn append_tool_fact_fails_for_missing_request() {
-        let path = temp_db_path("missing-tool-fact-request");
-        let store = Store::open(&path).await.expect("open store");
-        let error = store
-            .append_request_tool_fact("missing", "tool=list_directory")
-            .await
-            .expect_err("missing request should fail");
-        assert!(error.to_string().contains("was not found"));
-
-        remove_temp_db(store, path).await;
-    }
-
-    #[tokio::test]
-    async fn appended_tool_facts_keep_string_array_shape_under_storage_budget() {
-        let path = temp_db_path("tool-facts-budget");
-        let store = Store::open(&path).await.expect("open store");
-        let input = json!({
-            "input": [{"role":"user","content":[{"type":"input_text","text":"many facts"}]}]
-        });
-        store
-            .checkpoint_request("resp_many_facts", None, Some("deepseek-v4-pro"), &input)
-            .await
-            .expect("checkpoint request");
-
-        for index in 0..120 {
+    async fn runtime_state_is_not_persisted_across_open() {
+        let dir = temp_dir("runtime");
+        {
+            let store = Store::open(&dir).await.expect("open store");
             store
-                .append_request_tool_fact(
-                    "resp_many_facts",
-                    &format!("tool_fact {index:04} {}", "f".repeat(8_000)),
+                .checkpoint_request(
+                    "resp_1",
+                    None,
+                    Some("deepseek-v4-flash"),
+                    &json!({ "model": "deepseek-v4-flash", "input": "hello" }),
                 )
                 .await
-                .expect("append tool fact");
+                .expect("checkpoint");
+            store
+                .finish_request(
+                    "resp_1",
+                    RequestStatus::Completed,
+                    Some(&json!({
+                        "model": "deepseek-v4-flash",
+                        "usage": { "prompt_cache_hit_tokens": 2, "prompt_cache_miss_tokens": 3, "completion_tokens": 4, "total_tokens": 9 }
+                    })),
+                    None,
+                )
+                .await
+                .expect("finish");
+            assert_eq!(
+                store
+                    .runtime_summary(10)
+                    .await
+                    .expect("summary")
+                    .request_count,
+                1
+            );
         }
 
-        let stored_json: String =
-            sqlx::query_scalar("SELECT tool_facts_json FROM requests WHERE id = ?1;")
-                .bind("resp_many_facts")
-                .fetch_one(&store.pool)
-                .await
-                .expect("stored tool facts");
-        assert!(stored_json.len() <= MAX_STORAGE_JSON_BYTES, "{stored_json}");
-        let facts: Vec<String> =
-            serde_json::from_str(&stored_json).expect("tool facts stay string array-shaped");
-        assert_eq!(facts.len(), MAX_STORAGE_TOOL_FACTS_PER_REQUEST);
-        assert!(facts[0].contains("omitted 21 older tool fact"), "{facts:?}");
-        assert!(
-            facts.last().unwrap().contains("tool_fact 0119"),
-            "{facts:?}"
-        );
-        assert!(facts
-            .iter()
-            .all(|fact| fact.chars().count() <= MAX_STORAGE_STRING_CHARS));
-
-        remove_temp_db(store, path).await;
-    }
-
-    #[tokio::test]
-    async fn recent_visible_events_hides_debug_diagnostics() {
-        let path = temp_db_path("visible-events");
-        let store = Store::open(&path).await.expect("open store");
-
-        store
-            .record_event(
-                "debug",
-                "tool_loop_iteration",
-                "Internal diagnostic.",
-                Some(&json!({"call_id": "call_secret"})),
-            )
-            .await
-            .expect("record debug event");
-        store
-            .record_event("info", "request_received", "Visible event.", None)
-            .await
-            .expect("record info event");
-
-        let (all_events, _) = store.recent_events(10, None).await.expect("all events");
-        assert_eq!(all_events.len(), 2);
-
-        let (visible_events, _) = store
-            .recent_visible_events(10, None)
-            .await
-            .expect("visible events");
-        assert_eq!(visible_events.len(), 1);
-        assert_eq!(visible_events[0].level, "info");
-        assert_eq!(visible_events[0].event_type, "request_received");
-
-        remove_temp_db(store, path).await;
-    }
-
-    #[tokio::test]
-    async fn checkpoint_request_sanitizes_large_inline_data_and_secrets() {
-        let path = temp_db_path("sanitize-checkpoint");
-        let store = Store::open(&path).await.expect("open store");
-        let screenshot = format!("before data:image/png;base64,{} after", "A".repeat(80_000));
-        let input = json!({
-            "api_key": "sk-should-not-be-stored",
-            "input": [{
-                "role": "user",
-                "content": [{"type": "input_text", "text": screenshot}]
-            }]
-        });
-
-        store
-            .checkpoint_request("resp_sanitize", None, Some("deepseek-v4-pro"), &input)
-            .await
-            .expect("checkpoint request");
-
-        let chain = store
-            .response_context_chain("resp_sanitize", 10)
-            .await
-            .expect("response context chain");
-        let stored = serde_json::to_string(&chain[0].input).expect("stored input json");
-        assert!(stored.contains("[inline-data-url omitted"), "{stored}");
-        assert!(!stored.contains("sk-should-not-be-stored"), "{stored}");
-        assert!(!stored.contains(&"A".repeat(2048)), "{stored}");
-
-        remove_temp_db(store, path).await;
-    }
-
-    #[tokio::test]
-    async fn checkpoint_request_compacts_many_small_items_before_storage() {
-        let path = temp_db_path("compact-many-small-items");
-        let store = Store::open(&path).await.expect("open store");
-        let items = (0..4_000)
-            .map(|index| {
-                json!({
-                    "role": "user",
-                    "content": [{
-                        "type": "input_text",
-                        "text": format!("small item {index:04} {}", "z".repeat(256))
-                    }]
-                })
-            })
-            .collect::<Vec<_>>();
-        let input = json!({ "input": items });
-
-        store
-            .checkpoint_request("resp_structural", None, Some("deepseek-v4-pro"), &input)
-            .await
-            .expect("checkpoint request");
-
-        let stored_json: String =
-            sqlx::query_scalar("SELECT input_json FROM requests WHERE id = ?1;")
-                .bind("resp_structural")
-                .fetch_one(&store.pool)
-                .await
-                .expect("stored input");
-        assert!(stored_json.len() <= MAX_STORAGE_JSON_BYTES, "{stored_json}");
-        assert!(stored_json.contains("array items omitted"), "{stored_json}");
-
-        let chain = store
-            .response_context_chain("resp_structural", 10)
-            .await
-            .expect("response context chain");
-        let stored_items = chain[0]
-            .input
-            .pointer("/input")
-            .and_then(Value::as_array)
-            .expect("stored input array");
+        let reopened = Store::open(&dir).await.expect("reopen");
         assert_eq!(
-            stored_items.len(),
-            COMPACT_STORAGE_ARRAY_HEAD_ITEMS + COMPACT_STORAGE_ARRAY_TAIL_ITEMS + 1
+            reopened
+                .runtime_summary(10)
+                .await
+                .expect("summary")
+                .request_count,
+            0
         );
-        let joined = serde_json::to_string(&chain[0].input).expect("stored input json");
-        assert!(joined.contains("small item 0000"), "{joined}");
-        assert!(joined.contains("small item 3999"), "{joined}");
-
-        remove_temp_db(store, path).await;
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
-    async fn checkpoint_request_slices_codex_full_context_payload() {
-        let path = temp_db_path("codex-full-context-slice");
-        let store = Store::open(&path).await.expect("open store");
-        let items = (0..150)
-            .map(|index| {
-                json!({
-                    "role": "user",
-                    "content": [{"type": "input_text", "text": format!("history item {index:03}") }]
-                })
-            })
-            .collect::<Vec<_>>();
-        let input = json!({
-            "model": "deepseek-v4-pro",
-            "prompt_cache_key": "thread-full-context",
-            "instructions": "system instructions should not be durable state",
-            "tools": [{"type": "function", "function": {"name": "expensive_tool"}}],
-            "input": items
-        });
-        let raw_len = serde_json::to_string(&input).expect("raw input").len();
-
-        store
-            .checkpoint_request("resp_full_context", None, Some("deepseek-v4-pro"), &input)
-            .await
-            .expect("checkpoint request");
-
-        let stored_json: String =
-            sqlx::query_scalar("SELECT input_json FROM requests WHERE id = ?1;")
-                .bind("resp_full_context")
-                .fetch_one(&store.pool)
+    async fn same_process_handles_share_runtime_state() {
+        let dir = temp_dir("shared-runtime");
+        {
+            let proxy_store = Store::open(&dir).await.expect("open proxy store");
+            let manager_store = Store::open(&dir.join("codeseex.db"))
                 .await
-                .expect("stored input");
-        assert!(stored_json.len() < raw_len / 2, "{stored_json}");
-        let stored: Value = serde_json::from_str(&stored_json).expect("stored json");
-        assert!(stored.get("instructions").is_none(), "{stored}");
-        assert!(stored.get("tools").is_none(), "{stored}");
+                .expect("open manager store");
+
+            proxy_store
+                .checkpoint_request(
+                    "resp_shared",
+                    None,
+                    Some("deepseek-v4-pro"),
+                    &json!({ "model": "deepseek-v4-pro", "input": "hello" }),
+                )
+                .await
+                .expect("checkpoint");
+            proxy_store
+                .finish_request(
+                    "resp_shared",
+                    RequestStatus::Completed,
+                    Some(&json!({
+                        "model": "deepseek-v4-pro",
+                        "usage": { "input_tokens": 7, "completion_tokens": 3, "total_tokens": 10 }
+                    })),
+                    None,
+                )
+                .await
+                .expect("finish");
+
+            let summary = manager_store
+                .runtime_summary(10)
+                .await
+                .expect("manager summary");
+            assert_eq!(summary.request_count, 1);
+            assert_eq!(
+                summary.last_turn.as_ref().map(|turn| turn.id.as_str()),
+                Some("resp_shared")
+            );
+        }
+
+        let reopened = Store::open(&dir).await.expect("reopen store");
         assert_eq!(
-            stored
-                .pointer("/_codeseex_storage/mode")
-                .and_then(Value::as_str),
-            Some("codex_full_context_slice")
-        );
-        let stored_items = stored
-            .get("input")
-            .and_then(Value::as_array)
-            .expect("stored input items");
-        assert_eq!(stored_items.len(), CODEX_FULL_CONTEXT_STORAGE_TAIL_ITEMS);
-        assert!(serde_json::to_string(&stored_items[0])
-            .expect("first retained item")
-            .contains("history item 118"));
-
-        remove_temp_db(store, path).await;
-    }
-
-    #[tokio::test]
-    async fn checkpoint_request_keeps_delta_input_when_previous_response_id_is_used() {
-        let path = temp_db_path("previous-response-delta");
-        let store = Store::open(&path).await.expect("open store");
-        let items = (0..120)
-            .map(|index| {
-                json!({
-                    "role": "user",
-                    "content": [{"type": "input_text", "text": format!("delta item {index:03}") }]
-                })
-            })
-            .collect::<Vec<_>>();
-        let input = json!({
-            "model": "deepseek-v4-pro",
-            "prompt_cache_key": "thread-with-previous",
-            "instructions": "not replayed from adapter state",
-            "tools": [{"type": "function", "function": {"name": "tool"}}],
-            "input": items
-        });
-
-        store
-            .checkpoint_request(
-                "resp_delta",
-                Some("resp_parent"),
-                Some("deepseek-v4-pro"),
-                &input,
-            )
-            .await
-            .expect("checkpoint request");
-
-        let stored_json: String =
-            sqlx::query_scalar("SELECT input_json FROM requests WHERE id = ?1;")
-                .bind("resp_delta")
-                .fetch_one(&store.pool)
+            reopened
+                .runtime_summary(10)
                 .await
-                .expect("stored input");
-        let stored: Value = serde_json::from_str(&stored_json).expect("stored json");
-        assert!(stored.get("_codeseex_storage").is_none(), "{stored}");
-        assert_eq!(
-            stored.get("input").and_then(Value::as_array).map(Vec::len),
-            Some(120)
+                .expect("reopened summary")
+                .request_count,
+            0
         );
-        assert!(stored.get("instructions").is_none(), "{stored}");
-        assert!(stored.get("tools").is_none(), "{stored}");
-
-        remove_temp_db(store, path).await;
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
-    async fn turn_messages_are_sliced_for_codex_full_context_without_parent() {
-        let path = temp_db_path("turn-messages-full-context-slice");
-        let store = Store::open(&path).await.expect("open store");
-        let input = json!({
-            "model": "deepseek-v4-pro",
-            "prompt_cache_key": "thread-turn-slice",
-            "instructions": "instructions",
-            "tools": [{"type": "function", "function": {"name": "tool"}}],
-            "input": (0..120).map(|index| json!({
-                "role": "user",
-                "content": [{"type": "input_text", "text": format!("history {index}") }]
-            })).collect::<Vec<_>>()
-        });
-        store
-            .checkpoint_request("resp_turn_slice", None, Some("deepseek-v4-pro"), &input)
-            .await
-            .expect("checkpoint request");
-        let messages = (0..120)
-            .map(|index| {
-                json!({
-                    "role": "user",
-                    "content": format!("compiled history message {index:03}")
-                })
-            })
-            .collect::<Vec<_>>();
-
-        store
-            .replace_request_turn_messages("resp_turn_slice", &messages)
-            .await
-            .expect("replace turn messages");
-
-        let stored_json: String =
-            sqlx::query_scalar("SELECT turn_messages_json FROM requests WHERE id = ?1;")
-                .bind("resp_turn_slice")
-                .fetch_one(&store.pool)
-                .await
-                .expect("stored turn messages");
-        let stored: Vec<Value> = serde_json::from_str(&stored_json).expect("stored messages");
-        assert_eq!(stored.len(), CODEX_FULL_CONTEXT_STORAGE_TAIL_ITEMS);
-        assert!(serde_json::to_string(&stored[0])
-            .expect("first retained message")
-            .contains("compiled history message 088"));
-
-        remove_temp_db(store, path).await;
-    }
-
-    #[tokio::test]
-    async fn finish_request_sanitizes_large_response_strings() {
-        let path = temp_db_path("sanitize-response");
-        let store = Store::open(&path).await.expect("open store");
-        let input = json!({
-            "input": [{"role":"user","content":[{"type":"input_text","text":"hello"}]}]
-        });
-        store
-            .checkpoint_request("resp_large", None, Some("deepseek-v4-pro"), &input)
-            .await
-            .expect("checkpoint request");
-
-        let response = json!({
-            "authorization": "Bearer should-not-be-stored",
-            "output": [{
-                "type": "message",
-                "content": [{"type": "output_text", "text": "x".repeat(MAX_STORAGE_STRING_CHARS + 1024)}]
-            }]
-        });
-        store
-            .finish_request(
-                "resp_large",
-                RequestStatus::Completed,
-                Some(&response),
-                None,
-            )
-            .await
-            .expect("finish request");
-
-        let chain = store
-            .response_context_chain("resp_large", 10)
-            .await
-            .expect("response context chain");
-        let stored = serde_json::to_string(&chain[0].response).expect("stored response json");
-        assert!(stored.contains("[truncated chars="), "{stored}");
-        assert!(stored.contains("[redacted sensitive value]"), "{stored}");
-        assert!(!stored.contains("should-not-be-stored"), "{stored}");
-        assert!(stored.len() < MAX_STORAGE_STRING_CHARS + 2048, "{stored}");
-
-        remove_temp_db(store, path).await;
-    }
-
-    #[tokio::test]
-    async fn maintenance_prunes_events_older_than_retention() {
-        let path = temp_db_path("maintenance-events");
-        let store = Store::open(&path).await.expect("open store");
-
-        store
-            .record_event("info", "old_event", "Old event.", None)
-            .await
-            .expect("record old event");
+    async fn events_are_written_to_logs_and_redacted() {
+        let dir = temp_dir("logs");
+        let store = Store::open(&dir).await.expect("open store");
         store
             .record_event(
                 "info",
-                "new_event",
-                "New event.",
-                Some(&json!({"token": "secret-token-value"})),
+                "request_started",
+                "Request started.",
+                Some(&json!({
+                    "Authorization": "Bearer secret",
+                    "payload": "data:image/png;base64,abcdef"
+                })),
             )
             .await
-            .expect("record new event");
+            .expect("record event");
 
-        let old_ts = Utc::now()
-            .checked_sub_signed(Duration::days(10))
-            .expect("old timestamp")
-            .to_rfc3339();
-        sqlx::query("UPDATE events SET created_at = ?1 WHERE event_type = 'old_event';")
-            .bind(old_ts)
-            .execute(&store.pool)
-            .await
-            .expect("backdate old event");
-
-        let report = store.run_maintenance(7).await.expect("run maintenance");
-        assert_eq!(report.log_retention_days, 7);
-        assert_eq!(report.deleted_events, 1);
-
-        let (events, _) = store.recent_events(10, None).await.expect("recent events");
+        let (events, has_more) = store.recent_visible_events(10, None).await.expect("events");
+        assert!(!has_more);
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].event_type, "new_event");
-        let detail = serde_json::to_string(&events[0].detail).expect("event detail");
-        assert!(detail.contains("[redacted sensitive value]"), "{detail}");
-        assert!(!detail.contains("secret-token-value"), "{detail}");
-
-        remove_temp_db(store, path).await;
+        let detail = serde_json::to_string(&events[0].detail).expect("detail json");
+        assert!(!detail.contains("Bearer secret"));
+        assert!(!detail.contains("abcdef"));
+        assert!(detail.contains("redacted"));
+        assert!(dir
+            .join("logs")
+            .read_dir()
+            .expect("read logs")
+            .next()
+            .is_some());
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
-    async fn maintenance_compacts_existing_structurally_large_request_payloads() {
-        let path = temp_db_path("maintenance-structural-large");
-        let store = Store::open(&path).await.expect("open store");
-        let items = (0..4_000)
-            .map(|index| {
-                json!({
-                    "role": "user",
-                    "content": [{
-                        "type": "input_text",
-                        "text": format!("legacy small item {index:04} {}", "q".repeat(256))
-                    }]
-                })
-            })
+    async fn codex_full_context_input_is_not_kept_in_runtime() {
+        let dir = temp_dir("full-context");
+        let store = Store::open(&dir).await.expect("open store");
+        let input_items = (0..100)
+            .map(|index| json!({ "role": "user", "content": format!("secret item {index}") }))
             .collect::<Vec<_>>();
-        let raw_input = json!({ "input": items });
-        let raw_input_json = serde_json::to_string(&raw_input).expect("raw input json");
-        assert!(raw_input_json.len() > MAX_STORAGE_JSON_BYTES);
-        let now = Utc::now().to_rfc3339();
-        sqlx::query(
-            r#"
-            INSERT INTO requests
-              (id, previous_response_id, status, model, input_json, created_at, updated_at)
-            VALUES (?1, NULL, 'completed', 'deepseek-v4-pro', ?2, ?3, ?3);
-            "#,
-        )
-        .bind("resp_legacy_structural")
-        .bind(&raw_input_json)
-        .bind(now)
-        .execute(&store.pool)
-        .await
-        .expect("insert legacy structural request");
-
-        let report = store.run_maintenance(7).await.expect("run maintenance");
-        assert_eq!(report.sanitized_requests, 1);
-
-        let stored_json: String =
-            sqlx::query_scalar("SELECT input_json FROM requests WHERE id = ?1;")
-                .bind("resp_legacy_structural")
-                .fetch_one(&store.pool)
-                .await
-                .expect("stored input");
-        assert!(stored_json.len() <= MAX_STORAGE_JSON_BYTES, "{stored_json}");
-        assert!(stored_json.contains("array items omitted"), "{stored_json}");
-        assert!(
-            stored_json.contains("legacy small item 0000"),
-            "{stored_json}"
-        );
-        assert!(
-            stored_json.contains("legacy small item 3999"),
-            "{stored_json}"
-        );
-
-        remove_temp_db(store, path).await;
-    }
-
-    #[tokio::test]
-    async fn maintenance_sanitizes_multiple_large_request_batches() {
-        let path = temp_db_path("maintenance-multiple-batches");
-        let store = Store::open(&path).await.expect("open store");
-        let row_count = usize::try_from(MAINTENANCE_REQUEST_BATCH).unwrap() + 2;
-        let large_text = "r".repeat(MAINTENANCE_LARGE_FIELD_BYTES as usize + 1024);
-        let now = Utc::now().to_rfc3339();
-
-        for index in 0..row_count {
-            let raw_input = json!({
-                "input": [{
-                    "role": "user",
-                    "content": [{
-                        "type": "input_text",
-                        "text": format!("legacy batch row {index:04} {large_text}")
-                    }]
-                }]
-            });
-            sqlx::query(
-                r#"
-                INSERT INTO requests
-                  (id, previous_response_id, status, model, input_json, created_at, updated_at)
-                VALUES (?1, NULL, 'completed', 'deepseek-v4-pro', ?2, ?3, ?3);
-                "#,
+        store
+            .checkpoint_request(
+                "resp_full",
+                None,
+                Some("deepseek-v4-pro"),
+                &json!({
+                    "model": "deepseek-v4-pro",
+                    "prompt_cache_key": "thread",
+                    "instructions": "system",
+                    "tools": [],
+                    "input": input_items
+                }),
             )
-            .bind(format!("resp_legacy_batch_{index:04}"))
-            .bind(serde_json::to_string(&raw_input).expect("raw input json"))
-            .bind(&now)
-            .execute(&store.pool)
             .await
-            .expect("insert legacy batch request");
-        }
-
-        let report = store.run_maintenance(7).await.expect("run maintenance");
-        assert_eq!(report.sanitized_requests, row_count as u64);
-        assert!(report.request_sanitize_batches >= 2);
-        assert!(!report.request_sanitize_limit_reached);
-
-        let remaining_large: i64 = sqlx::query_scalar(
-            r#"
-            SELECT COUNT(*)
-            FROM requests
-            WHERE length(input_json) > ?1;
-            "#,
-        )
-        .bind(MAINTENANCE_LARGE_FIELD_BYTES)
-        .fetch_one(&store.pool)
-        .await
-        .expect("remaining large count");
-        assert_eq!(remaining_large, 0);
-
-        remove_temp_db(store, path).await;
-    }
-
-    #[tokio::test]
-    async fn maintenance_sanitizes_existing_large_request_payloads() {
-        let path = temp_db_path("maintenance-large-requests");
-        let store = Store::open(&path).await.expect("open store");
-        let raw_input = json!({
-            "api_key": "old-secret-key",
-            "input": [{
-                "role": "user",
-                "content": [{
-                    "type": "input_text",
-                    "text": format!("legacy screenshot data:image/jpeg;base64,{}", "B".repeat(300_000))
-                }]
-            }]
-        });
-        let raw_response = json!({
-            "secret": "old-response-secret",
-            "output": [{
-                "type": "message",
-                "content": [{"type": "output_text", "text": "y".repeat(300_000)}]
-            }]
-        });
-        let now = Utc::now().to_rfc3339();
-        sqlx::query(
-            r#"
-            INSERT INTO requests
-              (id, previous_response_id, status, model, input_json, response_json, created_at, updated_at)
-            VALUES (?1, NULL, 'completed', 'deepseek-v4-pro', ?2, ?3, ?4, ?4);
-            "#,
-        )
-        .bind("resp_legacy_large")
-        .bind(serde_json::to_string(&raw_input).expect("raw input json"))
-        .bind(serde_json::to_string(&raw_response).expect("raw response json"))
-        .bind(now)
-        .execute(&store.pool)
-        .await
-        .expect("insert legacy large request");
-
-        let report = store.run_maintenance(7).await.expect("run maintenance");
-        assert_eq!(report.sanitized_requests, 1);
+            .expect("checkpoint");
+        store
+            .finish_request(
+                "resp_full",
+                RequestStatus::Completed,
+                Some(&json!({ "model": "deepseek-v4-pro" })),
+                None,
+            )
+            .await
+            .expect("finish");
 
         let chain = store
-            .response_context_chain("resp_legacy_large", 10)
+            .response_context_chain("resp_full", 1)
             .await
-            .expect("response context chain");
-        assert_eq!(chain.len(), 1);
-        let stored = serde_json::to_string(&chain[0]).expect("stored response json");
-        assert!(stored.contains("[inline-data-url omitted"), "{stored}");
-        assert!(stored.contains("[truncated chars="), "{stored}");
-        assert!(stored.contains("[redacted sensitive value]"), "{stored}");
-        assert!(!stored.contains("old-secret-key"), "{stored}");
-        assert!(!stored.contains("old-response-secret"), "{stored}");
-        assert!(!stored.contains(&"B".repeat(2048)), "{stored}");
-        assert!(
-            stored.len()
-                < serde_json::to_string(&raw_input).unwrap().len()
-                    + serde_json::to_string(&raw_response).unwrap().len(),
-            "{stored}"
+            .expect("chain");
+        assert_eq!(chain[0].input["input"].as_array().unwrap().len(), 0);
+        assert_eq!(
+            chain[0].input["_codeseex_runtime"]["mode"],
+            "codex_full_context_not_stored"
         );
-
-        remove_temp_db(store, path).await;
+        let _ = std::fs::remove_dir_all(dir);
     }
 
-    fn temp_db_path(label: &str) -> std::path::PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system clock")
-            .as_nanos();
-        std::env::temp_dir().join(format!("codeseex-next-{label}-{nanos}.db"))
+    #[tokio::test]
+    async fn codex_full_context_without_prompt_cache_key_is_not_kept_in_runtime() {
+        let dir = temp_dir("full-context-no-cache-key");
+        let store = Store::open(&dir).await.expect("open store");
+        let input_items = (0..100)
+            .map(|index| json!({ "role": "user", "content": format!("secret item {index}") }))
+            .collect::<Vec<_>>();
+        store
+            .checkpoint_request(
+                "resp_full_no_cache_key",
+                None,
+                Some("deepseek-v4-pro"),
+                &json!({
+                    "model": "deepseek-v4-pro",
+                    "instructions": "system",
+                    "tools": [],
+                    "input": input_items
+                }),
+            )
+            .await
+            .expect("checkpoint");
+
+        let chain = store
+            .response_context_chain("resp_full_no_cache_key", 1)
+            .await
+            .expect_err("in-progress previous should fail");
+        assert!(chain.to_string().contains("not completed"));
+        store
+            .finish_request(
+                "resp_full_no_cache_key",
+                RequestStatus::Completed,
+                Some(&json!({ "model": "deepseek-v4-pro" })),
+                None,
+            )
+            .await
+            .expect("finish");
+        let chain = store
+            .response_context_chain("resp_full_no_cache_key", 1)
+            .await
+            .expect("chain");
+        assert_eq!(chain[0].input["input"].as_array().unwrap().len(), 0);
+        assert_eq!(
+            chain[0].input["_codeseex_runtime"]["mode"],
+            "codex_full_context_not_stored"
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
-    async fn remove_temp_db(store: Store, path: std::path::PathBuf) {
-        store.close().await;
-        drop(store);
-        let wal = temp_db_sidecar_path(&path, "-wal");
-        let shm = temp_db_sidecar_path(&path, "-shm");
-        remove_temp_file(path).await;
-        remove_temp_file(wal).await;
-        remove_temp_file(shm).await;
+    #[tokio::test]
+    async fn duplicate_request_ids_are_rejected() {
+        let dir = temp_dir("duplicate-id");
+        let store = Store::open(&dir).await.expect("open store");
+        store
+            .checkpoint_request(
+                "resp_dup",
+                None,
+                Some("deepseek-v4-pro"),
+                &json!({ "input": [] }),
+            )
+            .await
+            .expect("first checkpoint");
+        let error = store
+            .checkpoint_request(
+                "resp_dup",
+                None,
+                Some("deepseek-v4-pro"),
+                &json!({ "input": [] }),
+            )
+            .await
+            .expect_err("duplicate id should fail");
+        assert!(error.to_string().contains("already exists"));
+        let _ = std::fs::remove_dir_all(dir);
     }
 
-    async fn remove_temp_file(path: std::path::PathBuf) {
-        for _ in 0..5 {
-            match std::fs::remove_file(&path) {
-                Ok(()) => return,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
-                Err(_) => tokio::time::sleep(StdDuration::from_millis(20)).await,
-            }
-        }
-        let _ = std::fs::remove_file(path);
+    #[tokio::test]
+    async fn previous_context_requires_completed_status() {
+        let dir = temp_dir("previous-status");
+        let store = Store::open(&dir).await.expect("open store");
+        store
+            .checkpoint_request(
+                "resp_parent",
+                None,
+                Some("deepseek-v4-pro"),
+                &json!({ "input": [] }),
+            )
+            .await
+            .expect("checkpoint");
+        let error = store
+            .response_context_chain("resp_parent", 1)
+            .await
+            .expect_err("in-progress previous should fail");
+        assert!(error.to_string().contains("not completed"));
+        let _ = std::fs::remove_dir_all(dir);
     }
 
-    fn temp_db_sidecar_path(path: &std::path::Path, suffix: &str) -> std::path::PathBuf {
-        let mut value = path.as_os_str().to_os_string();
-        value.push(suffix);
-        std::path::PathBuf::from(value)
+    #[tokio::test]
+    async fn missing_previous_response_id_is_explicit() {
+        let dir = temp_dir("missing-previous");
+        let store = Store::open(&dir).await.expect("open store");
+        let error = store
+            .response_context_chain("resp_missing", 1)
+            .await
+            .expect_err("missing previous should fail");
+        assert!(error.to_string().contains("send full context"));
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
