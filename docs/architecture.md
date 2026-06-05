@@ -27,7 +27,7 @@ The only public compatibility contract for Codex is `/v1/*`. The `/api/*` routes
 ## Runtime Boundaries
 
 - `core`: protocol types, config, model/catalog definitions, URL normalization, and context-safe helpers.
-- `store`: SQLite state, request lifecycle, logs, usage, and durable context facts.
+- `store`: SQLite adapter ledger, request lifecycle, logs, usage, and durable context facts.
 - `proxy`: HTTP `/v1/*`, upstream conversion, context compilation, tool ownership, hosted tool execution, and the shared manager runtime.
 - `desktop`: Tauri window/tray/autostart/single-instance shell, embedded proxy lifecycle, and command bridge to the manager runtime.
 - `ui`: static WebView assets only; no Node/Vite runtime is required for normal desktop use.
@@ -37,8 +37,14 @@ The only public compatibility contract for Codex is `/v1/*`. The `/api/*` routes
 Development data lives under `~/.codeseex-next`:
 
 - `config.toml`: readable CodeSeeX config.
-- `codeseex.db`: request state, logs, usage, diagnostics.
+- `codeseex.db`: minimal adapter ledger for request lifecycle, replayable context, tool facts, compact records, usage, logs, and diagnostics.
 - `model-catalog.json`: generated Codex model catalog.
 - `extension/tools/<tool>/manifest.json`: optional community tool metadata and explicit command execution declarations.
 
 The `-next` data directory is development-only isolation. The final product remains CodeSeeX, so the release plan should use the normal CodeSeeX data location or an explicit in-app upgrade path rather than framing this as a separate product migration.
+
+## State Boundary
+
+Codex owns the raw session transcript files. CodeSeeX does not parse those files as protocol state and does not duplicate them into SQLite. The store keeps only the bounded facts needed to emulate a Responses-compatible server for DeepSeek/custom upstreams: response chains, request lifecycle, replayable turn messages, verified tool facts, compact records, usage, and diagnostics.
+
+New state writes are sanitized before persistence, and maintenance sanitizes oversized legacy request payloads in place without deleting request identity. See [state-contract.md](state-contract.md) for the durable state contract.

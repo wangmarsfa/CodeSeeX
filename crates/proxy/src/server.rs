@@ -25,15 +25,18 @@ use crate::responses::conversion::{
 };
 use crate::responses::stream_tool_calls::{
     collect_streaming_tool_call_deltas, streaming_tool_calls, StreamingToolCallState,
+    StreamingVisibleToolBridge,
 };
 use crate::responses::usage::{merge_response_usage, response_usage_from_chat_usage};
 use crate::text::compact_line;
+use crate::tool_passthrough::ToolContext;
 use crate::tools::chat_protocol::chat_tool_calls_to_assistant_message;
 use crate::tools::coordinator::{complete_chat_with_tools, ToolLoopContext, ToolLoopResult};
 use crate::tools::diagnostics::{attach_tool_loop_warning, ToolLoopDiagnostics};
 use crate::tools::hosted::{
     execute_code_tool, is_code_tool_executable, summarize_tool_result, tool_fact_line,
 };
+use crate::tools::ownership::ChatToolCall;
 use crate::tools::ownership::{
     is_web_search_tool, partition_tool_calls, proxy_executed_calls_in_order,
 };
@@ -81,6 +84,32 @@ where
     L: FnOnce() + Send + 'static,
 {
     let store = Store::open(&config.database_path()).await?;
+    let maintenance = store
+        .run_maintenance(
+            UserConfig::read_from(&config.config_path())
+                .unwrap_or_default()
+                .log_retention_days(),
+        )
+        .await?;
+    if maintenance.deleted_events > 0
+        || maintenance.sanitized_requests > 0
+        || maintenance.request_sanitize_limit_reached
+    {
+        let _ = store
+            .record_event(
+                "info",
+                "state_maintenance_completed",
+                "CodeSeeX state maintenance completed.",
+                Some(&json!({
+                    "log_retention_days": maintenance.log_retention_days,
+                    "deleted_events": maintenance.deleted_events,
+                    "sanitized_requests": maintenance.sanitized_requests,
+                    "request_sanitize_batches": maintenance.request_sanitize_batches,
+                    "request_sanitize_limit_reached": maintenance.request_sanitize_limit_reached
+                })),
+            )
+            .await;
+    }
     let recovered = store
         .recover_interrupted_requests("proxy_started_with_in_progress_checkpoint")
         .await?;
@@ -103,6 +132,7 @@ where
         client: reqwest::Client::builder().timeout(timeout).build()?,
         store,
     };
+    let shutdown_store = state.store.clone();
 
     ensure_catalog(&config)?;
 
@@ -124,9 +154,11 @@ where
     let listener = TcpListener::bind((config.host.as_str(), config.port)).await?;
     tracing::info!("CodeSeeX proxy listening on {}", config.proxy_base_url());
     on_listening();
-    axum::serve(listener, app)
+    let result = axum::serve(listener, app)
         .with_graceful_shutdown(shutdown)
-        .await?;
+        .await;
+    shutdown_store.close().await;
+    result?;
     Ok(())
 }
 
@@ -946,6 +978,92 @@ fn show_thinking_enabled(config: &AppConfig) -> bool {
         .unwrap_or(true)
 }
 
+fn native_apply_patch_client_tool_sse_events(
+    response_id: &str,
+    call: &ChatToolCall,
+    visible_tool_bridge: &mut StreamingVisibleToolBridge,
+    output_index: &mut u64,
+    sequence: &mut u64,
+) -> (Bytes, Value) {
+    if let Some(finished) =
+        visible_tool_bridge.finish_native_apply_patch(response_id, call, sequence)
+    {
+        return (finished.bytes, finished.item);
+    }
+    let item = native_apply_patch_response_item_from_chat_call(call);
+    let call_output_index = *output_index;
+    *output_index += 1;
+    let mut bytes =
+        custom_tool_call_sse_added(response_id, call_output_index, &item, sequence).to_vec();
+    if let Some(input) = item
+        .get("input")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+    {
+        bytes.extend_from_slice(&sse_bytes(
+            "response.custom_tool_call_input.delta",
+            json!({
+                "type": "response.custom_tool_call_input.delta",
+                "response_id": response_id,
+                "item_id": item["id"],
+                "output_index": call_output_index,
+                "delta": input,
+                "sequence_number": next_sequence(sequence)
+            }),
+        ));
+    }
+    bytes.extend_from_slice(&custom_tool_call_sse_done(
+        response_id,
+        call_output_index,
+        &item,
+        sequence,
+    ));
+    (Bytes::from(bytes), item)
+}
+
+fn external_client_tool_sse_events(
+    response_id: &str,
+    call: &ChatToolCall,
+    external_tool_context: &ToolContext,
+    visible_tool_bridge: &mut StreamingVisibleToolBridge,
+    output_index: &mut u64,
+    sequence: &mut u64,
+) -> (Bytes, Value) {
+    if let Some(finished) = visible_tool_bridge.finish_external_function(
+        response_id,
+        call,
+        external_tool_context,
+        sequence,
+    ) {
+        return (finished.bytes, finished.item);
+    }
+    let item = external_tool_context.response_item_from_chat_call(call);
+    let call_output_index = *output_index;
+    *output_index += 1;
+    let mut bytes =
+        function_call_sse_added(response_id, call_output_index, &item, sequence).to_vec();
+    if !call.arguments.is_empty() {
+        bytes.extend_from_slice(&sse_bytes(
+            "response.function_call_arguments.delta",
+            json!({
+                "type": "response.function_call_arguments.delta",
+                "response_id": response_id,
+                "item_id": item["id"],
+                "output_index": call_output_index,
+                "delta": call.arguments,
+                "sequence_number": next_sequence(sequence)
+            }),
+        ));
+    }
+    bytes.extend_from_slice(&function_call_sse_done(
+        response_id,
+        call_output_index,
+        &item,
+        sequence,
+    ));
+    (Bytes::from(bytes), item)
+}
+
 struct StreamingResponseParams {
     response_id: String,
     model: String,
@@ -1035,6 +1153,7 @@ fn response_stream_from_chat(params: StreamingResponseParams) -> axum::response:
                 let mut output_done = false;
                 let mut last_tool_index = 0_u64;
                 let mut tool_states: BTreeMap<u64, StreamingToolCallState> = BTreeMap::new();
+                let mut visible_tool_bridge = StreamingVisibleToolBridge::default();
                 let mut upstream = response.bytes_stream();
 
                 macro_rules! close_reasoning_if_needed {
@@ -1271,6 +1390,15 @@ fn response_stream_from_chat(params: StreamingResponseParams) -> axum::response:
                         if has_tool_delta {
                             close_reasoning_if_needed!();
                             close_content_if_needed!("commentary");
+                            for event in visible_tool_bridge.process_delta(
+                                &response_id,
+                                &delta,
+                                &external_tool_context,
+                                &mut output_index,
+                                &mut sequence,
+                            ) {
+                                yield event;
+                            }
                         }
                         collect_streaming_tool_call_deltas(&delta, &mut tool_states, &mut last_tool_index);
                     }
@@ -1492,39 +1620,26 @@ fn response_stream_from_chat(params: StreamingResponseParams) -> axum::response:
                         return;
                     }
                     for call in &partition.native {
-                        let item = native_apply_patch_response_item_from_chat_call(call);
-                        let call_output_index = output_index;
-                        output_index += 1;
-                        yield custom_tool_call_sse_added(&response_id, call_output_index, &item, &mut sequence);
-                        if let Some(input) = item.get("input").and_then(Value::as_str).filter(|value| !value.is_empty()) {
-                            yield sse_bytes("response.custom_tool_call_input.delta", json!({
-                                "type": "response.custom_tool_call_input.delta",
-                                "response_id": response_id,
-                                "item_id": item["id"],
-                                "output_index": call_output_index,
-                                "delta": input,
-                                "sequence_number": next_sequence(&mut sequence)
-                            }));
-                        }
-                        yield custom_tool_call_sse_done(&response_id, call_output_index, &item, &mut sequence);
+                        let (bytes, item) = native_apply_patch_client_tool_sse_events(
+                            &response_id,
+                            call,
+                            &mut visible_tool_bridge,
+                            &mut output_index,
+                            &mut sequence,
+                        );
+                        yield bytes;
                         output.push(item);
                     }
                     for call in &partition.external {
-                        let item = external_tool_context.response_item_from_chat_call(call);
-                        let call_output_index = output_index;
-                        output_index += 1;
-                        yield function_call_sse_added(&response_id, call_output_index, &item, &mut sequence);
-                        if !call.arguments.is_empty() {
-                            yield sse_bytes("response.function_call_arguments.delta", json!({
-                                "type": "response.function_call_arguments.delta",
-                                "response_id": response_id,
-                                "item_id": item["id"],
-                                "output_index": call_output_index,
-                                "delta": call.arguments,
-                                "sequence_number": next_sequence(&mut sequence)
-                            }));
-                        }
-                        yield function_call_sse_done(&response_id, call_output_index, &item, &mut sequence);
+                        let (bytes, item) = external_client_tool_sse_events(
+                            &response_id,
+                            call,
+                            &external_tool_context,
+                            &mut visible_tool_bridge,
+                            &mut output_index,
+                            &mut sequence,
+                        );
+                        yield bytes;
                         output.push(item);
                     }
                     let final_response = json!({
@@ -1764,39 +1879,26 @@ fn response_stream_from_chat(params: StreamingResponseParams) -> axum::response:
 
                 if has_client_tools {
                     for call in &partition.native {
-                        let item = native_apply_patch_response_item_from_chat_call(call);
-                        let call_output_index = output_index;
-                        output_index += 1;
-                        yield custom_tool_call_sse_added(&response_id, call_output_index, &item, &mut sequence);
-                        if let Some(input) = item.get("input").and_then(Value::as_str).filter(|value| !value.is_empty()) {
-                            yield sse_bytes("response.custom_tool_call_input.delta", json!({
-                                "type": "response.custom_tool_call_input.delta",
-                                "response_id": response_id,
-                                "item_id": item["id"],
-                                "output_index": call_output_index,
-                                "delta": input,
-                                "sequence_number": next_sequence(&mut sequence)
-                            }));
-                        }
-                        yield custom_tool_call_sse_done(&response_id, call_output_index, &item, &mut sequence);
+                        let (bytes, item) = native_apply_patch_client_tool_sse_events(
+                            &response_id,
+                            call,
+                            &mut visible_tool_bridge,
+                            &mut output_index,
+                            &mut sequence,
+                        );
+                        yield bytes;
                         output.push(item);
                     }
                     for call in &partition.external {
-                        let item = external_tool_context.response_item_from_chat_call(call);
-                        let call_output_index = output_index;
-                        output_index += 1;
-                        yield function_call_sse_added(&response_id, call_output_index, &item, &mut sequence);
-                        if !call.arguments.is_empty() {
-                            yield sse_bytes("response.function_call_arguments.delta", json!({
-                                "type": "response.function_call_arguments.delta",
-                                "response_id": response_id,
-                                "item_id": item["id"],
-                                "output_index": call_output_index,
-                                "delta": call.arguments,
-                                "sequence_number": next_sequence(&mut sequence)
-                            }));
-                        }
-                        yield function_call_sse_done(&response_id, call_output_index, &item, &mut sequence);
+                        let (bytes, item) = external_client_tool_sse_events(
+                            &response_id,
+                            call,
+                            &external_tool_context,
+                            &mut visible_tool_bridge,
+                            &mut output_index,
+                            &mut sequence,
+                        );
+                        yield bytes;
                         output.push(item);
                     }
                     let final_response = json!({

@@ -20,8 +20,18 @@ pub(crate) fn proxy_visible_response_items(tool_calls: &[ChatToolCall]) -> Vec<V
 }
 
 pub(crate) fn native_apply_patch_response_item_from_chat_call(call: &ChatToolCall) -> Value {
+    native_apply_patch_response_item_from_chat_call_with_id(
+        call,
+        &format!("ctc_{}", Uuid::new_v4().simple()),
+    )
+}
+
+pub(crate) fn native_apply_patch_response_item_from_chat_call_with_id(
+    call: &ChatToolCall,
+    item_id: &str,
+) -> Value {
     json!({
-        "id": format!("ctc_{}", Uuid::new_v4().simple()),
+        "id": item_id,
         "type": "custom_tool_call",
         "status": "completed",
         "call_id": call.id,
@@ -49,13 +59,13 @@ fn normalize_unified_hunk_headers(value: &str) -> String {
         if index > 0 {
             output.push('\n');
         }
-        if let Some(normalized) = normalize_unified_hunk_header(line) {
-            output.push_str(&normalized);
-        } else {
-            output.push_str(line);
-        }
+        output.push_str(&normalize_patch_line(line));
     }
     output
+}
+
+pub(crate) fn normalize_patch_line(line: &str) -> String {
+    normalize_unified_hunk_header(line).unwrap_or_else(|| line.to_owned())
 }
 
 fn normalize_unified_hunk_header(line: &str) -> Option<String> {
@@ -311,7 +321,7 @@ fn tool_usage_batch_display_text(names: &[String]) -> String {
     )
 }
 
-fn normalize_apply_patch_response_input(arguments: &str) -> String {
+pub(crate) fn normalize_apply_patch_response_input(arguments: &str) -> String {
     let Ok(value) = serde_json::from_str::<Value>(arguments) else {
         return normalize_patch_newlines(arguments);
     };

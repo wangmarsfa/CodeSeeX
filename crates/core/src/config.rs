@@ -231,6 +231,14 @@ impl AppConfig {
 }
 
 impl UserConfig {
+    pub fn log_retention_days(&self) -> u16 {
+        self.ui
+            .as_ref()
+            .and_then(|ui| ui.log_retention_days)
+            .unwrap_or(7)
+            .clamp(1, 365)
+    }
+
     pub fn read_from(path: &Path) -> io::Result<Self> {
         if !path.exists() {
             return Ok(Self::default());

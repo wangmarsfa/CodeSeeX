@@ -1,10 +1,30 @@
 use anyhow::{bail, Context, Result};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
-use sqlx::{sqlite::SqliteConnectOptions, Row, SqlitePool};
+use sqlx::{
+    sqlite::{SqliteConnectOptions, SqliteJournalMode, SqliteSynchronous},
+    Row, SqlitePool,
+};
 use std::collections::HashSet;
 use std::path::Path;
+use std::time::Duration as StdDuration;
+
+const MAX_STORAGE_STRING_CHARS: usize = 64 * 1024;
+const MAX_STORAGE_JSON_BYTES: usize = 512 * 1024;
+const COMPACT_STORAGE_STRING_CHARS: usize = 4 * 1024;
+const COMPACT_STORAGE_ARRAY_HEAD_ITEMS: usize = 80;
+const COMPACT_STORAGE_ARRAY_TAIL_ITEMS: usize = 20;
+const COMPACT_STORAGE_OBJECT_KEYS: usize = 128;
+const MAX_STORAGE_TOOL_FACTS_PER_REQUEST: usize = 100;
+const TOOL_FACT_OMITTED_PREFIX: &str = "[CodeSeeX storage omitted ";
+const TOOL_FACT_OMITTED_SUFFIX: &str = " older tool fact(s) after exceeding durable state budget]";
+const MAINTENANCE_LARGE_FIELD_BYTES: i64 = 256 * 1024;
+#[cfg(not(test))]
+const MAINTENANCE_REQUEST_BATCH: i64 = 200;
+#[cfg(test)]
+const MAINTENANCE_REQUEST_BATCH: i64 = 8;
+const MAINTENANCE_REQUEST_MAX_BATCHES: usize = 20;
 
 #[derive(Debug, Clone)]
 pub struct Store {
@@ -47,6 +67,26 @@ pub struct RuntimeSummary {
     pub total_cache_miss_input_tokens: u64,
     pub total_output_tokens: u64,
     pub average_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MaintenanceReport {
+    pub log_retention_days: u16,
+    pub deleted_events: u64,
+    pub sanitized_requests: u64,
+    pub request_sanitize_batches: u64,
+    pub request_sanitize_limit_reached: bool,
+}
+
+struct RequestSanitizeReport {
+    sanitized_requests: u64,
+    batches: u64,
+    limit_reached: bool,
+}
+
+struct RequestSanitizeBatch {
+    fetched: u64,
+    changed: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -116,11 +156,18 @@ impl Store {
         let options = SqliteConnectOptions::new()
             .filename(path)
             .create_if_missing(true)
-            .foreign_keys(true);
+            .foreign_keys(true)
+            .journal_mode(SqliteJournalMode::Wal)
+            .synchronous(SqliteSynchronous::Normal)
+            .busy_timeout(StdDuration::from_secs(5));
         let pool = SqlitePool::connect_with(options).await?;
         let store = Self { pool };
         store.migrate().await?;
         Ok(store)
+    }
+
+    pub async fn close(&self) {
+        self.pool.close().await;
     }
 
     pub async fn migrate(&self) -> Result<()> {
@@ -208,11 +255,143 @@ impl Store {
         .bind(previous_response_id)
         .bind(RequestStatus::InProgress.as_str())
         .bind(model)
-        .bind(serde_json::to_string(input)?)
+        .bind(storage_json_string(input)?)
         .bind(now)
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    pub async fn run_maintenance(&self, log_retention_days: u16) -> Result<MaintenanceReport> {
+        let log_retention_days = log_retention_days.clamp(1, 365);
+        let cutoff = Utc::now()
+            .checked_sub_signed(Duration::days(i64::from(log_retention_days)))
+            .unwrap_or_else(Utc::now)
+            .to_rfc3339();
+        let deleted_events = sqlx::query(
+            r#"
+            DELETE FROM events
+            WHERE created_at < ?1;
+            "#,
+        )
+        .bind(cutoff)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        let request_sanitize = self.sanitize_large_request_payloads().await?;
+        Ok(MaintenanceReport {
+            log_retention_days,
+            deleted_events,
+            sanitized_requests: request_sanitize.sanitized_requests,
+            request_sanitize_batches: request_sanitize.batches,
+            request_sanitize_limit_reached: request_sanitize.limit_reached,
+        })
+    }
+
+    async fn sanitize_large_request_payloads(&self) -> Result<RequestSanitizeReport> {
+        let mut sanitized_requests = 0_u64;
+        let mut batches = 0_u64;
+        for _ in 0..MAINTENANCE_REQUEST_MAX_BATCHES {
+            let batch = self.sanitize_large_request_payload_batch().await?;
+            if batch.fetched == 0 {
+                return Ok(RequestSanitizeReport {
+                    sanitized_requests,
+                    batches,
+                    limit_reached: false,
+                });
+            }
+            batches = batches.saturating_add(1);
+            sanitized_requests = sanitized_requests.saturating_add(batch.changed);
+            if batch.fetched < MAINTENANCE_REQUEST_BATCH as u64 || batch.changed == 0 {
+                return Ok(RequestSanitizeReport {
+                    sanitized_requests,
+                    batches,
+                    limit_reached: false,
+                });
+            }
+        }
+        Ok(RequestSanitizeReport {
+            sanitized_requests,
+            batches,
+            limit_reached: true,
+        })
+    }
+
+    async fn sanitize_large_request_payload_batch(&self) -> Result<RequestSanitizeBatch> {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, input_json, response_json, turn_messages_json, tool_facts_json, diagnostic_json
+            FROM requests
+            WHERE length(input_json) > ?1
+               OR COALESCE(length(response_json), 0) > ?1
+               OR COALESCE(length(turn_messages_json), 0) > ?1
+               OR COALESCE(length(tool_facts_json), 0) > ?1
+               OR COALESCE(length(diagnostic_json), 0) > ?1
+            ORDER BY updated_at ASC
+            LIMIT ?2;
+            "#,
+        )
+        .bind(MAINTENANCE_LARGE_FIELD_BYTES)
+        .bind(MAINTENANCE_REQUEST_BATCH)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let fetched = rows.len() as u64;
+        let mut changed = 0_u64;
+        for row in rows {
+            let id: String = row.try_get("id")?;
+            let input_json: String = row.try_get("input_json")?;
+            let response_json: Option<String> = row.try_get("response_json")?;
+            let turn_messages_json: Option<String> = row.try_get("turn_messages_json")?;
+            let tool_facts_json: Option<String> = row.try_get("tool_facts_json")?;
+            let diagnostic_json: Option<String> = row.try_get("diagnostic_json")?;
+
+            let next_input_json = sanitize_json_text("requests.input_json", Some(&input_json))?
+                .unwrap_or(input_json.clone());
+            let next_response_json =
+                sanitize_json_text("requests.response_json", response_json.as_deref())?;
+            let next_turn_messages_json = sanitize_value_array_json_text(
+                "requests.turn_messages_json",
+                turn_messages_json.as_deref(),
+            )?;
+            let next_tool_facts_json = sanitize_tool_facts_json_text(
+                "requests.tool_facts_json",
+                tool_facts_json.as_deref(),
+            )?;
+            let next_diagnostic_json =
+                sanitize_json_text("requests.diagnostic_json", diagnostic_json.as_deref())?;
+
+            if next_input_json == input_json
+                && next_response_json == response_json
+                && next_turn_messages_json == turn_messages_json
+                && next_tool_facts_json == tool_facts_json
+                && next_diagnostic_json == diagnostic_json
+            {
+                continue;
+            }
+
+            sqlx::query(
+                r#"
+                UPDATE requests
+                SET input_json = ?2,
+                    response_json = ?3,
+                    turn_messages_json = ?4,
+                    tool_facts_json = ?5,
+                    diagnostic_json = ?6
+                WHERE id = ?1;
+                "#,
+            )
+            .bind(&id)
+            .bind(next_input_json)
+            .bind(next_response_json)
+            .bind(next_turn_messages_json)
+            .bind(next_tool_facts_json)
+            .bind(next_diagnostic_json)
+            .execute(&self.pool)
+            .await?;
+            changed = changed.saturating_add(1);
+        }
+        Ok(RequestSanitizeBatch { fetched, changed })
     }
 
     pub async fn runtime_summary(&self, turn_limit: u32) -> Result<RuntimeSummary> {
@@ -489,7 +668,7 @@ impl Store {
             "#,
         )
         .bind(id)
-        .bind(serde_json::to_string(&facts)?)
+        .bind(storage_tool_facts_json_string(&facts)?)
         .bind(now)
         .execute(&self.pool)
         .await?;
@@ -552,7 +731,7 @@ impl Store {
             "#,
         )
         .bind(id)
-        .bind(serde_json::to_string(messages)?)
+        .bind(storage_json_array_string(messages)?)
         .bind(now)
         .execute(&self.pool)
         .await?;
@@ -610,8 +789,8 @@ impl Store {
         )
         .bind(id)
         .bind(status.as_str())
-        .bind(response.map(serde_json::to_string).transpose()?)
-        .bind(diagnostic.map(serde_json::to_string).transpose()?)
+        .bind(response.map(storage_json_string).transpose()?)
+        .bind(diagnostic.map(storage_json_string).transpose()?)
         .bind(now)
         .execute(&self.pool)
         .await?;
@@ -687,7 +866,7 @@ impl Store {
             "#,
         )
         .bind(id)
-        .bind(serde_json::to_string(diagnostic)?)
+        .bind(storage_json_string(diagnostic)?)
         .bind(now)
         .execute(&self.pool)
         .await?;
@@ -714,7 +893,7 @@ impl Store {
         .bind(level)
         .bind(event_type)
         .bind(message)
-        .bind(detail.map(serde_json::to_string).transpose()?)
+        .bind(detail.map(storage_json_string).transpose()?)
         .bind(now)
         .execute(&self.pool)
         .await?;
@@ -961,11 +1140,322 @@ fn duration_ms(start: &str, end: &str) -> u64 {
     u64::try_from(millis).unwrap_or(0)
 }
 
+fn storage_json_string(value: &Value) -> Result<String> {
+    let sanitized = sanitize_json_for_storage(value);
+    let serialized = serde_json::to_string(&sanitized)?;
+    if serialized.len() <= MAX_STORAGE_JSON_BYTES {
+        return Ok(serialized);
+    }
+
+    let compacted = compact_json_for_storage(&sanitized);
+    let compacted_serialized = serde_json::to_string(&compacted)?;
+    if compacted_serialized.len() <= MAX_STORAGE_JSON_BYTES {
+        return Ok(compacted_serialized);
+    }
+
+    Ok(serde_json::to_string(&json!({
+        "_codeseex_storage_notice": "json payload omitted after exceeding durable state budget",
+        "original_bytes": serialized.len(),
+        "compacted_bytes": compacted_serialized.len(),
+        "hash": stable_hash_hex(serialized.as_bytes())
+    }))?)
+}
+
+fn storage_json_array_string(values: &[Value]) -> Result<String> {
+    let value = Value::Array(values.iter().map(sanitize_json_for_storage).collect());
+    let serialized = serde_json::to_string(&value)?;
+    if serialized.len() <= MAX_STORAGE_JSON_BYTES {
+        return Ok(serialized);
+    }
+
+    let compacted = compact_json_for_storage(&value);
+    let compacted_serialized = serde_json::to_string(&compacted)?;
+    if compacted_serialized.len() <= MAX_STORAGE_JSON_BYTES {
+        return Ok(compacted_serialized);
+    }
+
+    Ok(serde_json::to_string(&vec![json!({
+        "_codeseex_storage_notice": "json array payload omitted after exceeding durable state budget",
+        "original_bytes": serialized.len(),
+        "compacted_bytes": compacted_serialized.len(),
+        "hash": stable_hash_hex(serialized.as_bytes())
+    })])?)
+}
+
+fn storage_tool_facts_json_string(facts: &[String]) -> Result<String> {
+    let mut prior_omitted = 0_usize;
+    let mut sanitized = facts
+        .iter()
+        .enumerate()
+        .filter_map(|(index, fact)| {
+            if index == 0 {
+                if let Some(count) = omitted_tool_fact_count(fact) {
+                    prior_omitted = prior_omitted.saturating_add(count);
+                    return None;
+                }
+            }
+            Some(fact)
+        })
+        .map(|fact| sanitize_string_for_storage(fact))
+        .collect::<Vec<_>>();
+    if sanitized.len() > MAX_STORAGE_TOOL_FACTS_PER_REQUEST {
+        let omitted = prior_omitted + sanitized.len() - (MAX_STORAGE_TOOL_FACTS_PER_REQUEST - 1);
+        let tail_start = sanitized.len() - (MAX_STORAGE_TOOL_FACTS_PER_REQUEST - 1);
+        let mut compacted = Vec::with_capacity(MAX_STORAGE_TOOL_FACTS_PER_REQUEST);
+        compacted.push(tool_fact_omitted_marker(omitted));
+        compacted.extend(sanitized.drain(tail_start..));
+        sanitized = compacted;
+    } else if prior_omitted > 0 {
+        let available = MAX_STORAGE_TOOL_FACTS_PER_REQUEST - 1;
+        if sanitized.len() > available {
+            let newly_omitted = sanitized.len() - available;
+            prior_omitted = prior_omitted.saturating_add(newly_omitted);
+            sanitized.drain(0..newly_omitted);
+        }
+        sanitized.insert(0, tool_fact_omitted_marker(prior_omitted));
+    }
+
+    let serialized = serde_json::to_string(&sanitized)?;
+    if serialized.len() <= MAX_STORAGE_JSON_BYTES {
+        return Ok(serialized);
+    }
+
+    let compacted = sanitized
+        .into_iter()
+        .map(|fact| truncate_storage_string(&fact, COMPACT_STORAGE_STRING_CHARS))
+        .collect::<Vec<_>>();
+    let compacted_serialized = serde_json::to_string(&compacted)?;
+    if compacted_serialized.len() <= MAX_STORAGE_JSON_BYTES {
+        return Ok(compacted_serialized);
+    }
+
+    Ok(serde_json::to_string(&vec![format!(
+        "[CodeSeeX storage omitted tool facts after exceeding durable state budget; original_bytes={}, compacted_bytes={}, hash={}]",
+        serialized.len(),
+        compacted_serialized.len(),
+        stable_hash_hex(serialized.as_bytes())
+    )])?)
+}
+
+fn tool_fact_omitted_marker(count: usize) -> String {
+    format!("{TOOL_FACT_OMITTED_PREFIX}{count}{TOOL_FACT_OMITTED_SUFFIX}")
+}
+
+fn omitted_tool_fact_count(text: &str) -> Option<usize> {
+    text.strip_prefix(TOOL_FACT_OMITTED_PREFIX)?
+        .strip_suffix(TOOL_FACT_OMITTED_SUFFIX)?
+        .parse()
+        .ok()
+}
+
+fn sanitize_json_text(label: &str, text: Option<&str>) -> Result<Option<String>> {
+    text.map(|text| {
+        let value = parse_json_field::<Value>(label, text)?;
+        storage_json_string(&value)
+    })
+    .transpose()
+}
+
+fn sanitize_value_array_json_text(label: &str, text: Option<&str>) -> Result<Option<String>> {
+    text.map(|text| {
+        let values = parse_json_field::<Vec<Value>>(label, text)?;
+        storage_json_array_string(&values)
+    })
+    .transpose()
+}
+
+fn sanitize_tool_facts_json_text(label: &str, text: Option<&str>) -> Result<Option<String>> {
+    text.map(|text| {
+        let facts = parse_json_field::<Vec<String>>(label, text)?;
+        storage_tool_facts_json_string(&facts)
+    })
+    .transpose()
+}
+
+fn sanitize_json_for_storage(value: &Value) -> Value {
+    match value {
+        Value::String(text) => Value::String(sanitize_string_for_storage(text)),
+        Value::Array(items) => Value::Array(items.iter().map(sanitize_json_for_storage).collect()),
+        Value::Object(object) => {
+            let mut sanitized = serde_json::Map::with_capacity(object.len());
+            for (key, value) in object {
+                let next = if is_sensitive_storage_key(key) {
+                    Value::String("[redacted sensitive value]".to_owned())
+                } else {
+                    sanitize_json_for_storage(value)
+                };
+                sanitized.insert(key.clone(), next);
+            }
+            Value::Object(sanitized)
+        }
+        other => other.clone(),
+    }
+}
+
+fn sanitize_string_for_storage(text: &str) -> String {
+    let redacted = redact_inline_data_urls_for_storage(text);
+    truncate_storage_string(&redacted, MAX_STORAGE_STRING_CHARS)
+}
+
+fn is_sensitive_storage_key(key: &str) -> bool {
+    let key = key.trim().to_ascii_lowercase();
+    matches!(
+        key.as_str(),
+        "api_key"
+            | "apikey"
+            | "authorization"
+            | "auth"
+            | "bearer"
+            | "token"
+            | "access_token"
+            | "refresh_token"
+            | "password"
+            | "secret"
+            | "client_secret"
+            | "proxy_password"
+    ) || key.ends_with("_api_key")
+        || key.ends_with("_token")
+        || key.ends_with("_secret")
+}
+
+fn redact_inline_data_urls_for_storage(text: &str) -> String {
+    let Some(mut cursor) = text.find("data:") else {
+        return text.to_owned();
+    };
+    let mut output = String::with_capacity(text.len().min(MAX_STORAGE_STRING_CHARS));
+    let mut copied_until = 0;
+    while cursor < text.len() {
+        output.push_str(&text[copied_until..cursor]);
+        let mut end = text.len();
+        for (offset, ch) in text[cursor..].char_indices() {
+            if ch.is_whitespace() || matches!(ch, '"' | '\'' | '<' | '>' | ')' | ']' | '}' | '`') {
+                end = cursor + offset;
+                break;
+            }
+        }
+        let segment = &text[cursor..end];
+        if segment.len() > 1024 || segment.contains(";base64,") {
+            output.push_str(&format!(
+                "[inline-data-url omitted chars={} bytes={} hash={}]",
+                segment.chars().count(),
+                segment.len(),
+                stable_hash_hex(segment.as_bytes())
+            ));
+        } else {
+            output.push_str(segment);
+        }
+        copied_until = end;
+        let Some(next) = text[copied_until..].find("data:") else {
+            break;
+        };
+        cursor = copied_until + next;
+    }
+    output.push_str(&text[copied_until..]);
+    output
+}
+
+fn truncate_storage_string(text: &str, max_chars: usize) -> String {
+    let count = text.chars().count();
+    if count <= max_chars {
+        return text.to_owned();
+    }
+    let keep = max_chars.saturating_sub(96);
+    let prefix = text.chars().take(keep).collect::<String>();
+    format!(
+        "{prefix}...[truncated chars={} bytes={} hash={}]",
+        count,
+        text.len(),
+        stable_hash_hex(text.as_bytes())
+    )
+}
+
+fn compact_json_for_storage(value: &Value) -> Value {
+    match value {
+        Value::String(text) => {
+            Value::String(truncate_storage_string(text, COMPACT_STORAGE_STRING_CHARS))
+        }
+        Value::Array(items) => compact_json_array_for_storage(items),
+        Value::Object(object) => {
+            let mut compacted = serde_json::Map::with_capacity(object.len());
+            for (index, (key, value)) in object.iter().enumerate() {
+                if index >= COMPACT_STORAGE_OBJECT_KEYS {
+                    compacted.insert(
+                        "_codeseex_storage_omitted_keys".to_owned(),
+                        json!(object.len() - COMPACT_STORAGE_OBJECT_KEYS),
+                    );
+                    break;
+                }
+                compacted.insert(key.clone(), compact_json_for_storage(value));
+            }
+            Value::Object(compacted)
+        }
+        other => other.clone(),
+    }
+}
+
+fn compact_json_array_for_storage(items: &[Value]) -> Value {
+    let keep_all = COMPACT_STORAGE_ARRAY_HEAD_ITEMS + COMPACT_STORAGE_ARRAY_TAIL_ITEMS;
+    if items.len() <= keep_all {
+        return Value::Array(items.iter().map(compact_json_for_storage).collect());
+    }
+
+    let tail_start = items.len().saturating_sub(COMPACT_STORAGE_ARRAY_TAIL_ITEMS);
+    let mut compacted = Vec::with_capacity(keep_all + 1);
+    compacted.extend(
+        items
+            .iter()
+            .take(COMPACT_STORAGE_ARRAY_HEAD_ITEMS)
+            .map(compact_json_for_storage),
+    );
+    compacted.push(json!({
+        "_codeseex_storage_notice": "array items omitted after exceeding durable state budget",
+        "omitted_items": tail_start.saturating_sub(COMPACT_STORAGE_ARRAY_HEAD_ITEMS),
+        "total_items": items.len()
+    }));
+    compacted.extend(items.iter().skip(tail_start).map(compact_json_for_storage));
+    Value::Array(compacted)
+}
+
+fn stable_hash_hex(bytes: &[u8]) -> String {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[tokio::test]
+    async fn open_configures_sqlite_for_local_proxy_state() {
+        let path = temp_db_path("sqlite-options");
+        let store = Store::open(&path).await.expect("open store");
+
+        let journal_mode: String = sqlx::query_scalar("PRAGMA journal_mode;")
+            .fetch_one(&store.pool)
+            .await
+            .expect("journal mode");
+        assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
+
+        let synchronous: i64 = sqlx::query_scalar("PRAGMA synchronous;")
+            .fetch_one(&store.pool)
+            .await
+            .expect("synchronous pragma");
+        assert_eq!(synchronous, 1);
+
+        let busy_timeout: i64 = sqlx::query_scalar("PRAGMA busy_timeout;")
+            .fetch_one(&store.pool)
+            .await
+            .expect("busy timeout");
+        assert!(busy_timeout >= 5_000);
+
+        remove_temp_db(store, path).await;
+    }
 
     #[tokio::test]
     async fn response_context_chain_includes_failed_parent_without_response() {
@@ -1024,7 +1514,7 @@ mod tests {
         assert!(chain[0].tool_facts.is_empty());
         assert_eq!(chain[1].status, RequestStatus::Completed);
 
-        let _ = std::fs::remove_file(path);
+        remove_temp_db(store, path).await;
     }
 
     #[tokio::test]
@@ -1064,7 +1554,7 @@ mod tests {
         assert_eq!(chain[0].tool_facts.len(), 1);
         assert!(chain[0].tool_facts[0].contains("list_directory"));
 
-        let _ = std::fs::remove_file(path);
+        remove_temp_db(store, path).await;
     }
 
     #[tokio::test]
@@ -1094,7 +1584,7 @@ mod tests {
         assert_eq!(facts.len(), 1);
         assert!(facts[0].contains("Shanghai weather"));
 
-        let _ = std::fs::remove_file(path);
+        remove_temp_db(store, path).await;
     }
 
     #[tokio::test]
@@ -1164,7 +1654,59 @@ mod tests {
             Some("call_1")
         );
 
-        let _ = std::fs::remove_file(path);
+        remove_temp_db(store, path).await;
+    }
+
+    #[tokio::test]
+    async fn turn_messages_keep_array_shape_when_structurally_compacted() {
+        let path = temp_db_path("turn-messages-compact");
+        let store = Store::open(&path).await.expect("open store");
+
+        let input = json!({
+            "input": [{"role":"user","content":[{"type":"input_text","text":"many messages"}]}]
+        });
+        store
+            .checkpoint_request("resp_many_turns", None, Some("deepseek-v4-pro"), &input)
+            .await
+            .expect("checkpoint request");
+
+        let messages = (0..4_000)
+            .map(|index| {
+                json!({
+                    "role": "user",
+                    "content": format!("stored turn message {index:04} {}", "m".repeat(256))
+                })
+            })
+            .collect::<Vec<_>>();
+        store
+            .replace_request_turn_messages("resp_many_turns", &messages)
+            .await
+            .expect("replace turn messages");
+
+        let stored_json: String =
+            sqlx::query_scalar("SELECT turn_messages_json FROM requests WHERE id = ?1;")
+                .bind("resp_many_turns")
+                .fetch_one(&store.pool)
+                .await
+                .expect("stored turn messages");
+        assert!(stored_json.len() <= MAX_STORAGE_JSON_BYTES, "{stored_json}");
+        let stored: Vec<Value> =
+            serde_json::from_str(&stored_json).expect("turn messages stay array-shaped");
+        assert_eq!(
+            stored.len(),
+            COMPACT_STORAGE_ARRAY_HEAD_ITEMS + COMPACT_STORAGE_ARRAY_TAIL_ITEMS + 1
+        );
+        assert!(stored_json.contains("array items omitted"), "{stored_json}");
+        assert!(
+            stored_json.contains("stored turn message 0000"),
+            "{stored_json}"
+        );
+        assert!(
+            stored_json.contains("stored turn message 3999"),
+            "{stored_json}"
+        );
+
+        remove_temp_db(store, path).await;
     }
 
     #[tokio::test]
@@ -1225,7 +1767,7 @@ mod tests {
             Some("second")
         );
 
-        let _ = std::fs::remove_file(path);
+        remove_temp_db(store, path).await;
     }
 
     #[tokio::test]
@@ -1257,7 +1799,7 @@ mod tests {
         assert_eq!(overview.active_requests, 0);
         assert_eq!(overview.failed_request_count, 1);
 
-        let _ = std::fs::remove_file(path);
+        remove_temp_db(store, path).await;
     }
 
     #[tokio::test]
@@ -1270,7 +1812,51 @@ mod tests {
             .expect_err("missing request should fail");
         assert!(error.to_string().contains("was not found"));
 
-        let _ = std::fs::remove_file(path);
+        remove_temp_db(store, path).await;
+    }
+
+    #[tokio::test]
+    async fn appended_tool_facts_keep_string_array_shape_under_storage_budget() {
+        let path = temp_db_path("tool-facts-budget");
+        let store = Store::open(&path).await.expect("open store");
+        let input = json!({
+            "input": [{"role":"user","content":[{"type":"input_text","text":"many facts"}]}]
+        });
+        store
+            .checkpoint_request("resp_many_facts", None, Some("deepseek-v4-pro"), &input)
+            .await
+            .expect("checkpoint request");
+
+        for index in 0..120 {
+            store
+                .append_request_tool_fact(
+                    "resp_many_facts",
+                    &format!("tool_fact {index:04} {}", "f".repeat(8_000)),
+                )
+                .await
+                .expect("append tool fact");
+        }
+
+        let stored_json: String =
+            sqlx::query_scalar("SELECT tool_facts_json FROM requests WHERE id = ?1;")
+                .bind("resp_many_facts")
+                .fetch_one(&store.pool)
+                .await
+                .expect("stored tool facts");
+        assert!(stored_json.len() <= MAX_STORAGE_JSON_BYTES, "{stored_json}");
+        let facts: Vec<String> =
+            serde_json::from_str(&stored_json).expect("tool facts stay string array-shaped");
+        assert_eq!(facts.len(), MAX_STORAGE_TOOL_FACTS_PER_REQUEST);
+        assert!(facts[0].contains("omitted 21 older tool fact"), "{facts:?}");
+        assert!(
+            facts.last().unwrap().contains("tool_fact 0119"),
+            "{facts:?}"
+        );
+        assert!(facts
+            .iter()
+            .all(|fact| fact.chars().count() <= MAX_STORAGE_STRING_CHARS));
+
+        remove_temp_db(store, path).await;
     }
 
     #[tokio::test]
@@ -1303,7 +1889,346 @@ mod tests {
         assert_eq!(visible_events[0].level, "info");
         assert_eq!(visible_events[0].event_type, "request_received");
 
-        let _ = std::fs::remove_file(path);
+        remove_temp_db(store, path).await;
+    }
+
+    #[tokio::test]
+    async fn checkpoint_request_sanitizes_large_inline_data_and_secrets() {
+        let path = temp_db_path("sanitize-checkpoint");
+        let store = Store::open(&path).await.expect("open store");
+        let screenshot = format!("before data:image/png;base64,{} after", "A".repeat(80_000));
+        let input = json!({
+            "api_key": "sk-should-not-be-stored",
+            "input": [{
+                "role": "user",
+                "content": [{"type": "input_text", "text": screenshot}]
+            }]
+        });
+
+        store
+            .checkpoint_request("resp_sanitize", None, Some("deepseek-v4-pro"), &input)
+            .await
+            .expect("checkpoint request");
+
+        let chain = store
+            .response_context_chain("resp_sanitize", 10)
+            .await
+            .expect("response context chain");
+        let stored = serde_json::to_string(&chain[0].input).expect("stored input json");
+        assert!(stored.contains("[inline-data-url omitted"), "{stored}");
+        assert!(stored.contains("[redacted sensitive value]"), "{stored}");
+        assert!(!stored.contains("sk-should-not-be-stored"), "{stored}");
+        assert!(!stored.contains(&"A".repeat(2048)), "{stored}");
+
+        remove_temp_db(store, path).await;
+    }
+
+    #[tokio::test]
+    async fn checkpoint_request_compacts_many_small_items_before_storage() {
+        let path = temp_db_path("compact-many-small-items");
+        let store = Store::open(&path).await.expect("open store");
+        let items = (0..4_000)
+            .map(|index| {
+                json!({
+                    "role": "user",
+                    "content": [{
+                        "type": "input_text",
+                        "text": format!("small item {index:04} {}", "z".repeat(256))
+                    }]
+                })
+            })
+            .collect::<Vec<_>>();
+        let input = json!({ "input": items });
+
+        store
+            .checkpoint_request("resp_structural", None, Some("deepseek-v4-pro"), &input)
+            .await
+            .expect("checkpoint request");
+
+        let stored_json: String =
+            sqlx::query_scalar("SELECT input_json FROM requests WHERE id = ?1;")
+                .bind("resp_structural")
+                .fetch_one(&store.pool)
+                .await
+                .expect("stored input");
+        assert!(stored_json.len() <= MAX_STORAGE_JSON_BYTES, "{stored_json}");
+        assert!(stored_json.contains("array items omitted"), "{stored_json}");
+
+        let chain = store
+            .response_context_chain("resp_structural", 10)
+            .await
+            .expect("response context chain");
+        let stored_items = chain[0]
+            .input
+            .pointer("/input")
+            .and_then(Value::as_array)
+            .expect("stored input array");
+        assert_eq!(
+            stored_items.len(),
+            COMPACT_STORAGE_ARRAY_HEAD_ITEMS + COMPACT_STORAGE_ARRAY_TAIL_ITEMS + 1
+        );
+        let joined = serde_json::to_string(&chain[0].input).expect("stored input json");
+        assert!(joined.contains("small item 0000"), "{joined}");
+        assert!(joined.contains("small item 3999"), "{joined}");
+
+        remove_temp_db(store, path).await;
+    }
+
+    #[tokio::test]
+    async fn finish_request_sanitizes_large_response_strings() {
+        let path = temp_db_path("sanitize-response");
+        let store = Store::open(&path).await.expect("open store");
+        let input = json!({
+            "input": [{"role":"user","content":[{"type":"input_text","text":"hello"}]}]
+        });
+        store
+            .checkpoint_request("resp_large", None, Some("deepseek-v4-pro"), &input)
+            .await
+            .expect("checkpoint request");
+
+        let response = json!({
+            "authorization": "Bearer should-not-be-stored",
+            "output": [{
+                "type": "message",
+                "content": [{"type": "output_text", "text": "x".repeat(MAX_STORAGE_STRING_CHARS + 1024)}]
+            }]
+        });
+        store
+            .finish_request(
+                "resp_large",
+                RequestStatus::Completed,
+                Some(&response),
+                None,
+            )
+            .await
+            .expect("finish request");
+
+        let chain = store
+            .response_context_chain("resp_large", 10)
+            .await
+            .expect("response context chain");
+        let stored = serde_json::to_string(&chain[0].response).expect("stored response json");
+        assert!(stored.contains("[truncated chars="), "{stored}");
+        assert!(stored.contains("[redacted sensitive value]"), "{stored}");
+        assert!(!stored.contains("should-not-be-stored"), "{stored}");
+        assert!(stored.len() < MAX_STORAGE_STRING_CHARS + 2048, "{stored}");
+
+        remove_temp_db(store, path).await;
+    }
+
+    #[tokio::test]
+    async fn maintenance_prunes_events_older_than_retention() {
+        let path = temp_db_path("maintenance-events");
+        let store = Store::open(&path).await.expect("open store");
+
+        store
+            .record_event("info", "old_event", "Old event.", None)
+            .await
+            .expect("record old event");
+        store
+            .record_event(
+                "info",
+                "new_event",
+                "New event.",
+                Some(&json!({"token": "secret-token-value"})),
+            )
+            .await
+            .expect("record new event");
+
+        let old_ts = Utc::now()
+            .checked_sub_signed(Duration::days(10))
+            .expect("old timestamp")
+            .to_rfc3339();
+        sqlx::query("UPDATE events SET created_at = ?1 WHERE event_type = 'old_event';")
+            .bind(old_ts)
+            .execute(&store.pool)
+            .await
+            .expect("backdate old event");
+
+        let report = store.run_maintenance(7).await.expect("run maintenance");
+        assert_eq!(report.log_retention_days, 7);
+        assert_eq!(report.deleted_events, 1);
+
+        let (events, _) = store.recent_events(10, None).await.expect("recent events");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "new_event");
+        let detail = serde_json::to_string(&events[0].detail).expect("event detail");
+        assert!(detail.contains("[redacted sensitive value]"), "{detail}");
+        assert!(!detail.contains("secret-token-value"), "{detail}");
+
+        remove_temp_db(store, path).await;
+    }
+
+    #[tokio::test]
+    async fn maintenance_compacts_existing_structurally_large_request_payloads() {
+        let path = temp_db_path("maintenance-structural-large");
+        let store = Store::open(&path).await.expect("open store");
+        let items = (0..4_000)
+            .map(|index| {
+                json!({
+                    "role": "user",
+                    "content": [{
+                        "type": "input_text",
+                        "text": format!("legacy small item {index:04} {}", "q".repeat(256))
+                    }]
+                })
+            })
+            .collect::<Vec<_>>();
+        let raw_input = json!({ "input": items });
+        let raw_input_json = serde_json::to_string(&raw_input).expect("raw input json");
+        assert!(raw_input_json.len() > MAX_STORAGE_JSON_BYTES);
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(
+            r#"
+            INSERT INTO requests
+              (id, previous_response_id, status, model, input_json, created_at, updated_at)
+            VALUES (?1, NULL, 'completed', 'deepseek-v4-pro', ?2, ?3, ?3);
+            "#,
+        )
+        .bind("resp_legacy_structural")
+        .bind(&raw_input_json)
+        .bind(now)
+        .execute(&store.pool)
+        .await
+        .expect("insert legacy structural request");
+
+        let report = store.run_maintenance(7).await.expect("run maintenance");
+        assert_eq!(report.sanitized_requests, 1);
+
+        let stored_json: String =
+            sqlx::query_scalar("SELECT input_json FROM requests WHERE id = ?1;")
+                .bind("resp_legacy_structural")
+                .fetch_one(&store.pool)
+                .await
+                .expect("stored input");
+        assert!(stored_json.len() <= MAX_STORAGE_JSON_BYTES, "{stored_json}");
+        assert!(stored_json.contains("array items omitted"), "{stored_json}");
+        assert!(
+            stored_json.contains("legacy small item 0000"),
+            "{stored_json}"
+        );
+        assert!(
+            stored_json.contains("legacy small item 3999"),
+            "{stored_json}"
+        );
+
+        remove_temp_db(store, path).await;
+    }
+
+    #[tokio::test]
+    async fn maintenance_sanitizes_multiple_large_request_batches() {
+        let path = temp_db_path("maintenance-multiple-batches");
+        let store = Store::open(&path).await.expect("open store");
+        let row_count = usize::try_from(MAINTENANCE_REQUEST_BATCH).unwrap() + 2;
+        let large_text = "r".repeat(MAINTENANCE_LARGE_FIELD_BYTES as usize + 1024);
+        let now = Utc::now().to_rfc3339();
+
+        for index in 0..row_count {
+            let raw_input = json!({
+                "input": [{
+                    "role": "user",
+                    "content": [{
+                        "type": "input_text",
+                        "text": format!("legacy batch row {index:04} {large_text}")
+                    }]
+                }]
+            });
+            sqlx::query(
+                r#"
+                INSERT INTO requests
+                  (id, previous_response_id, status, model, input_json, created_at, updated_at)
+                VALUES (?1, NULL, 'completed', 'deepseek-v4-pro', ?2, ?3, ?3);
+                "#,
+            )
+            .bind(format!("resp_legacy_batch_{index:04}"))
+            .bind(serde_json::to_string(&raw_input).expect("raw input json"))
+            .bind(&now)
+            .execute(&store.pool)
+            .await
+            .expect("insert legacy batch request");
+        }
+
+        let report = store.run_maintenance(7).await.expect("run maintenance");
+        assert_eq!(report.sanitized_requests, row_count as u64);
+        assert!(report.request_sanitize_batches >= 2);
+        assert!(!report.request_sanitize_limit_reached);
+
+        let remaining_large: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)
+            FROM requests
+            WHERE length(input_json) > ?1;
+            "#,
+        )
+        .bind(MAINTENANCE_LARGE_FIELD_BYTES)
+        .fetch_one(&store.pool)
+        .await
+        .expect("remaining large count");
+        assert_eq!(remaining_large, 0);
+
+        remove_temp_db(store, path).await;
+    }
+
+    #[tokio::test]
+    async fn maintenance_sanitizes_existing_large_request_payloads() {
+        let path = temp_db_path("maintenance-large-requests");
+        let store = Store::open(&path).await.expect("open store");
+        let raw_input = json!({
+            "api_key": "old-secret-key",
+            "input": [{
+                "role": "user",
+                "content": [{
+                    "type": "input_text",
+                    "text": format!("legacy screenshot data:image/jpeg;base64,{}", "B".repeat(300_000))
+                }]
+            }]
+        });
+        let raw_response = json!({
+            "secret": "old-response-secret",
+            "output": [{
+                "type": "message",
+                "content": [{"type": "output_text", "text": "y".repeat(300_000)}]
+            }]
+        });
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(
+            r#"
+            INSERT INTO requests
+              (id, previous_response_id, status, model, input_json, response_json, created_at, updated_at)
+            VALUES (?1, NULL, 'completed', 'deepseek-v4-pro', ?2, ?3, ?4, ?4);
+            "#,
+        )
+        .bind("resp_legacy_large")
+        .bind(serde_json::to_string(&raw_input).expect("raw input json"))
+        .bind(serde_json::to_string(&raw_response).expect("raw response json"))
+        .bind(now)
+        .execute(&store.pool)
+        .await
+        .expect("insert legacy large request");
+
+        let report = store.run_maintenance(7).await.expect("run maintenance");
+        assert_eq!(report.sanitized_requests, 1);
+
+        let chain = store
+            .response_context_chain("resp_legacy_large", 10)
+            .await
+            .expect("response context chain");
+        assert_eq!(chain.len(), 1);
+        let stored = serde_json::to_string(&chain[0]).expect("stored response json");
+        assert!(stored.contains("[inline-data-url omitted"), "{stored}");
+        assert!(stored.contains("[truncated chars="), "{stored}");
+        assert!(stored.contains("[redacted sensitive value]"), "{stored}");
+        assert!(!stored.contains("old-secret-key"), "{stored}");
+        assert!(!stored.contains("old-response-secret"), "{stored}");
+        assert!(!stored.contains(&"B".repeat(2048)), "{stored}");
+        assert!(
+            stored.len()
+                < serde_json::to_string(&raw_input).unwrap().len()
+                    + serde_json::to_string(&raw_response).unwrap().len(),
+            "{stored}"
+        );
+
+        remove_temp_db(store, path).await;
     }
 
     fn temp_db_path(label: &str) -> std::path::PathBuf {
@@ -1312,5 +2237,32 @@ mod tests {
             .expect("system clock")
             .as_nanos();
         std::env::temp_dir().join(format!("codeseex-next-{label}-{nanos}.db"))
+    }
+
+    async fn remove_temp_db(store: Store, path: std::path::PathBuf) {
+        store.close().await;
+        drop(store);
+        let wal = temp_db_sidecar_path(&path, "-wal");
+        let shm = temp_db_sidecar_path(&path, "-shm");
+        remove_temp_file(path).await;
+        remove_temp_file(wal).await;
+        remove_temp_file(shm).await;
+    }
+
+    async fn remove_temp_file(path: std::path::PathBuf) {
+        for _ in 0..5 {
+            match std::fs::remove_file(&path) {
+                Ok(()) => return,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+                Err(_) => tokio::time::sleep(StdDuration::from_millis(20)).await,
+            }
+        }
+        let _ = std::fs::remove_file(path);
+    }
+
+    fn temp_db_sidecar_path(path: &std::path::Path, suffix: &str) -> std::path::PathBuf {
+        let mut value = path.as_os_str().to_os_string();
+        value.push(suffix);
+        std::path::PathBuf::from(value)
     }
 }

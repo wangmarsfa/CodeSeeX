@@ -1,3 +1,7 @@
+mod visible_bridge;
+
+pub(crate) use visible_bridge::StreamingVisibleToolBridge;
+
 use crate::tools::ownership::ChatToolCall;
 use serde_json::Value;
 use std::collections::BTreeMap;

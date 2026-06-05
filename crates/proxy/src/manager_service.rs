@@ -223,6 +223,54 @@ impl ManagerRuntime {
         let user_config = user_config_from_payload(&payload, existing_config, &config);
         match user_config.write_atomic(&config.config_path()) {
             Ok(()) => {
+                let maintenance = match self
+                    .store
+                    .run_maintenance(user_config.log_retention_days())
+                    .await
+                {
+                    Ok(report) => {
+                        if report.deleted_events > 0
+                            || report.sanitized_requests > 0
+                            || report.request_sanitize_limit_reached
+                        {
+                            let _ = self
+                                .store
+                                .record_event(
+                                    "info",
+                                    "state_maintenance_completed",
+                                    "CodeSeeX state maintenance completed.",
+                                    Some(&json!({
+                                        "log_retention_days": report.log_retention_days,
+                                        "deleted_events": report.deleted_events,
+                                        "sanitized_requests": report.sanitized_requests,
+                                        "request_sanitize_batches": report.request_sanitize_batches,
+                                        "request_sanitize_limit_reached": report.request_sanitize_limit_reached
+                                    })),
+                                )
+                                .await;
+                        }
+                        json!({
+                            "ok": true,
+                            "log_retention_days": report.log_retention_days,
+                            "deleted_events": report.deleted_events,
+                            "sanitized_requests": report.sanitized_requests,
+                            "request_sanitize_batches": report.request_sanitize_batches,
+                            "request_sanitize_limit_reached": report.request_sanitize_limit_reached
+                        })
+                    }
+                    Err(error) => {
+                        let _ = self
+                            .store
+                            .record_event(
+                                "error",
+                                "state_maintenance_failed",
+                                "CodeSeeX failed to prune expired events.",
+                                Some(&json!({ "error": error.to_string() })),
+                            )
+                            .await;
+                        json!({ "ok": false, "error": error.to_string() })
+                    }
+                };
                 let _ = self
                     .store
                     .record_event(
@@ -236,7 +284,8 @@ impl ManagerRuntime {
                     "ok": true,
                     "saved": true,
                     "config_version": now_seconds().to_string(),
-                    "path": config.config_path().to_string_lossy()
+                    "path": config.config_path().to_string_lossy(),
+                    "maintenance": maintenance
                 }))
             }
             Err(error) => status(500, json!({ "ok": false, "error": error.to_string() })),

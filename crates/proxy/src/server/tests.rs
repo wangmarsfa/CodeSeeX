@@ -41,6 +41,7 @@ async fn serve_with_shutdown_exits_after_listening() {
     let data_dir = temp_workspace("serve-shutdown");
     let mut config = test_config(data_dir.clone());
     config.port = 0;
+    let database_path = config.database_path();
     let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
@@ -58,6 +59,7 @@ async fn serve_with_shutdown_exits_after_listening() {
 
     assert!(started_rx.await.is_ok(), "listening callback should run");
     assert!(result.is_ok(), "server should stop cleanly: {result:?}");
+    std::fs::remove_file(&database_path).expect("database handle should be released on shutdown");
     let _ = std::fs::remove_dir_all(data_dir);
 }
 
@@ -240,7 +242,9 @@ async fn fake_apply_patch_streaming_chat_completions(
     } else {
         concat!(
                 "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"patch the file natively\"}}]}\n\n",
-                "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_patch\",\"type\":\"function\",\"function\":{\"name\":\"apply_patch\",\"arguments\":\"{\\\"patch\\\":\\\"*** Begin Patch\\\\n*** Add File: target/codeseex-next-apply-patch-streaming-test/hello.txt\\\\n+hello\\\\n*** End Patch\\\"}\"}}]}}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_patch\",\"type\":\"function\",\"function\":{\"name\":\"apply_patch\",\"arguments\":\"{\\\"patch\\\":\\\"*** Begin Patch\\\\n\"}}]}}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"*** Add File: target/codeseex-next-apply-patch-streaming-test/hello.txt\\\\n+hello\\\\n\"}}]}}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"*** End Patch\\\"}\"}}]}}]}\n\n",
                 "data: [DONE]\n\n"
             )
             .to_owned()
@@ -1789,6 +1793,12 @@ async fn streaming_apply_patch_returns_native_custom_tool_call() {
     assert!(body.contains("\"type\":\"custom_tool_call\""), "{body}");
     assert!(body.contains("\"name\":\"apply_patch\""), "{body}");
     assert!(body.contains("*** Begin Patch"), "{body}");
+    assert!(
+        body.matches("response.custom_tool_call_input.delta")
+            .count()
+            >= 2,
+        "{body}"
+    );
     assert!(!body.contains("patch-ok"), "{body}");
     assert!(body.contains("encrypted_content"), "{body}");
     let thinking_done = body

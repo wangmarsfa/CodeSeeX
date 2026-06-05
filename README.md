@@ -8,7 +8,7 @@ During development it uses `~/.codeseex-next` only to keep test data away from t
 
 - Rust core for proxy, protocol conversion, catalog generation, state, and diagnostics.
 - Tauri 2 desktop shell with static WebView assets.
-- SQLite for durable request state, usage, logs, and diagnostics.
+- SQLite for the minimal adapter state ledger, usage, logs, and diagnostics.
 - TOML for readable user configuration.
 - External compatibility with the current CodeSeeX Codex setup: port `8787`, `deepseek-v4-flash`, `deepseek-v4-pro`, generated `config.toml`, and `model_catalog_json`.
 
@@ -39,6 +39,7 @@ M3 context fidelity has started:
 - Function/tool/MCP-like request facts that cannot be represented as plain chat messages are preserved as verified facts instead of being silently dropped.
 - Inline `data:` URLs from tool facts are redacted to size/hash markers so screenshots or binary payloads do not poison prompt caching.
 - Context diagnostics are persisted with each request checkpoint for debugging history reconstruction and compaction behavior.
+- SQLite state is an adapter ledger, not a duplicate Codex transcript; large inline data, secrets, and oversized strings are sanitized before durable storage.
 - Failed or interrupted parent turns can safely contribute user input and verified facts without replaying partial assistant text.
 - `/v1/responses/compact` returns a local, readable compaction item and does not fake OpenAI `encrypted_content`.
 
@@ -55,7 +56,7 @@ M4 tool migration has started:
 - Community tools under `~/.codeseex-next/extension/tools/<tool>/manifest.json` are discovered for the Tools page, default to disabled, can persist safe UI settings, and execute only when the manifest declares an explicit external command.
 - Community tool execution runs in a child process with no shell, a minimal environment, timeout handling, and bounded stdout/stderr capture; third-party code is never loaded into the proxy process.
 
-See [docs/electron-parity-checklist.md](docs/electron-parity-checklist.md) for the migration release gate and [docs/community-tools.md](docs/community-tools.md) for the current manifest and execution contract. The next step for community tools is parity hardening with broader platform executor validation.
+See [docs/electron-parity-checklist.md](docs/electron-parity-checklist.md) for the migration release gate, [docs/state-contract.md](docs/state-contract.md) for the durable state boundary, and [docs/community-tools.md](docs/community-tools.md) for the current manifest and execution contract. The next step for community tools is parity hardening with broader platform executor validation.
 
 ## Development
 

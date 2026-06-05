@@ -56,9 +56,17 @@ impl ToolContext {
     }
 
     pub fn response_item_from_chat_call(&self, call: &ChatToolCall) -> Value {
+        self.response_item_from_chat_call_with_id(call, &format!("fc_{}", Uuid::new_v4().simple()))
+    }
+
+    pub fn response_item_from_chat_call_with_id(
+        &self,
+        call: &ChatToolCall,
+        item_id: &str,
+    ) -> Value {
         let entry = self.entries.get(&call.name);
         let mut item = json!({
-            "id": format!("fc_{}", Uuid::new_v4().simple()),
+            "id": item_id,
             "type": "function_call",
             "status": "completed",
             "call_id": call.id,
