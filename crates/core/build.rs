@@ -21,7 +21,7 @@ fn main() {
         panic!(
             "CodeSeeX model catalog seed was not found. \
 Set CODESEEX_MODEL_CATALOG_SEED or place model-catalog.seed.json under .private. \
-GitHub release builds restore this file from the CODESEEX_MODEL_CATALOG_SEED_JSON secret."
+GitHub release builds restore this file from the CODESEEX_MODEL_CATALOG_SEED_GZIP_BASE64 secret."
         );
     }
 

@@ -23,14 +23,24 @@ jobs:
       - name: Restore model catalog seed
         shell: bash
         env:
-          CODESEEX_MODEL_CATALOG_SEED_JSON: ${{ secrets.CODESEEX_MODEL_CATALOG_SEED_JSON }}
+          CODESEEX_MODEL_CATALOG_SEED_GZIP_BASE64: ${{ secrets.CODESEEX_MODEL_CATALOG_SEED_GZIP_BASE64 }}
         run: |
-          if [ -z "$CODESEEX_MODEL_CATALOG_SEED_JSON" ]; then
-            echo "Missing CODESEEX_MODEL_CATALOG_SEED_JSON secret."
+          if [ -z "$CODESEEX_MODEL_CATALOG_SEED_GZIP_BASE64" ]; then
+            echo "Missing CODESEEX_MODEL_CATALOG_SEED_GZIP_BASE64 secret."
             exit 1
           fi
-          mkdir -p .private
-          printf '%s\n' "$CODESEEX_MODEL_CATALOG_SEED_JSON" > .private/model-catalog.seed.json
+          python - <<'PY'
+          import base64
+          import gzip
+          import os
+          from pathlib import Path
+
+          payload = os.environ["CODESEEX_MODEL_CATALOG_SEED_GZIP_BASE64"]
+          Path(".private").mkdir(exist_ok=True)
+          Path(".private/model-catalog.seed.json").write_bytes(
+              gzip.decompress(base64.b64decode(payload))
+          )
+          PY
 
       - name: Install Linux desktop dependencies
         run: |
@@ -93,14 +103,24 @@ jobs:
       - name: Restore model catalog seed
         shell: bash
         env:
-          CODESEEX_MODEL_CATALOG_SEED_JSON: ${{ secrets.CODESEEX_MODEL_CATALOG_SEED_JSON }}
+          CODESEEX_MODEL_CATALOG_SEED_GZIP_BASE64: ${{ secrets.CODESEEX_MODEL_CATALOG_SEED_GZIP_BASE64 }}
         run: |
-          if [ -z "$CODESEEX_MODEL_CATALOG_SEED_JSON" ]; then
-            echo "Missing CODESEEX_MODEL_CATALOG_SEED_JSON secret."
+          if [ -z "$CODESEEX_MODEL_CATALOG_SEED_GZIP_BASE64" ]; then
+            echo "Missing CODESEEX_MODEL_CATALOG_SEED_GZIP_BASE64 secret."
             exit 1
           fi
-          mkdir -p .private
-          printf '%s\n' "$CODESEEX_MODEL_CATALOG_SEED_JSON" > .private/model-catalog.seed.json
+          python - <<'PY'
+          import base64
+          import gzip
+          import os
+          from pathlib import Path
+
+          payload = os.environ["CODESEEX_MODEL_CATALOG_SEED_GZIP_BASE64"]
+          Path(".private").mkdir(exist_ok=True)
+          Path(".private/model-catalog.seed.json").write_bytes(
+              gzip.decompress(base64.b64decode(payload))
+          )
+          PY
 
       - name: Install Linux desktop dependencies
         if: runner.os == 'Linux'
