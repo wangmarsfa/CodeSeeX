@@ -18,7 +18,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - name: Check out source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Restore model catalog seed
         shell: bash
@@ -98,7 +98,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - name: Check out source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Restore model catalog seed
         shell: bash
@@ -155,7 +155,7 @@ jobs:
         run: cargo tauri build --ci --no-sign --features tauri/custom-protocol ${{ matrix.bundle_args }}
 
       - name: Upload ${{ matrix.label }} artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.artifact_name }}
           if-no-files-found: error
@@ -172,10 +172,10 @@ jobs:
       contents: write
     steps:
       - name: Check out source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Download desktop artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: release-assets
 
