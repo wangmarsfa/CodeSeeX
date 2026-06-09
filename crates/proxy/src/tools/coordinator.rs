@@ -4,7 +4,7 @@ use crate::tools::chat_protocol::{
 };
 use crate::tools::diagnostics::{attach_tool_loop_warning, ToolLoopDiagnostics};
 use crate::tools::hosted::{
-    execute_code_tool, is_code_tool_executable, summarize_tool_result,
+    execute_code_tools_concurrently, is_code_tool_executable, summarize_tool_result,
     summarize_tool_result_for_log, tool_fact_line,
 };
 use crate::tools::ownership::{
@@ -133,13 +133,9 @@ pub(crate) async fn complete_chat_with_tools(
                 .ok_or_else(|| "tool call response did not include an assistant message".to_owned())
                 .map(normalize_assistant_tool_message)?
         };
-        context
-            .store
-            .append_request_turn_messages(context.request_id, &[stored_assistant])
-            .await
-            .map_err(|error| format!("failed to persist assistant tool turn message: {error}"))?;
         messages.push(assistant_message);
-        for call in proxy_executed_calls {
+        let message_snapshot = messages.clone();
+        for call in &proxy_executed_calls {
             let _ = context
                 .store
                 .record_event(
@@ -154,16 +150,21 @@ pub(crate) async fn complete_chat_with_tools(
                     })),
                 )
                 .await;
-            let mut result = execute_code_tool(
-                context.client,
-                context.config,
-                context.tool_context,
-                messages,
-                context.current_image_refs,
-                context.community_tools,
-                &call,
-            )
-            .await;
+        }
+        let executed_tools = execute_code_tools_concurrently(
+            context.client,
+            context.config,
+            context.tool_context,
+            &message_snapshot,
+            context.current_image_refs,
+            context.community_tools,
+            &proxy_executed_calls,
+        )
+        .await;
+        let mut tool_messages = Vec::new();
+        for executed in executed_tools {
+            let call = executed.call;
+            let mut result = executed.result;
             if let Some(warning) = loop_diagnostics.repeated_call_warning(&call) {
                 attach_tool_loop_warning(&mut result, &warning);
                 let _ = context
@@ -216,16 +217,16 @@ pub(crate) async fn complete_chat_with_tools(
                 "tool_call_id": call.id,
                 "content": result_text
             });
-            context
-                .store
-                .append_request_turn_messages(
-                    context.request_id,
-                    std::slice::from_ref(&tool_message),
-                )
-                .await
-                .map_err(|error| format!("failed to persist tool result turn message: {error}"))?;
+            tool_messages.push(tool_message.clone());
             messages.push(tool_message);
         }
+        let mut stored_messages = vec![stored_assistant];
+        stored_messages.extend(tool_messages);
+        context
+            .store
+            .append_request_turn_messages(context.request_id, &stored_messages)
+            .await
+            .map_err(|error| format!("failed to persist tool turn messages: {error}"))?;
         if has_client_tools {
             return Ok(ToolLoopResult::ClientToolCalls(ToolLoopResponse {
                 chat,

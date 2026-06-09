@@ -34,7 +34,7 @@ use crate::tools::chat_protocol::chat_tool_calls_to_assistant_message;
 use crate::tools::coordinator::{complete_chat_with_tools, ToolLoopContext, ToolLoopResult};
 use crate::tools::diagnostics::{attach_tool_loop_warning, ToolLoopDiagnostics};
 use crate::tools::hosted::{
-    execute_code_tool, is_code_tool_executable, summarize_tool_result,
+    execute_code_tools_concurrently, is_code_tool_executable, summarize_tool_result,
     summarize_tool_result_for_log, tool_fact_line,
 };
 use crate::tools::ownership::ChatToolCall;
@@ -48,14 +48,17 @@ use crate::tools::response_items::{
     native_apply_patch_response_item_from_chat_call, proxy_visible_response_items,
     web_search_call_output_response_item,
 };
-use crate::upstream::payload::normalize_chat_payload;
+use crate::upstream::payload::{
+    normalize_chat_payload, request_is_lightweight_auxiliary, request_shape_diagnostic,
+    resolve_upstream_model,
+};
 use axum::body::{Body, Bytes};
-use axum::extract::State;
+use axum::extract::{DefaultBodyLimit, Path, State};
 use axum::http::{header, HeaderMap, Response, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use codeseex_core::context::{redact_inline_data_urls, request_looks_like_codex_full_context};
+use codeseex_core::context::redact_inline_data_urls;
 use codeseex_core::models::available_models;
 use codeseex_core::protocol::ChatMessage;
 use codeseex_core::{AppConfig, UserConfig};
@@ -66,11 +69,15 @@ use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use tokio::net::TcpListener;
+use tokio::sync::Notify;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 use uuid::Uuid;
+
+const RESPONSES_BODY_LIMIT_BYTES: usize = 64 * 1024 * 1024;
 
 pub async fn serve(config: AppConfig) -> anyhow::Result<()> {
     serve_with_shutdown(config, std::future::pending::<()>(), || {}).await
@@ -137,7 +144,9 @@ where
         .route("/v1/models", get(models))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/responses/compact", post(responses_compact))
+        .route("/v1/responses/{response_id}/cancel", post(cancel_response))
         .route("/v1/responses", post(responses))
+        .layer(DefaultBodyLimit::max(RESPONSES_BODY_LIMIT_BYTES))
         .layer(
             CorsLayer::new()
                 .allow_origin(Any)
@@ -332,11 +341,20 @@ async fn chat_completions(
             Some(&json!({
                 "id": id,
                 "endpoint": "/v1/chat/completions",
-                "requested_model": requested_model,
-                "model": model
+                "requested_model": requested_model.as_deref(),
+                "model": model.as_deref()
             })),
         )
         .await;
+    record_request_shape_diagnostic(
+        &state.store,
+        &id,
+        "/v1/chat/completions",
+        requested_model.as_deref(),
+        model.as_deref().unwrap_or_default(),
+        &original_payload,
+    )
+    .await;
 
     let auth = headers
         .get(header::AUTHORIZATION)
@@ -415,6 +433,8 @@ async fn chat_completions(
                                 Some(&json!({
                                     "id": id,
                                     "status": status.as_u16(),
+                                    "requested_model": requested_model.as_deref(),
+                                    "model": model.as_deref(),
                                     "upstream_error": if status.is_success() { Value::Null } else { upstream_error }
                                 })),
                             )
@@ -433,7 +453,12 @@ async fn chat_completions(
                                 "error",
                                 "request_failed",
                                 "Failed to read upstream response body.",
-                                Some(&json!({ "id": id, "error": error.to_string() })),
+                                Some(&json!({
+                                    "id": id,
+                                    "requested_model": requested_model.as_deref(),
+                                    "model": model.as_deref(),
+                                    "error": error.to_string()
+                                })),
                             )
                             .await;
                         json_error(
@@ -457,7 +482,12 @@ async fn chat_completions(
                     "error",
                     "request_failed",
                     "Failed to connect to upstream.",
-                    Some(&json!({ "id": id, "error": error.to_string() })),
+                    Some(&json!({
+                        "id": id,
+                        "requested_model": requested_model.as_deref(),
+                        "model": model.as_deref(),
+                        "error": error.to_string()
+                    })),
                 )
                 .await;
             json_error(
@@ -481,11 +511,10 @@ async fn responses_compact(
     if let Err(response) = ensure_new_response_id(&state, &id, previous).await {
         return response;
     }
-    let resolved_previous =
-        match resolve_previous_response_id(&state, &id, &model, previous, &input).await {
-            Ok(previous) => previous,
-            Err(response) => return response,
-        };
+    let resolved_previous = match resolve_previous_response_id(&state, previous).await {
+        Ok(previous) => previous,
+        Err(response) => return response,
+    };
     let previous_for_context = resolved_previous.as_deref();
 
     if let Err(error) = state
@@ -630,6 +659,34 @@ async fn responses_compact(
     json_response(response)
 }
 
+async fn cancel_response(
+    Path(response_id): Path<String>,
+    State(state): State<ProxyState>,
+) -> axum::response::Response {
+    let active = cancel_streaming_response(&response_id);
+    let interrupted = state
+        .store
+        .interrupt_request_if_in_progress(&response_id, "response cancelled by client")
+        .await
+        .unwrap_or(false);
+    if active || interrupted {
+        let _ = state
+            .store
+            .record_event(
+                "info",
+                "request_interrupted",
+                "Streaming response cancelled.",
+                Some(&json!({ "id": response_id })),
+            )
+            .await;
+    }
+    json_response(json!({
+        "id": response_id,
+        "object": "response",
+        "status": "cancelled"
+    }))
+}
+
 async fn responses(
     State(state): State<ProxyState>,
     headers: HeaderMap,
@@ -638,15 +695,18 @@ async fn responses(
     let id = response_id_from_input(&input);
     let previous = input.get("previous_response_id").and_then(Value::as_str);
     let config = state.active_config();
+    let requested_model = input
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
     let model = response_model_from_input(&config, &input);
     if let Err(response) = ensure_new_response_id(&state, &id, previous).await {
         return response;
     }
-    let resolved_previous =
-        match resolve_previous_response_id(&state, &id, &model, previous, &input).await {
-            Ok(previous) => previous,
-            Err(response) => return response,
-        };
+    let resolved_previous = match resolve_previous_response_id(&state, previous).await {
+        Ok(previous) => previous,
+        Err(response) => return response,
+    };
     let previous_for_context = resolved_previous.as_deref();
     if let Err(error) = state
         .store
@@ -696,7 +756,12 @@ async fn responses(
         "stream": stream_requested
     });
     normalize_chat_payload(&config, &input, &mut payload);
-    let enabled_tools = enabled_tool_ids(&config);
+    let suppress_proxy_tools = request_is_lightweight_auxiliary(&input);
+    let enabled_tools = if suppress_proxy_tools {
+        Vec::new()
+    } else {
+        enabled_tool_ids(&config)
+    };
     let tool_settings = tool_settings(&config);
     let community_tools = crate::community_tools::CommunityToolSet::load(
         &config.data_dir,
@@ -705,12 +770,18 @@ async fn responses(
     );
     let mut external_tool_context =
         crate::tool_passthrough::ToolContext::from_request_tools(input.get("tools"));
-    if request_has_codex_native_tool_surface(&external_tool_context) {
+    if !suppress_proxy_tools && request_has_codex_native_tool_surface(&external_tool_context) {
         external_tool_context.ensure_codex_tool_search_bridge();
     }
-    let mut tools = crate::tools::upstream_tool_definitions(&enabled_tools);
-    tools.extend(community_tools.definitions());
-    tools.extend(external_tool_context.upstream_tools.clone());
+    let mut tools = if suppress_proxy_tools {
+        Vec::new()
+    } else {
+        crate::tools::upstream_tool_definitions(&enabled_tools)
+    };
+    if !suppress_proxy_tools {
+        tools.extend(community_tools.definitions());
+        tools.extend(external_tool_context.upstream_tools.clone());
+    }
     let tools = dedupe_tool_definitions(tools);
     let _ = state
         .store
@@ -775,11 +846,20 @@ async fn responses(
                 "resolved_previous_response_id": previous_for_context,
                 "history_messages": history_message_count,
                 "context": context_diagnostic,
-                "requested_model": model,
-                "model": upstream_model
+                "requested_model": requested_model.as_deref(),
+                "model": upstream_model.as_str()
             })),
         )
         .await;
+    record_request_shape_diagnostic(
+        &state.store,
+        &id,
+        "/v1/responses",
+        requested_model.as_deref(),
+        upstream_model.as_str(),
+        &input,
+    )
+    .await;
 
     let auth = headers
         .get(header::AUTHORIZATION)
@@ -816,6 +896,8 @@ async fn responses(
                                 Some(&json!({
                                     "id": id,
                                     "status": status.as_u16(),
+                                    "requested_model": requested_model.as_deref(),
+                                    "model": upstream_model.as_str(),
                                     "upstream_error": upstream_error
                                 })),
                             )
@@ -834,7 +916,12 @@ async fn responses(
                                 "error",
                                 "request_failed",
                                 "Failed to read upstream response body.",
-                                Some(&json!({ "id": id, "error": error.to_string() })),
+                                Some(&json!({
+                                    "id": id,
+                                    "requested_model": requested_model.as_deref(),
+                                    "model": upstream_model.as_str(),
+                                    "error": error.to_string()
+                                })),
                             )
                             .await;
                         json_error(
@@ -901,6 +988,7 @@ async fn responses(
                                 );
                             }
                         };
+                    let mut client_tool_handoff = false;
                     let mut mapped = match tool_loop_result {
                         ToolLoopResult::FinalChat(result) => {
                             if let Some(message) = final_chat_turn_message(&result.chat) {
@@ -927,6 +1015,7 @@ async fn responses(
                             response
                         }
                         ToolLoopResult::ClientToolCalls(result) => {
+                            client_tool_handoff = true;
                             let mut response = chat_completion_tool_calls_to_response(
                                 &config,
                                 &id,
@@ -951,9 +1040,16 @@ async fn responses(
                             )
                             .await;
                     }
+                    let completion_diagnostic = client_tool_handoff
+                        .then(|| json!({ "codeseex_lifecycle": "client_tool_handoff" }));
                     if let Err(error) = state
                         .store
-                        .finish_request(&id, RequestStatus::Completed, Some(&mapped), None)
+                        .finish_request(
+                            &id,
+                            RequestStatus::Completed,
+                            Some(&mapped),
+                            completion_diagnostic.as_ref(),
+                        )
                         .await
                     {
                         return json_error(
@@ -962,15 +1058,17 @@ async fn responses(
                             error.to_string(),
                         );
                     }
-                    let _ = state
-                        .store
-                        .record_event(
-                            "info",
-                            "request_completed",
-                            "Responses request completed.",
-                            Some(&json!({ "id": id })),
-                        )
-                        .await;
+                    if !client_tool_handoff {
+                        let _ = state
+                            .store
+                            .record_event(
+                                "info",
+                                "request_completed",
+                                "Responses request completed.",
+                                Some(&json!({ "id": id })),
+                            )
+                            .await;
+                    }
                     json_response(mapped)
                 }
                 Err(error) => {
@@ -1008,7 +1106,12 @@ async fn responses(
                     "error",
                     "request_failed",
                     "Failed to connect to upstream.",
-                    Some(&json!({ "id": id, "error": error.to_string() })),
+                    Some(&json!({
+                        "id": id,
+                        "requested_model": requested_model.as_deref(),
+                        "model": upstream_model.as_str(),
+                        "error": error.to_string()
+                    })),
                 )
                 .await;
             json_error(
@@ -1090,118 +1193,14 @@ async fn ensure_new_response_id(
 
 async fn resolve_previous_response_id(
     state: &ProxyState,
-    request_id: &str,
-    model: &str,
     previous: Option<&str>,
-    input: &Value,
 ) -> Result<Option<String>, Response<Body>> {
     let Some(previous) = previous.filter(|value| !value.trim().is_empty()) else {
         return Ok(None);
     };
     match state.store.response_status(previous).await {
         Ok(Some(RequestStatus::Completed)) => Ok(Some(previous.to_owned())),
-        Ok(Some(status)) if request_looks_like_codex_full_context(input) => {
-            let _ = state
-                .store
-                .record_event(
-                    "warn",
-                    "previous_response_not_completed_full_context_used",
-                    "previous_response_id was not completed; CodeSeeX used the full context sent by Codex instead.",
-                    Some(&json!({
-                        "id": request_id,
-                        "previous_response_id": previous,
-                        "previous_status": status,
-                        "input_items": input
-                            .get("input")
-                            .and_then(Value::as_array)
-                            .map(Vec::len)
-                            .unwrap_or(0)
-                    })),
-                )
-                .await;
-            Ok(None)
-        }
-        Ok(Some(status)) => {
-            let detail = json!({
-                "id": request_id,
-                "previous_response_id": previous,
-                "previous_status": status,
-                "error": "previous_response_id is not completed in this CodeSeeX process; send full context instead"
-            });
-            let _ = state
-                .store
-                .checkpoint_request(request_id, Some(previous), Some(model), input)
-                .await;
-            let _ = state
-                .store
-                .finish_request(request_id, RequestStatus::Failed, None, Some(&detail))
-                .await;
-            let _ = state
-                .store
-                .record_event(
-                    "error",
-                    "previous_response_not_completed",
-                    "previous_response_id is not completed in this CodeSeeX process.",
-                    Some(&detail),
-                )
-                .await;
-            Err(json_error(
-                StatusCode::CONFLICT,
-                "previous_response_not_completed",
-                "previous_response_id is not completed in this CodeSeeX process; send full context instead"
-                    .to_owned(),
-            ))
-        }
-        Ok(None) if request_looks_like_codex_full_context(input) => {
-            let _ = state
-                .store
-                .record_event(
-                    "warn",
-                    "previous_response_unavailable_full_context_used",
-                    "previous_response_id was unavailable; CodeSeeX used the full context sent by Codex instead.",
-                    Some(&json!({
-                        "id": request_id,
-                        "previous_response_id": previous,
-                        "input_items": input
-                            .get("input")
-                            .and_then(Value::as_array)
-                            .map(Vec::len)
-                            .unwrap_or(0)
-                    })),
-                )
-                .await;
-            Ok(None)
-        }
-        Ok(None) => {
-            let detail = json!({
-                "id": request_id,
-                "previous_response_id": previous,
-                "error": "previous_response_id is not available in this CodeSeeX process; send full context instead"
-            });
-            let _ = state
-                .store
-                .checkpoint_request(request_id, Some(previous), Some(model), input)
-                .await;
-            let _ = state
-                .store
-                .finish_request(request_id, RequestStatus::Failed, None, Some(&detail))
-                .await;
-            let _ = state
-                .store
-                .record_event(
-                    "error",
-                    "previous_response_unavailable",
-                    "previous_response_id is not available in this CodeSeeX process.",
-                    Some(&detail),
-                )
-                .await;
-            Err(json_error(
-                StatusCode::CONFLICT,
-                "previous_response_unavailable",
-                "previous_response_id is not available in this CodeSeeX process; send full context instead"
-                    .to_owned(),
-            ))
-        }
+        Ok(Some(_)) | Ok(None) => Ok(None),
         Err(error) => Err(json_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "state_previous_response_check_failed",
@@ -1210,12 +1209,39 @@ async fn resolve_previous_response_id(
     }
 }
 
+async fn record_request_shape_diagnostic(
+    store: &Store,
+    id: &str,
+    endpoint: &str,
+    requested_model: Option<&str>,
+    model: &str,
+    request: &Value,
+) {
+    let mut detail = request_shape_diagnostic(request);
+    if let Some(object) = detail.as_object_mut() {
+        object.insert("id".to_owned(), json!(id));
+        object.insert("endpoint".to_owned(), json!(endpoint));
+        if let Some(requested_model) = requested_model {
+            object.insert("requested_model".to_owned(), json!(requested_model));
+        }
+        object.insert("model".to_owned(), json!(model));
+    }
+    let _ = store
+        .record_event(
+            "debug",
+            "request_shape_diagnostic",
+            "CodeSeeX request shape diagnostic.",
+            Some(&detail),
+        )
+        .await;
+}
+
 fn response_model_from_input(config: &AppConfig, input: &Value) -> String {
     let requested = input
         .get("model")
         .and_then(Value::as_str)
         .unwrap_or_default();
-    config.model_override.upstream_slug(requested)
+    resolve_upstream_model(config, input, requested)
 }
 
 fn build_automatic_compaction(
@@ -1411,13 +1437,84 @@ struct StreamingResponseParams {
     auto_compaction: Option<Value>,
 }
 
+type StreamingCancellationMap = BTreeMap<String, StreamingCancellation>;
+
+static STREAMING_CANCELLATIONS: OnceLock<Mutex<StreamingCancellationMap>> = OnceLock::new();
+
+#[derive(Clone)]
+struct StreamingCancellation {
+    cancelled: Arc<AtomicBool>,
+    notify: Arc<Notify>,
+}
+
+impl StreamingCancellation {
+    fn new() -> Self {
+        Self {
+            cancelled: Arc::new(AtomicBool::new(false)),
+            notify: Arc::new(Notify::new()),
+        }
+    }
+
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::SeqCst);
+        self.notify.notify_waiters();
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::SeqCst)
+    }
+
+    async fn cancelled(&self) {
+        if self.is_cancelled() {
+            return;
+        }
+        self.notify.notified().await;
+    }
+}
+
+fn streaming_cancellations() -> &'static Mutex<StreamingCancellationMap> {
+    STREAMING_CANCELLATIONS.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn register_streaming_response(response_id: &str) -> StreamingCancellation {
+    let cancelled = StreamingCancellation::new();
+    if let Ok(mut active) = streaming_cancellations().lock() {
+        active.insert(response_id.to_owned(), cancelled.clone());
+    }
+    cancelled
+}
+
+fn unregister_streaming_response(response_id: &str) {
+    if let Ok(mut active) = streaming_cancellations().lock() {
+        active.remove(response_id);
+    }
+}
+
+fn cancel_streaming_response(response_id: &str) -> bool {
+    let Ok(active) = streaming_cancellations().lock() else {
+        return false;
+    };
+    let Some(cancelled) = active.get(response_id) else {
+        return false;
+    };
+    cancelled.cancel();
+    true
+}
+
+fn streaming_response_cancelled(cancelled: &StreamingCancellation) -> bool {
+    cancelled.is_cancelled()
+}
+
 struct StreamingRequestGuard {
     store: codeseex_store::Store,
     response_id: String,
+    cancelled: StreamingCancellation,
 }
 
 impl Drop for StreamingRequestGuard {
     fn drop(&mut self) {
+        self.cancelled.cancel();
+        unregister_streaming_response(&self.response_id);
         let store = self.store.clone();
         let response_id = self.response_id.clone();
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
@@ -1449,21 +1546,35 @@ fn response_stream_from_chat(params: StreamingResponseParams) -> axum::response:
         current_image_refs,
         auto_compaction,
     } = params;
+    let cancelled = register_streaming_response(&response_id);
     let guard = StreamingRequestGuard {
         store: state.store.clone(),
         response_id: response_id.clone(),
+        cancelled: cancelled.clone(),
     };
     let stream: BoxStream<'static, Result<Bytes, std::io::Error>> = Box::pin(
         async_stream::try_stream! {
             let _stream_guard = guard;
             io_result(())?;
+            macro_rules! stop_if_cancelled {
+                ($reason:expr) => {{
+                    if streaming_response_cancelled(&cancelled) {
+                        let _ = state
+                            .store
+                            .interrupt_request_if_in_progress(&response_id, $reason)
+                            .await;
+                        yield Bytes::from_static(b"data: [DONE]\n\n");
+                        return;
+                    }
+                }};
+            }
             let created_at = now_seconds();
             let mut sequence = 0_u64;
             let mut output_index = 0_u64;
             let mut output = Vec::new();
             let mut usage = response_usage_from_chat_usage(None);
             let mut next_response = Some(response);
-
+            stop_if_cancelled!("response cancelled before streaming started");
             yield sse_bytes("response.created", json!({
                 "type": "response.created",
                 "response": {
@@ -1492,6 +1603,7 @@ fn response_stream_from_chat(params: StreamingResponseParams) -> axum::response:
             let mut tool_loop_diagnostics = ToolLoopDiagnostics::default();
             let mut thinking_title_emitted = false;
             while let Some(response) = next_response.take() {
+                stop_if_cancelled!("response cancelled before streaming iteration");
                 let iteration = completed_tool_iterations;
                 let turn_item_id = format!("msg_{}", Uuid::new_v4().simple());
                 let mut turn_output_index = None;
@@ -1582,7 +1694,15 @@ fn response_stream_from_chat(params: StreamingResponseParams) -> axum::response:
                     }};
                 }
 
-                while let Some(chunk) = upstream.next().await {
+                loop {
+                    let next_chunk = tokio::select! {
+                        chunk = upstream.next() => chunk,
+                        _ = cancelled.cancelled() => None,
+                    };
+                    stop_if_cancelled!("response cancelled while reading upstream stream");
+                    let Some(chunk) = next_chunk else {
+                        break;
+                    };
                     let bytes = match chunk {
                         Ok(bytes) => bytes,
                         Err(error) => {
@@ -1727,8 +1847,8 @@ fn response_stream_from_chat(params: StreamingResponseParams) -> axum::response:
                                         "output_index": current_output_index,
                                         "content_index": 0,
                                         "part": { "type": "output_text", "text": "", "annotations": [] },
-                                        "sequence_number": next_sequence(&mut sequence)
-                                    }));
+                                    "sequence_number": next_sequence(&mut sequence)
+                                }));
                                 }
                                 turn_text.push_str(content);
                                 let current_output_index = turn_output_index.unwrap_or_default();
@@ -1768,6 +1888,7 @@ fn response_stream_from_chat(params: StreamingResponseParams) -> axum::response:
                     }
                 }
 
+                stop_if_cancelled!("response cancelled after upstream stream");
                 let tool_calls = streaming_tool_calls(tool_states);
                 let message_phase = if tool_calls.is_empty() {
                     "final_answer"
@@ -1776,11 +1897,11 @@ fn response_stream_from_chat(params: StreamingResponseParams) -> axum::response:
                 };
 
                 close_reasoning_if_needed!();
-
                 close_content_if_needed!(message_phase);
                 let _ = (reasoning_closed, thinking_closed, turn_output_closed);
 
                 if tool_calls.is_empty() {
+                    stop_if_cancelled!("response cancelled before final response persistence");
                     if !turn_text.trim().is_empty()
                         && !text_is_thinking_display_markdown(&turn_text)
                     {
@@ -1878,8 +1999,9 @@ fn response_stream_from_chat(params: StreamingResponseParams) -> axum::response:
                                 "Context compacted automatically.",
                                 Some(&json!({ "id": response_id })),
                             )
-                            .await;
+                        .await;
                     }
+                    stop_if_cancelled!("response cancelled before final response completion");
                     let final_response = json!({
                         "id": response_id,
                         "object": "response",
@@ -1912,6 +2034,7 @@ fn response_stream_from_chat(params: StreamingResponseParams) -> axum::response:
                 }
 
                 let all_tool_calls = tool_calls.clone();
+                stop_if_cancelled!("response cancelled before tool partition");
                 let partition = partition_tool_calls(
                     tool_calls,
                     &community_tools,
@@ -1964,6 +2087,7 @@ fn response_stream_from_chat(params: StreamingResponseParams) -> axum::response:
                 }
                 let has_client_tools = partition.has_client_executed_calls();
                 if has_client_tools && !partition.has_proxy_executed_calls() {
+                    stop_if_cancelled!("response cancelled before client tool handoff");
                     let stored_assistant = chat_tool_calls_to_assistant_message(
                         &all_tool_calls,
                         &turn_text,
@@ -2003,6 +2127,7 @@ fn response_stream_from_chat(params: StreamingResponseParams) -> axum::response:
                         yield bytes;
                         output.push(item);
                     }
+                    stop_if_cancelled!("response cancelled before client tool handoff completion");
                     let final_response = json!({
                         "id": response_id,
                         "object": "response",
@@ -2015,16 +2140,8 @@ fn response_stream_from_chat(params: StreamingResponseParams) -> axum::response:
                         "output": output,
                         "usage": usage
                     });
-                    let _ = state.store.finish_request(&response_id, RequestStatus::Completed, Some(&final_response), None).await;
-                    let _ = state
-                        .store
-                        .record_event(
-                            "info",
-                            "request_completed",
-                            "Streaming response completed with native external tool call.",
-                            Some(&json!({ "id": response_id })),
-                        )
-                        .await;
+                    let diagnostic = json!({ "codeseex_lifecycle": "client_tool_handoff" });
+                    let _ = state.store.finish_request(&response_id, RequestStatus::Completed, Some(&final_response), Some(&diagnostic)).await;
                     yield sse_bytes("response.completed", json!({
                         "type": "response.completed",
                         "response": final_response,
@@ -2034,6 +2151,7 @@ fn response_stream_from_chat(params: StreamingResponseParams) -> axum::response:
                     return;
                 }
                 if has_client_tools {
+                    stop_if_cancelled!("response cancelled before mixed tool split");
                     let _ = state
                         .store
                         .record_event(
@@ -2052,6 +2170,7 @@ fn response_stream_from_chat(params: StreamingResponseParams) -> axum::response:
                         .await;
                 }
 
+                stop_if_cancelled!("response cancelled before proxy tool display");
                 for item in proxy_visible_response_items(&proxy_executed_calls) {
                     let current_output_index = output_index;
                     output_index += 1;
@@ -2097,17 +2216,6 @@ fn response_stream_from_chat(params: StreamingResponseParams) -> axum::response:
                     &turn_text,
                     &turn_reasoning,
                 );
-                if let Err(error) = state
-                    .store
-                    .append_request_turn_messages(&response_id, &[stored_assistant])
-                    .await
-                {
-                    let detail = json!({ "error": error.to_string() });
-                    let _ = state.store.finish_request(&response_id, RequestStatus::Failed, None, Some(&detail)).await;
-                    yield stream_failed_event(&response_id, &model, created_at, &mut sequence, "state_turn_messages_failed", &detail["error"].to_string());
-                    yield Bytes::from_static(b"data: [DONE]\n\n");
-                    return;
-                }
                 if let Some(messages) = payload.get_mut("messages").and_then(Value::as_array_mut) {
                     messages.push(chat_tool_calls_to_assistant_message(
                         &proxy_executed_calls,
@@ -2121,8 +2229,13 @@ fn response_stream_from_chat(params: StreamingResponseParams) -> axum::response:
                     yield Bytes::from_static(b"data: [DONE]\n\n");
                     return;
                 }
-
+                let message_snapshot = payload
+                    .get("messages")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
                 for call in &proxy_executed_calls {
+                    stop_if_cancelled!("response cancelled before proxy tool execution");
                     let _ = state
                         .store
                         .record_event(
@@ -2137,22 +2250,29 @@ fn response_stream_from_chat(params: StreamingResponseParams) -> axum::response:
                             })),
                         )
                         .await;
-                    let message_snapshot = payload
-                        .get("messages")
-                        .and_then(Value::as_array)
-                        .cloned()
-                        .unwrap_or_default();
-                    let mut result = execute_code_tool(
+                }
+                let executed_tools = tokio::select! {
+                    result = execute_code_tools_concurrently(
                         &state.client,
                         &config,
                         &tool_execution_context,
                         &message_snapshot,
                         &current_image_refs,
                         &community_tools,
-                        call,
-                    )
-                    .await;
-                    if let Some(warning) = tool_loop_diagnostics.repeated_call_warning(call) {
+                        &proxy_executed_calls,
+                    ) => Some(result),
+                    _ = cancelled.cancelled() => None,
+                };
+                stop_if_cancelled!("response cancelled after proxy tool execution");
+                let Some(executed_tools) = executed_tools else {
+                    yield Bytes::from_static(b"data: [DONE]\n\n");
+                    return;
+                };
+                let mut tool_messages = Vec::new();
+                for executed in executed_tools {
+                    let call = executed.call;
+                    let mut result = executed.result;
+                    if let Some(warning) = tool_loop_diagnostics.repeated_call_warning(&call) {
                         attach_tool_loop_warning(&mut result, &warning);
                         let _ = state
                             .store
@@ -2172,7 +2292,7 @@ fn response_stream_from_chat(params: StreamingResponseParams) -> axum::response:
                     }
                     let result_text = serde_json::to_string(&result).unwrap_or_else(|_| "{}".to_owned());
                     let result_text = redact_inline_data_urls(&result_text);
-                    let fact = tool_fact_line(call, &result);
+                    let fact = tool_fact_line(&call, &result);
                     if let Err(error) = state.store.append_request_tool_fact(&response_id, &fact).await {
                         let message = format!("failed to persist tool fact: {error}");
                         let detail = json!({ "error": message });
@@ -2200,7 +2320,7 @@ fn response_stream_from_chat(params: StreamingResponseParams) -> axum::response:
 
                     if is_web_search_tool(&call.name) {
                         let replay_output = summarize_tool_result(&result);
-                        let item = web_search_call_output_response_item(call, &replay_output);
+                        let item = web_search_call_output_response_item(&call, &replay_output);
                         let result_output_index = output_index;
                         output_index += 1;
                         yield generic_output_item_sse_events(
@@ -2211,23 +2331,12 @@ fn response_stream_from_chat(params: StreamingResponseParams) -> axum::response:
                         );
                         output.push(item);
                     }
-
                     let tool_message = json!({
                         "role": "tool",
                         "tool_call_id": call.id,
                         "content": result_text
                     });
-                    if let Err(error) = state
-                        .store
-                        .append_request_turn_messages(&response_id, std::slice::from_ref(&tool_message))
-                        .await
-                    {
-                        let detail = json!({ "error": error.to_string() });
-                        let _ = state.store.finish_request(&response_id, RequestStatus::Failed, None, Some(&detail)).await;
-                        yield stream_failed_event(&response_id, &model, created_at, &mut sequence, "state_turn_messages_failed", &detail["error"].to_string());
-                        yield Bytes::from_static(b"data: [DONE]\n\n");
-                        return;
-                    }
+                    tool_messages.push(tool_message.clone());
                     if let Some(messages) = payload.get_mut("messages").and_then(Value::as_array_mut) {
                         messages.push(tool_message);
                     } else {
@@ -2239,7 +2348,23 @@ fn response_stream_from_chat(params: StreamingResponseParams) -> axum::response:
                     }
                 }
 
+                let mut stored_messages = vec![stored_assistant];
+                stored_messages.extend(tool_messages);
+                if let Err(error) = state
+                    .store
+                    .append_request_turn_messages(&response_id, &stored_messages)
+                    .await
+                {
+                    let detail = json!({ "error": error.to_string() });
+                    let _ = state.store.finish_request(&response_id, RequestStatus::Failed, None, Some(&detail)).await;
+                    yield stream_failed_event(&response_id, &model, created_at, &mut sequence, "state_turn_messages_failed", &detail["error"].to_string());
+                    yield Bytes::from_static(b"data: [DONE]\n\n");
+                    return;
+                }
+                stop_if_cancelled!("response cancelled after tool turn message persistence");
+
                 if has_client_tools {
+                    stop_if_cancelled!("response cancelled before native/external handoff");
                     for call in &partition.native {
                         let (bytes, item) = native_apply_patch_client_tool_sse_events(
                             &response_id,
@@ -2263,6 +2388,7 @@ fn response_stream_from_chat(params: StreamingResponseParams) -> axum::response:
                         yield bytes;
                         output.push(item);
                     }
+                    stop_if_cancelled!("response cancelled before native/external handoff completion");
                     let final_response = json!({
                         "id": response_id,
                         "object": "response",
@@ -2275,16 +2401,8 @@ fn response_stream_from_chat(params: StreamingResponseParams) -> axum::response:
                         "output": output,
                         "usage": usage
                     });
-                    let _ = state.store.finish_request(&response_id, RequestStatus::Completed, Some(&final_response), None).await;
-                    let _ = state
-                        .store
-                        .record_event(
-                            "info",
-                            "request_completed",
-                            "Streaming response completed after CodeSeeX and native/external tool split.",
-                            Some(&json!({ "id": response_id })),
-                        )
-                        .await;
+                    let diagnostic = json!({ "codeseex_lifecycle": "client_tool_handoff" });
+                    let _ = state.store.finish_request(&response_id, RequestStatus::Completed, Some(&final_response), Some(&diagnostic)).await;
                     yield sse_bytes("response.completed", json!({
                         "type": "response.completed",
                         "response": final_response,
@@ -2295,14 +2413,22 @@ fn response_stream_from_chat(params: StreamingResponseParams) -> axum::response:
                 }
 
                 completed_tool_iterations += 1;
-                match crate::upstream::post_chat_completions(
-                    &state.client,
-                    &config.upstream,
-                    auth.as_deref(),
-                    payload.clone(),
-                )
-                .await
-                {
+                stop_if_cancelled!("response cancelled before upstream continuation");
+                let next_chat = tokio::select! {
+                    result = crate::upstream::post_chat_completions(
+                        &state.client,
+                        &config.upstream,
+                        auth.as_deref(),
+                        payload.clone(),
+                    ) => Some(result),
+                    _ = cancelled.cancelled() => None,
+                };
+                stop_if_cancelled!("response cancelled during upstream continuation");
+                let Some(next_chat) = next_chat else {
+                    yield Bytes::from_static(b"data: [DONE]\n\n");
+                    return;
+                };
+                match next_chat {
                     Ok(next) if next.status().is_success() => {
                         next_response = Some(next);
                     }

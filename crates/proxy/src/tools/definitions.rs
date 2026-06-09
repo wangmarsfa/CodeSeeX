@@ -198,7 +198,7 @@ fn codeseex_configurable_hosted_tool_definition(id: &str) -> Option<Value> {
             "type": "function",
             "function": {
                 "name": "vision_analyze",
-                "description": "Use the configured Vision module endpoint to inspect one or more images. Pass the user's image reference directly in image/images when needed: HTTP(S) URL, data:image URL, file:// URL, workspace path, or local absolute path when full file access is active. If the current user message already contains an input_image, the tool can use it without extra file work. Do not convert local files to base64, copy files into the workspace, or use shell as an image transport. The tool reads local files, checks permissions, sends the image to the configured Vision endpoint, and returns prompt_sent plus the visual model text exactly as extracted.",
+                "description": "Use the configured Vision module endpoint to inspect one or more images. Pass the user's image reference directly in image/images when needed: HTTP(S) URL, data:image URL, file:// URL, workspace path, or local absolute path when full file access is active. If the current user message already contains an input_image, the tool can use it without extra file work. Do not convert local files to base64, copy files into the workspace, or use shell as an image transport. The tool reads local files, checks permissions, sends the image to the configured Vision endpoint, and returns prompt_sent plus text. The text field is the visual model's extracted answer; when the user directly asks about the image, answer from that text without inventing details or summarizing away specifics.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -214,7 +214,7 @@ fn codeseex_configurable_hosted_tool_definition(id: &str) -> Option<Value> {
             "type": "function",
             "function": {
                 "name": "image_gen",
-                "description": "Use the configured Vision module endpoint to generate images directly from text. Use this tool for image generation; do not read image files, skill files, or generated images first. If the Vision generation endpoint, generation model, or API key is not configured correctly, this tool returns a structured unavailable error. Returns prompt_sent exactly as sent and image URLs or local file paths; generated base64 is saved to disk and never returned inline.",
+                "description": "Use the configured Vision module endpoint to generate images directly from text. Use this tool for image generation; do not read image files, skill files, or generated images first. If the Vision generation endpoint, generation model, or API key is not configured correctly, this tool returns a structured unavailable error. Returns prompt_sent exactly as sent, image URLs or local file paths, and images_markdown for direct display to the user. Return images_markdown instead of calling view_image for generated files; generated base64 is saved to disk and never returned inline.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -249,7 +249,6 @@ fn enabled_set(enabled_ids: &[String]) -> HashSet<&str> {
 
 fn canonical_tool_id(id: &str) -> &str {
     match id {
-        "visual_search" => "vision_analyze",
         "vision_generate" | "imagegen" | "image_generation" | "generate_image"
         | "image_generate" | "create_image" => "image_gen",
         _ => id,

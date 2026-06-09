@@ -19,8 +19,9 @@ fn main() {
 
     if !seed_path.is_file() {
         panic!(
-            "CodeSeeX model catalog seed is not stored in public source. \
-Set CODESEEX_MODEL_CATALOG_SEED or place model-catalog.seed.json under .private to build release binaries."
+            "CodeSeeX model catalog seed was not found. \
+Set CODESEEX_MODEL_CATALOG_SEED or place model-catalog.seed.json under .private. \
+GitHub release builds restore this file from the CODESEEX_MODEL_CATALOG_SEED_JSON secret."
         );
     }
 

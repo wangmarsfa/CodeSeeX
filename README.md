@@ -11,6 +11,10 @@
 </p>
 
 <p align="center">
+  <img alt="CodeSeeX desktop manager" src="docs/img/1.png" width="860">
+</p>
+
+<p align="center">
   Unofficial and unaffiliated. Use your own credentials and follow the applicable Codex, OpenAI, DeepSeek, and search-provider terms.
 </p>
 
@@ -29,7 +33,7 @@ Codex Desktop  ->  CodeSeeX local API  ->  DeepSeek-compatible upstream
 
 - DeepSeek V4 models for Codex: `deepseek-v4-pro` and `deepseek-v4-flash`.
 - Generated Codex `config.toml` with `model_catalog_json` and local `base_url`.
-- Embedded model catalog seed for first-run machines without a native Codex catalog.
+- Embedded model catalog generated at build time for first-run machines without a native Codex catalog.
 - 1M context metadata with a 95% effective context window for Flash and Pro.
 - Codex-native Apply Patch and MCP boundaries: CodeSeeX passes native client tools back to Codex instead of executing them itself.
 - CodeSeeX-hosted Web Search and read-only workspace tools with bounded execution and local/private target protection.
@@ -41,12 +45,13 @@ Codex Desktop  ->  CodeSeeX local API  ->  DeepSeek-compatible upstream
 
 ## Quick Start
 
-1. Start CodeSeeX.
-2. Open `Settings -> Proxy` and confirm the local service is running on the default port `8787`.
-3. Copy the generated Codex TOML from the CodeSeeX adapter card.
-4. Put that TOML into the Codex configuration you use for DeepSeek.
-5. Restart Codex after changing TOML.
-6. Select `deepseek-v4-pro` or `deepseek-v4-flash` in Codex.
+1. Download the latest build for your platform from [GitHub Releases](https://github.com/TasteSteak/CodeSeeX/releases).
+2. Start CodeSeeX.
+3. Open `Settings -> Proxy` and confirm the local service is running on the default port `8787`.
+4. Copy the generated Codex TOML from the CodeSeeX adapter card.
+5. Put that TOML into the Codex configuration you use for DeepSeek.
+6. Restart Codex after changing TOML.
+7. Select `deepseek-v4-pro` or `deepseek-v4-flash` in Codex.
 
 Prefer the generated TOML because the catalog path and local port are machine-specific.
 
@@ -54,8 +59,6 @@ Prefer the generated TOML because the catalog path and local port are machine-sp
 model_provider = "custom"
 model = "deepseek-v4-pro"
 disable_response_storage = true
-model_context_window = 1000000
-model_auto_compact_token_limit = 950000
 model_reasoning_effort = "xhigh"
 model_catalog_json = "C:\\Users\\you\\.codeseex\\model-catalog.json"
 
@@ -66,9 +69,21 @@ requires_openai_auth = true
 base_url = "http://127.0.0.1:8787/v1"
 ```
 
+To use the faster model, change:
+
+```toml
+model = "deepseek-v4-flash"
+```
+
 ## Install And Update
 
 On Windows, use the NSIS `CodeSeeX_*_setup.exe` installer for normal desktop installs and updates. It supports installer language selection, current-user or all-users install mode, and migration from the earlier Electron build by uninstalling the legacy app before installing the Tauri build.
+
+## Upstream And Models
+
+CodeSeeX exposes `deepseek-v4-pro` and `deepseek-v4-flash` to Codex through its generated catalog. Leave the upstream URL blank to use the default DeepSeek-compatible upstream, or set a custom OpenAI-compatible upstream URL in `Settings -> Proxy`.
+
+The local Codex endpoint remains under `http://127.0.0.1:8787/v1` by default. If you change the listen port, copy the generated TOML again and restart Codex.
 
 ## Vision Module
 
@@ -77,12 +92,17 @@ The Vision module is optional and configurable from the desktop Tools settings. 
 - Analyze endpoints: OpenAI-compatible `/responses` or `/chat/completions`.
 - Generate endpoints: OpenAI-compatible `/responses` with image generation support or `/images/generations`.
 - Image inputs: current Codex `input_image` attachments, HTTP(S) URL, `data:image` URL, `file://` URL, workspace path, or permitted local absolute path.
+- Image generation results are returned as display-ready Markdown and local files; generated base64 payloads are saved to disk instead of being sent back inline.
 
 CodeSeeX does not rewrite Vision endpoint URLs. The request URL you configure is the request URL that will be used. When a local image is analyzed through a remote endpoint, the image pixels are sent to that configured service.
 
 ## Credential Boundary
 
 CodeSeeX manager settings do not store upstream API keys. Balance checks read the direct Codex auth source or a cached request `Authorization: Bearer ...` header. A legacy `DEEPSEEK_API_KEY` environment value can still act as a fallback for direct upstream requests, but it is not the balance credential source.
+
+## Privacy Notes
+
+CodeSeeX is a local bridge, but model requests are forwarded to the configured upstream service. Vision analysis sends image pixels to the configured Vision endpoint, and Web Search may request search-result pages or regular web pages from third-party websites. Those services may apply their own terms, retention policies, rate limits, and anti-abuse rules.
 
 ## Runtime Data
 
@@ -101,6 +121,28 @@ Codex owns the conversation transcript. CodeSeeX keeps only current-process brid
 
 User-facing logs stay compact by default. Diagnostic events are not persisted unless diagnostic logging is explicitly enabled for development.
 
+## Troubleshooting
+
+### Balance Query Fails
+
+- Make sure Codex auth is configured for the same user account.
+- Confirm the machine can reach the configured DeepSeek-compatible upstream.
+- If a system proxy or VPN is required, enable the system proxy mode in CodeSeeX.
+
+### Codex Cannot See DeepSeek Models
+
+- Confirm `model_catalog_json` points to an existing `~/.codeseex/model-catalog.json`.
+- Copy the generated TOML from CodeSeeX instead of typing the path manually.
+- Restart Codex after changing TOML.
+- GPT/OpenAI TOML files do not need `model_catalog_json` and are not affected by CodeSeeX.
+
+### Conversation Requests Fail
+
+- Check the CodeSeeX logs page for the upstream error.
+- Confirm Codex `base_url` points to CodeSeeX, for example `http://127.0.0.1:8787/v1`.
+- If you use a custom upstream, confirm the URL is reachable and OpenAI-compatible.
+- Make sure no other process is using the configured CodeSeeX port.
+
 ## Development
 
 Rust is required for the core workspace.
@@ -109,6 +151,8 @@ Rust is required for the core workspace.
 cargo run -p codeseex-proxy
 cargo test --workspace
 ```
+
+Source builds require a model catalog seed at build time. Set `CODESEEX_MODEL_CATALOG_SEED` to a local seed file, or place `model-catalog.seed.json` under `.private/`.
 
 On Windows, helper scripts load MSVC Build Tools when available, import `.env`, and keep Cargo caches under a configurable local dev directory by default:
 
@@ -124,7 +168,6 @@ The desktop UI is served from `apps/ui/public` through Tauri's custom protocol; 
 - [CHANGELOG.md](CHANGELOG.md) for release notes.
 - [CHANGELOG.zh-CN.md](CHANGELOG.zh-CN.md) for Chinese release notes.
 - [docs/installer-migration.md](docs/installer-migration.md) for installer and legacy migration behavior.
-- [docs/electron-parity-checklist.md](docs/electron-parity-checklist.md) for migration parity gates.
 - [docs/state-contract.md](docs/state-contract.md) for runtime/log state boundaries.
 - [docs/community-tools.md](docs/community-tools.md) for community tool manifests and execution rules.
 

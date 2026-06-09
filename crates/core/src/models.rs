@@ -23,26 +23,49 @@ pub enum UpstreamModelOverride {
     Pro,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ModelRouteHint {
+    #[default]
+    Default,
+    Lightweight,
+}
+
 impl UpstreamModelOverride {
     pub fn upstream_slug(self, requested: &str) -> String {
+        self.upstream_slug_with_hint(requested, ModelRouteHint::Default)
+    }
+
+    pub fn upstream_slug_with_hint(self, requested: &str, hint: ModelRouteHint) -> String {
         match self {
-            Self::Default => default_upstream_slug(requested),
+            Self::Default => default_upstream_slug(requested, hint),
             Self::Flash => MODEL_FLASH.to_owned(),
             Self::Pro => MODEL_PRO.to_owned(),
         }
     }
 }
 
-fn default_upstream_slug(requested: &str) -> String {
+fn default_upstream_slug(requested: &str, hint: ModelRouteHint) -> String {
     let requested = requested.trim();
     let normalized = requested.to_ascii_lowercase();
     match normalized.as_str() {
         "" => MODEL_PRO.to_owned(),
         MODEL_FLASH => MODEL_FLASH.to_owned(),
         MODEL_PRO => MODEL_PRO.to_owned(),
-        value if value.starts_with("gpt-") && value.ends_with("-mini") => MODEL_FLASH.to_owned(),
+        value if hint == ModelRouteHint::Lightweight && is_codex_native_gpt_model(value) => {
+            MODEL_FLASH.to_owned()
+        }
+        value if is_known_codex_lightweight_model(value) => MODEL_FLASH.to_owned(),
+        value if is_codex_native_gpt_model(value) => MODEL_PRO.to_owned(),
         _ => requested.to_owned(),
     }
+}
+
+fn is_codex_native_gpt_model(value: &str) -> bool {
+    value == "gpt-5" || value.starts_with("gpt-5.") || value.starts_with("gpt-5-")
+}
+
+fn is_known_codex_lightweight_model(value: &str) -> bool {
+    matches!(value, "gpt-5.4-mini" | "gpt-5.5-mini")
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -107,7 +130,7 @@ mod tests {
         );
         assert_eq!(
             UpstreamModelOverride::Default.upstream_slug("gpt-5.6-mini"),
-            MODEL_FLASH
+            MODEL_PRO
         );
         assert_eq!(
             UpstreamModelOverride::Default.upstream_slug("unknown-model"),
@@ -115,11 +138,29 @@ mod tests {
         );
         assert_eq!(
             UpstreamModelOverride::Default.upstream_slug("gpt-5.4"),
-            "gpt-5.4"
+            MODEL_PRO
         );
         assert_eq!(
             UpstreamModelOverride::Default.upstream_slug("gpt-5.5"),
-            "gpt-5.5"
+            MODEL_PRO
+        );
+        assert_eq!(
+            UpstreamModelOverride::Default.upstream_slug("gpt-5.3-codex"),
+            MODEL_PRO
+        );
+        assert_eq!(
+            UpstreamModelOverride::Default
+                .upstream_slug_with_hint("gpt-5.4", ModelRouteHint::Lightweight),
+            MODEL_FLASH
+        );
+        assert_eq!(
+            UpstreamModelOverride::Default
+                .upstream_slug_with_hint("gpt-5.6-mini", ModelRouteHint::Lightweight),
+            MODEL_FLASH
+        );
+        assert_eq!(
+            UpstreamModelOverride::Default.upstream_slug("gpt-4o"),
+            "gpt-4o"
         );
         assert_eq!(UpstreamModelOverride::Default.upstream_slug(""), MODEL_PRO);
         assert_eq!(UpstreamModelOverride::Flash.upstream_slug("x"), MODEL_FLASH);

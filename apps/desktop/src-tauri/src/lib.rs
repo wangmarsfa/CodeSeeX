@@ -20,6 +20,8 @@ use tokio::sync::oneshot;
 const MAIN_WINDOW_LABEL: &str = "main";
 const TRAY_ID: &str = "codeseex";
 const PRODUCT_NAME: &str = "CodeSeeX";
+const QUIT_FOR_UPDATE_ARG: &str = "--quit-for-update";
+const EXIT_PROXY_STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[derive(Default)]
 struct DesktopRuntime {
@@ -170,6 +172,10 @@ pub fn run() {
     tauri::Builder::default()
         .manage(DesktopRuntime::default())
         .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+            if args.iter().any(|arg| arg == QUIT_FOR_UPDATE_ARG) {
+                request_app_exit(app);
+                return;
+            }
             if !args.iter().any(|arg| arg == "--autostart") {
                 let _ = show_main_window(app);
             }
@@ -179,6 +185,10 @@ pub fn run() {
             Some(vec!["--autostart"]),
         ))
         .setup(|app| {
+            if launched_for_update_quit() {
+                app.handle().exit(0);
+                return Ok(());
+            }
             if let Err(error) = start_embedded_proxy(app.handle().clone()) {
                 eprintln!("[codeseex] failed to start embedded proxy: {error}");
             }
@@ -308,7 +318,7 @@ fn start_embedded_proxy(app: AppHandle) -> Result<(), String> {
     Ok(())
 }
 
-fn stop_embedded_proxy(app: &AppHandle) -> Result<(), String> {
+fn stop_embedded_proxy<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
     let state = app.state::<DesktopRuntime>();
     let shutdown = {
         let mut proxy = state
@@ -337,10 +347,12 @@ fn stop_embedded_proxy(app: &AppHandle) -> Result<(), String> {
     Ok(())
 }
 
-async fn restart_embedded_proxy(app: AppHandle) -> Result<(), String> {
-    stop_embedded_proxy(&app)?;
-    let mut stopped = false;
-    for _ in 0..60 {
+async fn wait_for_embedded_proxy_stop<R: Runtime>(
+    app: &AppHandle<R>,
+    timeout: std::time::Duration,
+) -> bool {
+    let started_at = std::time::Instant::now();
+    loop {
         let status = app
             .state::<DesktopRuntime>()
             .proxy
@@ -348,12 +360,18 @@ async fn restart_embedded_proxy(app: AppHandle) -> Result<(), String> {
             .map(|proxy| proxy.status.clone())
             .unwrap_or_else(|_| "failed".to_owned());
         if matches!(status.as_str(), "stopped" | "failed") {
-            stopped = true;
-            break;
+            return true;
+        }
+        if started_at.elapsed() >= timeout {
+            return false;
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
-    if !stopped {
+}
+
+async fn restart_embedded_proxy(app: AppHandle) -> Result<(), String> {
+    stop_embedded_proxy(&app)?;
+    if !wait_for_embedded_proxy_stop(&app, std::time::Duration::from_secs(3)).await {
         return Err("embedded proxy did not stop before restart timeout".to_owned());
     }
     start_embedded_proxy(app)
@@ -389,8 +407,8 @@ async fn handle_proxy_lifecycle_action(
     }))
 }
 
-fn set_proxy_runtime_status(
-    app: &AppHandle,
+fn set_proxy_runtime_status<R: Runtime>(
+    app: &AppHandle<R>,
     status: &str,
     error: Option<String>,
     clear_shutdown: bool,
@@ -411,8 +429,8 @@ fn set_proxy_runtime_status(
     Ok(())
 }
 
-fn set_proxy_runtime_status_if_generation(
-    app: &AppHandle,
+fn set_proxy_runtime_status_if_generation<R: Runtime>(
+    app: &AppHandle<R>,
     generation: u64,
     status: &str,
     error: Option<String>,
@@ -847,6 +865,10 @@ fn launched_from_autostart() -> bool {
     env::args().any(|arg| arg == "--autostart")
 }
 
+fn launched_for_update_quit() -> bool {
+    env::args().any(|arg| arg == QUIT_FOR_UPDATE_ARG)
+}
+
 fn sync_configured_autostart<R: Runtime>(app: &AppHandle<R>) {
     if let Some(enabled) = configured_autostart() {
         if let Err(error) = apply_autostart(app, enabled) {
@@ -996,23 +1018,35 @@ fn toggle_maximize(app: &AppHandle) -> Result<(), String> {
     }
 }
 
-fn close_or_hide(app: &AppHandle, state: &DesktopRuntime) -> Result<(), String> {
+fn close_or_hide(app: &AppHandle, _state: &DesktopRuntime) -> Result<(), String> {
     if should_hide_to_tray() {
         main_window(app)?.destroy().map_err(string_error)
     } else {
-        state.quitting.store(true, Ordering::SeqCst);
-        remove_tray_icon(app);
-        app.exit(0);
+        request_app_exit(app);
         Ok(())
     }
 }
 
-fn request_app_exit<R: Runtime>(app: &AppHandle<R>) {
-    app.state::<DesktopRuntime>()
+fn request_app_exit<R: Runtime + 'static>(app: &AppHandle<R>) {
+    let already_quitting = app
+        .state::<DesktopRuntime>()
         .quitting
-        .store(true, Ordering::SeqCst);
+        .swap(true, Ordering::SeqCst);
     remove_tray_icon(app);
-    app.exit(0);
+    if already_quitting {
+        return;
+    }
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        if let Err(error) = stop_embedded_proxy(&app) {
+            eprintln!("[codeseex] failed to stop embedded proxy before exit: {error}");
+        }
+        if !wait_for_embedded_proxy_stop(&app, EXIT_PROXY_STOP_TIMEOUT).await {
+            eprintln!("[codeseex] embedded proxy did not stop before app exit timeout");
+        }
+        remove_tray_icon(&app);
+        app.exit(0);
+    });
 }
 
 fn remove_tray_icon<R: Runtime>(app: &AppHandle<R>) {

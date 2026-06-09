@@ -10,6 +10,9 @@ pub use catalog::{build_codeseex_catalog, codex_toml_snippet, write_catalog_atom
 pub use config::{
     parse_network_proxy_mode, AppConfig, NetworkProxyMode, UpstreamConfig, UserBillingConfig,
     UserCatalogConfig, UserConfig, UserModelConfig, UserNetworkConfig, UserProxyConfig,
-    UserToolsConfig, UserUiConfig, UserUpstreamConfig, UserWebSearchToolConfig,
+    UserToolsConfig, UserUiConfig, UserUpstreamConfig, UserVisionToolConfig,
+    UserWebSearchToolConfig,
 };
-pub use models::{available_models, ModelInfo, TemperaturePreset, UpstreamModelOverride};
+pub use models::{
+    available_models, ModelInfo, ModelRouteHint, TemperaturePreset, UpstreamModelOverride,
+};

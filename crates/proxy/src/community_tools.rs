@@ -48,9 +48,6 @@ const RESERVED_CONFIG_KEYS: &[&str] = &[
     "VISION_GENERATE_MODEL",
     "VISION_GENERATE_URL",
     "VISION_API_KEY",
-    "VISUAL_SEARCH_API_KEY",
-    "VISUAL_SEARCH_MODEL",
-    "VISUAL_SEARCH_URL",
 ];
 
 #[derive(Debug, Clone)]
@@ -868,8 +865,7 @@ mod tests {
                     { "key": "CATALOG_MODE", "type": "text" },
                     { "key": "DEEPSEEK_API_KEY", "type": "password" },
                     { "key": "VISION_API_KEY", "type": "password" },
-                    { "key": "VISION_GENERATE_URL", "type": "text" },
-                    { "key": "VISUAL_SEARCH_API_KEY", "type": "password" }
+                    { "key": "VISION_GENERATE_URL", "type": "text" }
                 ]
             }))
             .expect("manifest json"),

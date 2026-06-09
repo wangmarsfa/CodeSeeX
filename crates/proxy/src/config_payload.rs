@@ -2,7 +2,7 @@ use codeseex_core::models::{TemperaturePreset, UpstreamModelOverride};
 use codeseex_core::{
     parse_network_proxy_mode, AppConfig, NetworkProxyMode, UserBillingConfig, UserConfig,
     UserModelConfig, UserNetworkConfig, UserProxyConfig, UserToolsConfig, UserUiConfig,
-    UserUpstreamConfig,
+    UserUpstreamConfig, UserVisionToolConfig,
 };
 use serde_json::Value;
 use std::collections::{BTreeMap, HashSet};
@@ -130,22 +130,62 @@ pub(crate) fn user_config_from_payload(
             tools.enabled = value_string_list(payload, "ENABLED_TOOLS").map(configurable_tool_ids);
         }
         if has_tool_settings {
-            let settings = tools.settings.get_or_insert_with(BTreeMap::new);
             for key in tool_config_keys {
                 let Some(value) = payload.get(&key) else {
                     continue;
                 };
-                if value.is_null() {
-                    settings.remove(&key);
+                if is_vision_tool_config_key(&key) {
+                    set_vision_tool_setting_from_payload(tools, &key, value);
                 } else if let Some(value) = crate::community_tools::value_to_setting_string(value) {
+                    let settings = tools.settings.get_or_insert_with(BTreeMap::new);
                     settings.insert(key, value);
+                } else {
+                    let Some(settings) = tools.settings.as_mut() else {
+                        continue;
+                    };
+                    settings.remove(&key);
                 }
             }
-            normalize_builtin_tool_settings(settings);
+            cleanup_tool_settings(tools);
         }
     }
 
     config
+}
+
+pub(crate) fn tool_settings_from_user_config(config: &UserConfig) -> BTreeMap<String, String> {
+    let Some(tools) = config.tools.as_ref() else {
+        return BTreeMap::new();
+    };
+    let mut settings = tools.settings.clone().unwrap_or_default();
+    if let Some(vision) = tools.vision_analyze.as_ref() {
+        insert_tool_setting(
+            &mut settings,
+            crate::tools::vision::ANALYZE_URL_KEY,
+            vision.analyze_url.as_deref(),
+        );
+        insert_tool_setting(
+            &mut settings,
+            crate::tools::vision::ANALYZE_MODEL_KEY,
+            vision.analyze_model.as_deref(),
+        );
+        insert_tool_setting(
+            &mut settings,
+            crate::tools::vision::GENERATE_URL_KEY,
+            vision.generate_url.as_deref(),
+        );
+        insert_tool_setting(
+            &mut settings,
+            crate::tools::vision::GENERATE_MODEL_KEY,
+            vision.generate_model.as_deref(),
+        );
+        insert_tool_setting(
+            &mut settings,
+            crate::tools::vision::API_KEY_KEY,
+            vision.api_key.as_deref(),
+        );
+    }
+    settings
 }
 
 fn clear_legacy_web_search_proxy(config: &mut UserConfig) {
@@ -164,19 +204,85 @@ fn clear_legacy_web_search_proxy(config: &mut UserConfig) {
     }
 }
 
-fn normalize_builtin_tool_settings(settings: &mut BTreeMap<String, String>) {
-    migrate_tool_setting(settings, "VISUAL_SEARCH_URL", "VISION_ANALYZE_URL");
-    migrate_tool_setting(settings, "VISUAL_SEARCH_MODEL", "VISION_ANALYZE_MODEL");
-    migrate_tool_setting(settings, "VISUAL_SEARCH_API_KEY", "VISION_API_KEY");
+fn cleanup_tool_settings(tools: &mut UserToolsConfig) {
+    if let Some(settings) = tools.settings.as_mut() {
+        for key in crate::tools::vision::config_keys() {
+            settings.remove(key);
+        }
+        if settings.is_empty() {
+            tools.settings = None;
+        }
+    }
+    if tools
+        .vision_analyze
+        .as_ref()
+        .is_some_and(vision_tool_config_is_empty)
+    {
+        tools.vision_analyze = None;
+    }
 }
 
-fn migrate_tool_setting(settings: &mut BTreeMap<String, String>, old_key: &str, new_key: &str) {
-    if settings.contains_key(new_key) {
-        settings.remove(old_key);
-        return;
+fn is_vision_tool_config_key(key: &str) -> bool {
+    crate::tools::vision::config_keys()
+        .iter()
+        .any(|candidate| *candidate == key)
+}
+
+fn set_vision_tool_setting_from_payload(tools: &mut UserToolsConfig, key: &str, value: &Value) {
+    let value = if value.is_null() {
+        None
+    } else {
+        crate::community_tools::value_to_setting_string(value)
+    };
+    set_vision_tool_setting(tools, key, value);
+}
+
+fn set_vision_tool_setting(tools: &mut UserToolsConfig, key: &str, value: Option<String>) {
+    let value = value
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
+    let vision = tools
+        .vision_analyze
+        .get_or_insert_with(UserVisionToolConfig::default);
+    match key {
+        crate::tools::vision::ANALYZE_URL_KEY => {
+            vision.analyze_url = value;
+        }
+        crate::tools::vision::ANALYZE_MODEL_KEY => {
+            vision.analyze_model = value;
+        }
+        crate::tools::vision::GENERATE_URL_KEY => {
+            vision.generate_url = value;
+        }
+        crate::tools::vision::GENERATE_MODEL_KEY => {
+            vision.generate_model = value;
+        }
+        crate::tools::vision::API_KEY_KEY => {
+            vision.api_key = value;
+        }
+        _ => {}
     }
-    if let Some(value) = settings.remove(old_key) {
-        settings.insert(new_key.to_owned(), value);
+}
+
+fn insert_tool_setting(settings: &mut BTreeMap<String, String>, key: &str, value: Option<&str>) {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return;
+    };
+    settings.insert(key.to_owned(), value.to_owned());
+}
+
+fn vision_tool_config_is_empty(config: &UserVisionToolConfig) -> bool {
+    option_string_is_empty(config.analyze_url.as_deref())
+        && option_string_is_empty(config.analyze_model.as_deref())
+        && option_string_is_empty(config.generate_url.as_deref())
+        && option_string_is_empty(config.generate_model.as_deref())
+        && option_string_is_empty(config.api_key.as_deref())
+}
+
+fn option_string_is_empty(value: Option<&str>) -> bool {
+    match value {
+        Some(value) => value.trim().is_empty(),
+        None => true,
     }
 }
 
@@ -192,8 +298,7 @@ fn configurable_tool_ids(ids: Vec<String>) -> Vec<String> {
         .map(|id| {
             if matches!(
                 id.as_str(),
-                "visual_search"
-                    | "vision_generate"
+                "vision_generate"
                     | "image_gen"
                     | "imagegen"
                     | "image_generation"
@@ -386,27 +491,43 @@ mod tests {
             tools.enabled.as_deref(),
             Some(&["vision_analyze".to_owned()][..])
         );
-        let settings = tools.settings.expect("tool settings");
+        assert!(tools.settings.is_none());
+        let vision = tools.vision_analyze.expect("vision config");
         assert_eq!(
-            settings.get("VISION_ANALYZE_URL").map(String::as_str),
+            vision.analyze_url.as_deref(),
             Some("https://vision.example.com/v1")
         );
+        assert_eq!(vision.analyze_model.as_deref(), Some("vision-model"));
         assert_eq!(
-            settings.get("VISION_ANALYZE_MODEL").map(String::as_str),
-            Some("vision-model")
-        );
-        assert_eq!(
-            settings.get("VISION_GENERATE_URL").map(String::as_str),
+            vision.generate_url.as_deref(),
             Some("https://vision.example.com/v1/images/generations")
         );
-        assert_eq!(
-            settings.get("VISION_GENERATE_MODEL").map(String::as_str),
-            Some("image-model")
+        assert_eq!(vision.generate_model.as_deref(), Some("image-model"));
+        assert_eq!(vision.api_key.as_deref(), Some("visual-secret"));
+    }
+
+    #[test]
+    fn payload_writes_vision_config_without_global_tool_settings_table() {
+        let config = user_config_from_payload(
+            &json!({
+                "VISION_ANALYZE_URL": "https://vision.example.com/v1",
+                "VISION_ANALYZE_MODEL": "vision-model",
+                "VISION_API_KEY": "visual-secret"
+            }),
+            UserConfig::default(),
+            &AppConfig::default(),
         );
-        assert_eq!(
-            settings.get("VISION_API_KEY").map(String::as_str),
-            Some("visual-secret")
-        );
+        let path = std::env::temp_dir().join(format!(
+            "codeseex-vision-config-{}.toml",
+            uuid::Uuid::new_v4()
+        ));
+        config.write_atomic(&path).expect("write config");
+        let text = std::fs::read_to_string(&path).expect("read config");
+        let _ = std::fs::remove_file(path);
+        assert!(text.contains("[tools.vision_analyze]"));
+        assert!(text.contains("analyze_url = \"https://vision.example.com/v1\""));
+        assert!(!text.contains("[tools.settings]"));
+        assert!(!text.contains("VISION_ANALYZE_URL"));
     }
 
     #[test]
@@ -451,20 +572,6 @@ mod tests {
     }
 
     #[test]
-    fn payload_canonicalizes_legacy_visual_search_tool_id() {
-        let config = user_config_from_payload(
-            &json!({ "ENABLED_TOOLS": ["visual_search"] }),
-            UserConfig::default(),
-            &AppConfig::default(),
-        );
-        let tools = config.tools.expect("tools config");
-        assert_eq!(
-            tools.enabled.as_deref(),
-            Some(&["vision_analyze".to_owned()][..])
-        );
-    }
-
-    #[test]
     fn payload_canonicalizes_vision_generate_to_vision_module() {
         let config = user_config_from_payload(
             &json!({ "ENABLED_TOOLS": ["vision_generate", "image_gen"] }),
@@ -476,38 +583,5 @@ mod tests {
             tools.enabled.as_deref(),
             Some(&["vision_analyze".to_owned()][..])
         );
-    }
-
-    #[test]
-    fn payload_migrates_legacy_visual_search_tool_settings() {
-        let config = user_config_from_payload(
-            &json!({
-                "VISUAL_SEARCH_URL": "https://vision.example.com/v1",
-                "VISUAL_SEARCH_MODEL": "vision-model",
-                "VISUAL_SEARCH_API_KEY": "visual-secret"
-            }),
-            UserConfig::default(),
-            &AppConfig::default(),
-        );
-        let settings = config
-            .tools
-            .expect("tools config")
-            .settings
-            .expect("tool settings");
-        assert_eq!(
-            settings.get("VISION_ANALYZE_URL").map(String::as_str),
-            Some("https://vision.example.com/v1")
-        );
-        assert_eq!(
-            settings.get("VISION_ANALYZE_MODEL").map(String::as_str),
-            Some("vision-model")
-        );
-        assert_eq!(
-            settings.get("VISION_API_KEY").map(String::as_str),
-            Some("visual-secret")
-        );
-        assert!(!settings.contains_key("VISUAL_SEARCH_URL"));
-        assert!(!settings.contains_key("VISUAL_SEARCH_MODEL"));
-        assert!(!settings.contains_key("VISUAL_SEARCH_API_KEY"));
     }
 }

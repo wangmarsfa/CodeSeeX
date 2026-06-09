@@ -3,6 +3,8 @@ const LOG_OLDER_PAGE_SIZE = 15;
 const LOG_MAX_ITEMS = 1000;
 const LOG_BOTTOM_LOAD_THRESHOLD = 80;
 const CONFIG_AUTOSAVE_DELAY_MS = 450;
+const CONFIG_TEXT_AUTOSAVE_DELAY_MS = 2500;
+const CONFIG_AUTOSAVE_RETRY_MS = 700;
 const DEBUG_MANAGER_BASE_URL = "http://127.0.0.1:8787";
 const REFRESH_RUNNING_MS = 2000;
 const REFRESH_IDLE_MS = 5000;
@@ -216,12 +218,14 @@ function bind() {
   if (els.toolConfigList) {
     els.toolConfigList.addEventListener("input", handleConfigInput);
     els.toolConfigList.addEventListener("change", handleConfigInput);
+    els.toolConfigList.addEventListener("focusout", handleConfigInput);
   }
 
   [els.showThinking, els.autoStart, els.deepseekOfficialV1Compat, els.uiLanguage, els.deepseekBaseUrl, els.proxyPort, ...billingInputs()].forEach((input) => {
     if (!input) return;
     input.addEventListener("input", handleConfigInput);
     input.addEventListener("change", handleConfigInput);
+    input.addEventListener("focusout", handleConfigInput);
   });
 
   onRadioChange("CONFIG_TAB", setConfigTab);
@@ -386,11 +390,16 @@ async function actionPost(url, title, detail) {
 }
 
 async function saveConfig() {
-  if (busy || configSaving || !pendingConfig) return;
+  if (!pendingConfig) return;
+  if (busy || configSaving) {
+    scheduleConfigSave(CONFIG_AUTOSAVE_RETRY_MS);
+    return;
+  }
   configSaving = true;
   renderConfigSaveState("saving");
   const payload = pendingConfig;
   const previousConfig = lastSavedConfig;
+  let saveCompleted = false;
   try {
     const response = await apiFetch("/api/config", {
       method: "POST",
@@ -401,11 +410,13 @@ async function saveConfig() {
     const status = await response.json().catch(() => null);
     const needsRestart = hasRestartRequiredChanges(payload);
     lastSavedConfig = normalizeConfigPayload(payload);
-    pendingConfig = null;
+    if (pendingConfig === payload || sameConfigPayload(normalizeConfigPayload(pendingConfig), lastSavedConfig)) {
+      pendingConfig = null;
+    }
     if (needsRestart) restartRequired = true;
     if (status && status.config_version) latestConfigVersion = String(status.config_version);
-    renderConfigSaveState(restartRequired ? "savedRestart" : "saved");
-    configSaving = false;
+    renderConfigSaveState(pendingConfig ? "pending" : (restartRequired ? "savedRestart" : "saved"));
+    saveCompleted = true;
     await syncDesktopConfig(payload, previousConfig).catch(() => {});
     await loadConfig();
     await loadCodexAdapter().catch(() => {});
@@ -416,6 +427,7 @@ async function saveConfig() {
     renderConfigSaveState("error");
   } finally {
     configSaving = false;
+    if (saveCompleted && pendingConfig) scheduleConfigSave(CONFIG_AUTOSAVE_RETRY_MS);
   }
 }
 
@@ -1777,7 +1789,7 @@ function setAboutStatus(message, warning, options = {}) {
   els.aboutStatus.classList.toggle("warning", Boolean(warning));
 }
 
-function handleConfigInput() {
+function handleConfigInput(event) {
   if (!lastSavedConfig) return;
   const nextPayload = buildConfigPayload();
   const next = normalizeConfigPayload(nextPayload);
@@ -1789,11 +1801,30 @@ function handleConfigInput() {
   }
   pendingConfig = nextPayload;
   renderConfigSaveState("pending");
+  scheduleConfigSave(configAutosaveDelayForEvent(event));
+}
+
+function scheduleConfigSave(delay = CONFIG_AUTOSAVE_DELAY_MS) {
   clearAutosaveTimer();
   autosaveTimer = setTimeout(() => {
     autosaveTimer = null;
     saveConfig();
-  }, CONFIG_AUTOSAVE_DELAY_MS);
+  }, delay);
+}
+
+function configAutosaveDelayForEvent(event) {
+  if (!event) return CONFIG_AUTOSAVE_DELAY_MS;
+  if (event.type === "change" || event.type === "focusout") return CONFIG_AUTOSAVE_DELAY_MS;
+  return isTextConfigInput(event.target) ? CONFIG_TEXT_AUTOSAVE_DELAY_MS : CONFIG_AUTOSAVE_DELAY_MS;
+}
+
+function isTextConfigInput(target) {
+  if (!target || !target.tagName) return false;
+  const tag = target.tagName.toLowerCase();
+  if (tag === "textarea") return true;
+  if (tag !== "input") return false;
+  const type = String(target.type || "text").toLowerCase();
+  return ["email", "number", "password", "search", "tel", "text", "url"].includes(type);
 }
 
 function buildConfigPayload() {

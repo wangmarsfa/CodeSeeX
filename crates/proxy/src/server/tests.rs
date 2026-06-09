@@ -6,6 +6,8 @@ use crate::responses::context::{
 use crate::tools::chat_protocol::assistant_message_from_chat_tool_subset;
 use crate::tools::ownership::ChatToolCall;
 use codeseex_core::config::UpstreamConfig;
+use codeseex_core::models::MODEL_FLASH;
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -37,6 +39,87 @@ fn test_config_with_upstream(data_dir: PathBuf, fake_addr: SocketAddr) -> AppCon
 
 fn temp_workspace(label: &str) -> PathBuf {
     std::env::temp_dir().join(format!("codeseex-{label}-{}", Uuid::new_v4().simple()))
+}
+
+fn write_vision_analyze_config(config: &AppConfig, endpoint: &str) {
+    std::fs::create_dir_all(&config.data_dir).expect("create test data dir");
+    let mut settings = BTreeMap::new();
+    settings.insert("VISION_ANALYZE_URL".to_owned(), endpoint.to_owned());
+    settings.insert(
+        "VISION_ANALYZE_MODEL".to_owned(),
+        "vision-test-model".to_owned(),
+    );
+    settings.insert("VISION_API_KEY".to_owned(), "vision-test-key".to_owned());
+    codeseex_core::UserConfig {
+        tools: Some(codeseex_core::UserToolsConfig {
+            enabled: Some(vec!["vision_analyze".to_owned()]),
+            settings: Some(settings),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+    .write_atomic(&config.config_path())
+    .expect("write vision config");
+}
+
+#[test]
+fn streaming_cancellation_registry_marks_active_response() {
+    let response_id = format!("resp_cancel_registry_{}", Uuid::new_v4().simple());
+    unregister_streaming_response(&response_id);
+    let cancelled = register_streaming_response(&response_id);
+
+    assert!(!streaming_response_cancelled(&cancelled));
+    assert!(cancel_streaming_response(&response_id));
+    assert!(streaming_response_cancelled(&cancelled));
+
+    unregister_streaming_response(&response_id);
+    assert!(!cancel_streaming_response(&response_id));
+}
+
+#[tokio::test]
+async fn cancel_response_marks_active_request_interrupted() {
+    let data_dir = temp_workspace("cancel-response");
+    let config = test_config(data_dir.clone());
+    let store = Store::open(&config.data_dir).await.unwrap();
+    let response_id = format!("resp_cancel_endpoint_{}", Uuid::new_v4().simple());
+    store
+        .checkpoint_request(&response_id, None, Some("deepseek-v4-pro"), &json!({}))
+        .await
+        .unwrap();
+    let cancelled = register_streaming_response(&response_id);
+    let proxy_state = ProxyState {
+        config: Arc::new(config),
+        client: reqwest::Client::new(),
+        store: store.clone(),
+    };
+    let proxy_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    let proxy_app = Router::new()
+        .route("/v1/responses/{response_id}/cancel", post(cancel_response))
+        .with_state(proxy_state);
+    tokio::spawn(async move {
+        axum::serve(proxy_listener, proxy_app).await.unwrap();
+    });
+
+    let response = reqwest::Client::new()
+        .post(format!(
+            "http://{proxy_addr}/v1/responses/{response_id}/cancel"
+        ))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.json::<Value>().await.unwrap();
+    assert_eq!(body["status"], "cancelled");
+    assert!(streaming_response_cancelled(&cancelled));
+    assert_eq!(
+        store.response_status(&response_id).await.unwrap(),
+        Some(RequestStatus::Interrupted)
+    );
+
+    unregister_streaming_response(&response_id);
+    let _ = std::fs::remove_dir_all(data_dir);
 }
 
 #[tokio::test]
@@ -275,6 +358,35 @@ async fn fake_apply_patch_streaming_chat_completions(
         .expect("fake upstream response should build")
 }
 
+async fn fake_apply_patch_chat_completions(
+    State(state): State<FakeUpstreamState>,
+    Json(payload): Json<Value>,
+) -> axum::response::Response {
+    {
+        let mut requests = state.requests.lock().expect("fake upstream lock poisoned");
+        requests.push(payload);
+    }
+    Json(json!({
+        "choices": [{
+            "finish_reason": "tool_calls",
+            "message": {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call_patch",
+                    "type": "function",
+                    "function": {
+                        "name": "apply_patch",
+                        "arguments": "{\"patch\":\"*** Begin Patch\\n*** Add File: target/codeseex-apply-patch-nonstream-test/hello.txt\\n+hello\\n*** End Patch\"}"
+                    }
+                }]
+            }
+        }],
+        "usage": { "prompt_tokens": 6, "completion_tokens": 4, "total_tokens": 10 }
+    }))
+    .into_response()
+}
+
 async fn fake_tool_search_bridge_streaming_chat_completions(
     State(state): State<FakeUpstreamState>,
     Json(payload): Json<Value>,
@@ -328,6 +440,228 @@ async fn fake_final_chat_completions(
             "message": { "role": "assistant", "content": "tool result acknowledged" }
         }],
         "usage": { "prompt_tokens": 10, "completion_tokens": 3, "total_tokens": 13 }
+    }))
+    .into_response()
+}
+
+async fn fake_vision_instruction_chat_completions(
+    State(state): State<FakeUpstreamState>,
+    Json(payload): Json<Value>,
+) -> axum::response::Response {
+    let request_index = {
+        let mut requests = state.requests.lock().expect("fake upstream lock poisoned");
+        requests.push(payload);
+        requests.len()
+    };
+    if request_index == 1 {
+        return Json(json!({
+        "choices": [{
+            "finish_reason": "tool_calls",
+            "message": {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call_vision_exact",
+                    "type": "function",
+                    "function": {
+                        "name": "vision_analyze",
+                        "arguments": "{\"image\":\"data:image/png;base64,AAAA\",\"prompt\":\"Return exactly what you see.\"}"
+                    }
+                }]
+            }
+        }],
+        "usage": { "prompt_tokens": 8, "completion_tokens": 2, "total_tokens": 10 }
+        }))
+        .into_response();
+    }
+    Json(json!({
+        "choices": [{
+            "message": { "role": "assistant", "content": "VISION EXACT LINE 1\nVISION EXACT LINE 2\nMODEL CONTINUATION AFTER VISION" }
+        }],
+        "usage": { "prompt_tokens": 10, "completion_tokens": 9, "total_tokens": 19 }
+    }))
+    .into_response()
+}
+
+async fn fake_parallel_vision_chat_completions(
+    State(state): State<FakeUpstreamState>,
+    Json(payload): Json<Value>,
+) -> axum::response::Response {
+    let has_tool_results = payload
+        .get("messages")
+        .and_then(Value::as_array)
+        .map(|messages| {
+            ["call_vision_a", "call_vision_b"]
+                .into_iter()
+                .all(|call_id| {
+                    messages.iter().any(|message| {
+                        message.get("role").and_then(Value::as_str) == Some("tool")
+                            && message.get("tool_call_id").and_then(Value::as_str) == Some(call_id)
+                    })
+                })
+        })
+        .unwrap_or(false);
+    {
+        let mut requests = state.requests.lock().expect("fake upstream lock poisoned");
+        requests.push(payload);
+    }
+    if has_tool_results {
+        return Json(json!({
+            "choices": [{
+                "message": { "role": "assistant", "content": "parallel vision handled" }
+            }],
+            "usage": { "prompt_tokens": 10, "completion_tokens": 3, "total_tokens": 13 }
+        }))
+        .into_response();
+    }
+    Json(json!({
+        "choices": [{
+            "finish_reason": "tool_calls",
+            "message": {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [
+                    {
+                        "id": "call_vision_a",
+                        "type": "function",
+                        "function": {
+                            "name": "vision_analyze",
+                            "arguments": "{\"image\":\"data:image/png;base64,AAAA\",\"prompt\":\"first\"}"
+                        }
+                    },
+                    {
+                        "id": "call_vision_b",
+                        "type": "function",
+                        "function": {
+                            "name": "vision_analyze",
+                            "arguments": "{\"image\":\"data:image/png;base64,BBBB\",\"prompt\":\"second\"}"
+                        }
+                    }
+                ]
+            }
+        }],
+        "usage": { "prompt_tokens": 8, "completion_tokens": 2, "total_tokens": 10 }
+    }))
+    .into_response()
+}
+
+async fn fake_vision_instruction_streaming_chat_completions(
+    State(state): State<FakeUpstreamState>,
+    Json(payload): Json<Value>,
+) -> axum::response::Response {
+    let request_index = {
+        let mut requests = state.requests.lock().expect("fake upstream lock poisoned");
+        requests.push(payload);
+        requests.len()
+    };
+    let body = if request_index == 1 {
+        concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_vision_exact\",\"type\":\"function\",\"function\":{\"name\":\"vision_analyze\",\"arguments\":\"{\\\"image\\\":\\\"data:image/png;base64,AAAA\\\",\\\"prompt\\\":\\\"Return exactly what you see.\\\"}\"}}]}}]}\n\n",
+            "data: [DONE]\n\n"
+        )
+        .to_owned()
+    } else {
+        concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"VISION EXACT LINE 1\\nVISION EXACT LINE 2\\nMODEL CONTINUATION AFTER VISION\"}}]}\n\n",
+            "data: [DONE]\n\n"
+        )
+        .to_owned()
+    };
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .body(Body::from(body))
+        .expect("fake upstream response should build")
+}
+
+fn assert_vision_tool_result_without_system_instruction(payload: &Value, call_id: &str) {
+    let messages = payload["messages"]
+        .as_array()
+        .expect("chat request messages");
+    assert!(!messages.iter().any(|message| {
+        message.get("role").and_then(Value::as_str) == Some("system")
+            && message
+                .get("content")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .contains("Vision result")
+    }));
+    let assistant_index = messages
+        .iter()
+        .position(|message| {
+            message.get("role").and_then(Value::as_str) == Some("assistant")
+                && message
+                    .get("tool_calls")
+                    .and_then(Value::as_array)
+                    .map(|calls| {
+                        calls
+                            .iter()
+                            .any(|call| call.get("id").and_then(Value::as_str) == Some(call_id))
+                    })
+                    .unwrap_or(false)
+        })
+        .expect("assistant tool call message");
+    let tool_index = messages
+        .iter()
+        .position(|message| {
+            message.get("role").and_then(Value::as_str) == Some("tool")
+                && message.get("tool_call_id").and_then(Value::as_str) == Some(call_id)
+        })
+        .expect("tool result message");
+    let user_index = messages
+        .iter()
+        .position(|message| message.get("role").and_then(Value::as_str) == Some("user"))
+        .expect("user message");
+
+    assert!(assistant_index < tool_index);
+    assert!(user_index < assistant_index);
+    let tool_content = messages[tool_index]
+        .get("content")
+        .and_then(Value::as_str)
+        .expect("tool content");
+    assert!(tool_content.contains("VISION EXACT LINE 1"));
+    assert!(!tool_content.contains("model_instruction"));
+}
+
+async fn fake_vision_responses(
+    State(state): State<FakeUpstreamState>,
+    Json(payload): Json<Value>,
+) -> axum::response::Response {
+    {
+        let mut requests = state.requests.lock().expect("fake vision lock poisoned");
+        requests.push(payload);
+    }
+    Json(json!({
+        "output": [{
+            "type": "message",
+            "content": [{
+                "type": "output_text",
+                "text": "VISION EXACT LINE 1\nVISION EXACT LINE 2"
+            }]
+        }],
+        "usage": { "total_tokens": 7 }
+    }))
+    .into_response()
+}
+
+async fn fake_delayed_vision_responses(
+    State(state): State<FakeUpstreamState>,
+    Json(payload): Json<Value>,
+) -> axum::response::Response {
+    {
+        let mut requests = state.requests.lock().expect("fake vision lock poisoned");
+        requests.push(payload);
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(450)).await;
+    Json(json!({
+        "output": [{
+            "type": "message",
+            "content": [{
+                "type": "output_text",
+                "text": "delayed vision ok"
+            }]
+        }],
+        "usage": { "total_tokens": 7 }
     }))
     .into_response()
 }
@@ -984,7 +1318,7 @@ async fn streaming_internal_tools_execute_inside_proxy_without_client_function_c
 }
 
 #[tokio::test]
-async fn responses_missing_previous_response_id_returns_conflict_without_upstream_call() {
+async fn responses_missing_previous_response_id_is_ignored_without_local_replay() {
     let fake_state = FakeUpstreamState::default();
     let fake_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let fake_addr = fake_listener.local_addr().unwrap();
@@ -1028,21 +1362,21 @@ async fn responses_missing_previous_response_id_returns_conflict_without_upstrea
         .await
         .unwrap();
 
-    assert_eq!(response.status(), StatusCode::CONFLICT);
-    let text = response.text().await.unwrap();
-    assert!(text.contains("previous_response_unavailable"), "{text}");
+    assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
         fake_state
             .requests
             .lock()
             .expect("fake upstream lock poisoned")
             .len(),
-        0,
-        "missing in-process parent must not call upstream"
+        1,
+        "missing parent should not block Codex-provided input"
     );
-    let summary = store.runtime_summary(10).await.unwrap();
-    assert_eq!(summary.request_count, 0);
-    assert_eq!(summary.failed_request_count, 1);
+    let chain = store
+        .response_context_chain("resp_missing_previous", 1)
+        .await
+        .unwrap();
+    assert_eq!(chain[0].previous_response_id, None);
 
     let _ = std::fs::remove_dir_all(data_dir);
 }
@@ -1115,6 +1449,239 @@ async fn responses_missing_previous_response_id_allows_codex_full_context() {
         .unwrap();
     assert_eq!(chain[0].previous_response_id, None);
     assert_eq!(chain[0].input["input"].as_array().unwrap().len(), 0);
+
+    let _ = std::fs::remove_dir_all(data_dir);
+}
+
+#[tokio::test]
+async fn responses_interrupted_previous_is_ignored_without_local_replay() {
+    let fake_state = FakeUpstreamState::default();
+    let fake_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let fake_addr = fake_listener.local_addr().unwrap();
+    let fake_app = Router::new()
+        .route("/chat/completions", post(fake_final_chat_completions))
+        .with_state(fake_state.clone());
+    tokio::spawn(async move {
+        axum::serve(fake_listener, fake_app).await.unwrap();
+    });
+
+    let data_dir = temp_workspace("interrupted-previous-conflict");
+    let config = test_config_with_upstream(data_dir.clone(), fake_addr);
+    let store = Store::open(&config.data_dir).await.unwrap();
+    store
+        .checkpoint_request(
+            "resp_interrupted_parent",
+            None,
+            Some("deepseek-v4-pro"),
+            &json!({ "input": "first request" }),
+        )
+        .await
+        .unwrap();
+    store
+        .interrupt_request_if_in_progress("resp_interrupted_parent", "client cancelled")
+        .await
+        .unwrap();
+    let proxy_state = ProxyState {
+        config: Arc::new(config),
+        client: reqwest::Client::new(),
+        store,
+    };
+    let proxy_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    let proxy_app = Router::new()
+        .route("/v1/responses", post(responses))
+        .with_state(proxy_state);
+    tokio::spawn(async move {
+        axum::serve(proxy_listener, proxy_app).await.unwrap();
+    });
+
+    let response = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/responses"))
+        .json(&json!({
+            "id": "resp_continue_after_interrupted",
+            "model": "deepseek-v4-pro",
+            "previous_response_id": "resp_interrupted_parent",
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "please continue" }]
+            }]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        fake_state
+            .requests
+            .lock()
+            .expect("fake upstream lock poisoned")
+            .len(),
+        1,
+        "interrupted parent should not block Codex-provided input"
+    );
+
+    let _ = std::fs::remove_dir_all(data_dir);
+}
+
+#[tokio::test]
+async fn responses_failed_previous_is_ignored_without_local_replay() {
+    let fake_state = FakeUpstreamState::default();
+    let fake_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let fake_addr = fake_listener.local_addr().unwrap();
+    let fake_app = Router::new()
+        .route("/chat/completions", post(fake_final_chat_completions))
+        .with_state(fake_state.clone());
+    tokio::spawn(async move {
+        axum::serve(fake_listener, fake_app).await.unwrap();
+    });
+
+    let data_dir = temp_workspace("failed-previous-conflict");
+    let config = test_config_with_upstream(data_dir.clone(), fake_addr);
+    let store = Store::open(&config.data_dir).await.unwrap();
+    store
+        .checkpoint_request(
+            "resp_failed_parent",
+            None,
+            Some("deepseek-v4-pro"),
+            &json!({ "input": "first request" }),
+        )
+        .await
+        .unwrap();
+    store
+        .finish_request(
+            "resp_failed_parent",
+            RequestStatus::Failed,
+            None,
+            Some(&json!({ "error": "upstream failed" })),
+        )
+        .await
+        .unwrap();
+    let proxy_state = ProxyState {
+        config: Arc::new(config),
+        client: reqwest::Client::new(),
+        store,
+    };
+    let proxy_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    let proxy_app = Router::new()
+        .route("/v1/responses", post(responses))
+        .with_state(proxy_state);
+    tokio::spawn(async move {
+        axum::serve(proxy_listener, proxy_app).await.unwrap();
+    });
+
+    let response = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/responses"))
+        .json(&json!({
+            "id": "resp_continue_after_failed",
+            "model": "deepseek-v4-pro",
+            "previous_response_id": "resp_failed_parent",
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "please continue" }]
+            }]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        fake_state
+            .requests
+            .lock()
+            .expect("fake upstream lock poisoned")
+            .len(),
+        1,
+        "failed parent should not block Codex-provided input"
+    );
+
+    let _ = std::fs::remove_dir_all(data_dir);
+}
+
+#[tokio::test]
+async fn responses_interrupted_previous_allows_codex_full_context() {
+    let fake_state = FakeUpstreamState::default();
+    let fake_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let fake_addr = fake_listener.local_addr().unwrap();
+    let fake_app = Router::new()
+        .route("/chat/completions", post(fake_final_chat_completions))
+        .with_state(fake_state.clone());
+    tokio::spawn(async move {
+        axum::serve(fake_listener, fake_app).await.unwrap();
+    });
+
+    let data_dir = temp_workspace("interrupted-previous-full-context");
+    let config = test_config_with_upstream(data_dir.clone(), fake_addr);
+    let store = Store::open(&config.data_dir).await.unwrap();
+    store
+        .checkpoint_request(
+            "resp_interrupted_parent_full",
+            None,
+            Some("deepseek-v4-pro"),
+            &json!({ "input": "first request" }),
+        )
+        .await
+        .unwrap();
+    store
+        .interrupt_request_if_in_progress("resp_interrupted_parent_full", "client cancelled")
+        .await
+        .unwrap();
+    let proxy_state = ProxyState {
+        config: Arc::new(config),
+        client: reqwest::Client::new(),
+        store: store.clone(),
+    };
+    let proxy_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    let proxy_app = Router::new()
+        .route("/v1/responses", post(responses))
+        .with_state(proxy_state);
+    tokio::spawn(async move {
+        axum::serve(proxy_listener, proxy_app).await.unwrap();
+    });
+
+    let input_items = (0..81)
+        .map(|index| {
+            json!({
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": format!("full context item {index}") }]
+            })
+        })
+        .collect::<Vec<_>>();
+    let response = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/responses"))
+        .json(&json!({
+            "id": "resp_full_context_after_interrupted",
+            "model": "deepseek-v4-pro",
+            "previous_response_id": "resp_interrupted_parent_full",
+            "prompt_cache_key": "thread-full-context",
+            "instructions": "answer briefly",
+            "tools": [],
+            "input": input_items
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        fake_state
+            .requests
+            .lock()
+            .expect("fake upstream lock poisoned")
+            .len(),
+        1
+    );
+    let chain = store
+        .response_context_chain("resp_full_context_after_interrupted", 1)
+        .await
+        .unwrap();
+    assert_eq!(chain[0].previous_response_id, None);
 
     let _ = std::fs::remove_dir_all(data_dir);
 }
@@ -1226,6 +1793,70 @@ async fn current_input_tool_outputs_replay_as_chat_tool_protocol() {
                 .unwrap_or_default()
                 .contains("ok")
     }));
+}
+
+#[tokio::test]
+async fn lightweight_auxiliary_responses_request_suppresses_proxy_tools() {
+    let fake_state = FakeUpstreamState::default();
+    let fake_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let fake_addr = fake_listener.local_addr().unwrap();
+    let fake_app = Router::new()
+        .route("/chat/completions", post(fake_final_chat_completions))
+        .with_state(fake_state.clone());
+    tokio::spawn(async move {
+        axum::serve(fake_listener, fake_app).await.unwrap();
+    });
+
+    let data_dir = temp_workspace("auxiliary-no-tools");
+    let config = test_config_with_upstream(data_dir.clone(), fake_addr);
+    let store = Store::open(&config.data_dir).await.unwrap();
+    let proxy_state = ProxyState {
+        config: Arc::new(config),
+        client: reqwest::Client::new(),
+        store,
+    };
+    let proxy_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    let proxy_app = Router::new()
+        .route("/v1/responses", post(responses))
+        .with_state(proxy_state);
+    tokio::spawn(async move {
+        axum::serve(proxy_listener, proxy_app).await.unwrap();
+    });
+
+    let response = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/responses"))
+        .json(&json!({
+            "id": "resp_auxiliary_suggestions",
+            "model": "gpt-5.4",
+            "stream": false,
+            "instructions": "Generate suggested starter prompts for a new project workspace conversation.",
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "The user opened a new project workspace topic." }]
+            }],
+            "max_output_tokens": 128
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert!(response.status().is_success());
+    let requests = fake_state
+        .requests
+        .lock()
+        .expect("fake upstream lock poisoned")
+        .clone();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0]["model"], MODEL_FLASH);
+    assert!(
+        requests[0].get("tools").is_none(),
+        "auxiliary requests should not receive proxy tools: {}",
+        requests[0]
+    );
+
+    let _ = std::fs::remove_dir_all(data_dir);
 }
 
 #[tokio::test]
@@ -1425,6 +2056,7 @@ async fn streaming_mixed_internal_and_external_tools_runs_internal_first() {
     ));
     let config = test_config_with_upstream(data_dir, fake_addr);
     let store = Store::open(&config.data_dir).await.unwrap();
+    let inspection_store = store.clone();
     let proxy_state = ProxyState {
         config: Arc::new(config),
         client: reqwest::Client::new(),
@@ -1499,6 +2131,17 @@ async fn streaming_mixed_internal_and_external_tools_runs_internal_first() {
         .expect("fake upstream lock poisoned")
         .clone();
     assert_eq!(requests.len(), 1);
+
+    let (events, _) = inspection_store.recent_events(20, None).await.unwrap();
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.event_type == "request_completed"),
+        "client tool handoff must not be logged as a completed conversation"
+    );
+    let summary = inspection_store.runtime_summary(10).await.unwrap();
+    assert_eq!(summary.request_count, 0);
+    assert!(summary.turn_history.is_empty());
 }
 
 #[tokio::test]
@@ -1678,6 +2321,348 @@ async fn streaming_web_search_emits_replayable_output_item() {
                 .unwrap_or_default()
                 .contains("missing_url")
     }));
+}
+
+#[tokio::test]
+async fn non_streaming_vision_result_uses_tool_schema_without_system_instruction() {
+    let chat_state = FakeUpstreamState::default();
+    let chat_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let chat_addr = chat_listener.local_addr().unwrap();
+    let chat_app = Router::new()
+        .route(
+            "/chat/completions",
+            post(fake_vision_instruction_chat_completions),
+        )
+        .with_state(chat_state.clone());
+    tokio::spawn(async move {
+        axum::serve(chat_listener, chat_app).await.unwrap();
+    });
+
+    let vision_state = FakeUpstreamState::default();
+    let vision_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let vision_addr = vision_listener.local_addr().unwrap();
+    let vision_app = Router::new()
+        .route("/v1/responses", post(fake_vision_responses))
+        .with_state(vision_state.clone());
+    tokio::spawn(async move {
+        axum::serve(vision_listener, vision_app).await.unwrap();
+    });
+
+    let data_dir = temp_workspace("vision-instruction-non-stream");
+    let config = test_config_with_upstream(data_dir.clone(), chat_addr);
+    write_vision_analyze_config(&config, &format!("http://{vision_addr}/v1/responses"));
+    let store = Store::open(&config.data_dir).await.unwrap();
+    let proxy_state = ProxyState {
+        config: Arc::new(config),
+        client: reqwest::Client::new(),
+        store,
+    };
+    let proxy_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    let proxy_app = Router::new()
+        .route("/v1/responses", post(responses))
+        .with_state(proxy_state);
+    tokio::spawn(async move {
+        axum::serve(proxy_listener, proxy_app).await.unwrap();
+    });
+
+    let body = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/responses"))
+        .json(&json!({
+            "id": "resp_vision_instruction_non_stream",
+            "model": "deepseek-v4-pro",
+            "stream": false,
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "analyze the image" }]
+            }]
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap();
+
+    let serialized = serde_json::to_string(&body).unwrap();
+    assert!(serialized.contains("VISION EXACT LINE 1\\nVISION EXACT LINE 2"));
+    assert!(serialized.contains("MODEL CONTINUATION AFTER VISION"));
+    let chat_requests = chat_state
+        .requests
+        .lock()
+        .expect("fake upstream lock poisoned")
+        .clone();
+    assert_eq!(
+        chat_requests.len(),
+        2,
+        "vision result should continue through a second chat completion"
+    );
+    assert_vision_tool_result_without_system_instruction(&chat_requests[1], "call_vision_exact");
+    assert_eq!(
+        vision_state
+            .requests
+            .lock()
+            .expect("fake vision lock poisoned")
+            .len(),
+        1
+    );
+
+    let _ = std::fs::remove_dir_all(data_dir);
+}
+
+#[tokio::test]
+async fn responses_accepts_large_client_image_output_and_stores_redacted_input() {
+    let fake_state = FakeUpstreamState::default();
+    let fake_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let fake_addr = fake_listener.local_addr().unwrap();
+    let fake_app = Router::new()
+        .route("/chat/completions", post(fake_final_chat_completions))
+        .with_state(fake_state);
+    tokio::spawn(async move {
+        axum::serve(fake_listener, fake_app).await.unwrap();
+    });
+
+    let data_dir = temp_workspace("large-client-image-output");
+    let config = test_config_with_upstream(data_dir.clone(), fake_addr);
+    let store = Store::open(&config.data_dir).await.unwrap();
+    let proxy_state = ProxyState {
+        config: Arc::new(config),
+        client: reqwest::Client::new(),
+        store: store.clone(),
+    };
+    let proxy_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    let proxy_app = Router::new()
+        .route("/v1/responses", post(responses))
+        .layer(DefaultBodyLimit::max(RESPONSES_BODY_LIMIT_BYTES))
+        .with_state(proxy_state);
+    tokio::spawn(async move {
+        axum::serve(proxy_listener, proxy_app).await.unwrap();
+    });
+
+    let large_image = format!("data:image/png;base64,{}", "A".repeat(3 * 1024 * 1024));
+    let response = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/responses"))
+        .json(&json!({
+            "id": "resp_large_client_image_output",
+            "model": "deepseek-v4-pro",
+            "stream": false,
+            "input": [{
+                "type": "function_call_output",
+                "call_id": "call_view_image",
+                "output": [{
+                    "type": "input_image",
+                    "image_url": large_image
+                }]
+            }]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let _body = response.json::<Value>().await.unwrap();
+    let chain = store
+        .response_context_chain("resp_large_client_image_output", 1)
+        .await
+        .expect("chain");
+    let stored = serde_json::to_string(&chain[0].input).expect("stored input json");
+    assert!(!stored.contains("data:image/png;base64"));
+    assert!(!stored.contains(&"A".repeat(128)));
+    assert!(stored.contains("redacted inline data url"));
+
+    let _ = std::fs::remove_dir_all(data_dir);
+}
+
+#[tokio::test]
+async fn non_streaming_proxy_tools_execute_parallel_batch_and_preserve_order() {
+    let chat_state = FakeUpstreamState::default();
+    let chat_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let chat_addr = chat_listener.local_addr().unwrap();
+    let chat_app = Router::new()
+        .route(
+            "/chat/completions",
+            post(fake_parallel_vision_chat_completions),
+        )
+        .with_state(chat_state.clone());
+    tokio::spawn(async move {
+        axum::serve(chat_listener, chat_app).await.unwrap();
+    });
+
+    let vision_state = FakeUpstreamState::default();
+    let vision_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let vision_addr = vision_listener.local_addr().unwrap();
+    let vision_app = Router::new()
+        .route("/v1/responses", post(fake_delayed_vision_responses))
+        .with_state(vision_state.clone());
+    tokio::spawn(async move {
+        axum::serve(vision_listener, vision_app).await.unwrap();
+    });
+
+    let data_dir = temp_workspace("parallel-vision-tools");
+    let config = test_config_with_upstream(data_dir.clone(), chat_addr);
+    write_vision_analyze_config(&config, &format!("http://{vision_addr}/v1/responses"));
+    let store = Store::open(&config.data_dir).await.unwrap();
+    let proxy_state = ProxyState {
+        config: Arc::new(config),
+        client: reqwest::Client::new(),
+        store,
+    };
+    let proxy_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    let proxy_app = Router::new()
+        .route("/v1/responses", post(responses))
+        .with_state(proxy_state);
+    tokio::spawn(async move {
+        axum::serve(proxy_listener, proxy_app).await.unwrap();
+    });
+
+    let started = std::time::Instant::now();
+    let body = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/responses"))
+        .json(&json!({
+            "id": "resp_parallel_vision_tools",
+            "model": "deepseek-v4-pro",
+            "stream": false,
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "inspect two images" }]
+            }]
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap();
+    let elapsed = started.elapsed();
+
+    assert!(
+        elapsed < std::time::Duration::from_millis(850),
+        "tool calls should run concurrently, elapsed={elapsed:?}"
+    );
+    assert!(serde_json::to_string(&body)
+        .unwrap()
+        .contains("parallel vision handled"));
+    assert_eq!(
+        vision_state
+            .requests
+            .lock()
+            .expect("fake vision lock poisoned")
+            .len(),
+        2
+    );
+    let chat_requests = chat_state
+        .requests
+        .lock()
+        .expect("fake upstream lock poisoned")
+        .clone();
+    assert_eq!(chat_requests.len(), 2);
+    let messages = chat_requests[1]["messages"].as_array().unwrap();
+    let assistant_index = messages
+        .iter()
+        .position(|message| message.get("role").and_then(Value::as_str) == Some("assistant"))
+        .expect("assistant tool call message");
+    let ordered_tool_ids = messages[assistant_index + 1..assistant_index + 3]
+        .iter()
+        .map(|message| message.get("tool_call_id").and_then(Value::as_str))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        ordered_tool_ids,
+        vec![Some("call_vision_a"), Some("call_vision_b")]
+    );
+
+    let _ = std::fs::remove_dir_all(data_dir);
+}
+
+#[tokio::test]
+async fn streaming_vision_result_uses_tool_schema_without_system_instruction() {
+    let chat_state = FakeUpstreamState::default();
+    let chat_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let chat_addr = chat_listener.local_addr().unwrap();
+    let chat_app = Router::new()
+        .route(
+            "/chat/completions",
+            post(fake_vision_instruction_streaming_chat_completions),
+        )
+        .with_state(chat_state.clone());
+    tokio::spawn(async move {
+        axum::serve(chat_listener, chat_app).await.unwrap();
+    });
+
+    let vision_state = FakeUpstreamState::default();
+    let vision_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let vision_addr = vision_listener.local_addr().unwrap();
+    let vision_app = Router::new()
+        .route("/v1/responses", post(fake_vision_responses))
+        .with_state(vision_state.clone());
+    tokio::spawn(async move {
+        axum::serve(vision_listener, vision_app).await.unwrap();
+    });
+
+    let data_dir = temp_workspace("vision-instruction-stream");
+    let config = test_config_with_upstream(data_dir.clone(), chat_addr);
+    write_vision_analyze_config(&config, &format!("http://{vision_addr}/v1/responses"));
+    let store = Store::open(&config.data_dir).await.unwrap();
+    let proxy_state = ProxyState {
+        config: Arc::new(config),
+        client: reqwest::Client::new(),
+        store,
+    };
+    let proxy_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    let proxy_app = Router::new()
+        .route("/v1/responses", post(responses))
+        .with_state(proxy_state);
+    tokio::spawn(async move {
+        axum::serve(proxy_listener, proxy_app).await.unwrap();
+    });
+
+    let body = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/responses"))
+        .json(&json!({
+            "id": "resp_vision_instruction_stream",
+            "model": "deepseek-v4-pro",
+            "stream": true,
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "analyze the image" }]
+            }]
+        }))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+
+    assert!(body.contains("VISION EXACT LINE 1"), "{body}");
+    assert!(body.contains("VISION EXACT LINE 2"), "{body}");
+    assert!(body.contains("MODEL CONTINUATION AFTER VISION"), "{body}");
+    let chat_requests = chat_state
+        .requests
+        .lock()
+        .expect("fake upstream lock poisoned")
+        .clone();
+    assert_eq!(
+        chat_requests.len(),
+        2,
+        "vision result should continue through a second streaming chat completion"
+    );
+    assert_vision_tool_result_without_system_instruction(&chat_requests[1], "call_vision_exact");
+    assert_eq!(
+        vision_state
+            .requests
+            .lock()
+            .expect("fake vision lock poisoned")
+            .len(),
+        1
+    );
+
+    let _ = std::fs::remove_dir_all(data_dir);
 }
 
 #[tokio::test]
@@ -2017,6 +3002,81 @@ async fn streaming_apply_patch_returns_native_custom_tool_call() {
         .expect("fake upstream lock poisoned")
         .clone();
     assert_eq!(requests.len(), 1);
+}
+
+#[tokio::test]
+async fn nonstreaming_client_tool_handoff_is_not_user_completed_turn() {
+    let fake_state = FakeUpstreamState::default();
+    let fake_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let fake_addr = fake_listener.local_addr().unwrap();
+    let fake_app = Router::new()
+        .route("/chat/completions", post(fake_apply_patch_chat_completions))
+        .with_state(fake_state.clone());
+    tokio::spawn(async move {
+        axum::serve(fake_listener, fake_app).await.unwrap();
+    });
+
+    let data_dir = temp_workspace("apply-patch-nonstream-handoff");
+    let patch_dir = PathBuf::from("target").join("codeseex-apply-patch-nonstream-test");
+    std::fs::create_dir_all(&patch_dir).expect("create ignored apply_patch test directory");
+    let patch_file = patch_dir.join("hello.txt");
+    let _ = std::fs::remove_file(&patch_file);
+    let config = test_config_with_upstream(data_dir.clone(), fake_addr);
+    let store = Store::open(&config.data_dir).await.unwrap();
+    let proxy_state = ProxyState {
+        config: Arc::new(config),
+        client: reqwest::Client::new(),
+        store: store.clone(),
+    };
+    let proxy_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    let proxy_app = Router::new()
+        .route("/v1/responses", post(responses))
+        .with_state(proxy_state);
+    tokio::spawn(async move {
+        axum::serve(proxy_listener, proxy_app).await.unwrap();
+    });
+
+    let response = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/responses"))
+        .json(&json!({
+            "id": "resp_apply_patch_handoff",
+            "model": "deepseek-v4-pro",
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "patch a file" }]
+            }]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert!(response.status().is_success());
+    let body = response.json::<Value>().await.unwrap();
+    let output = body["output"].as_array().unwrap();
+    assert!(output.iter().any(|item| {
+        item.get("type").and_then(Value::as_str) == Some("custom_tool_call")
+            && item.get("name").and_then(Value::as_str) == Some("apply_patch")
+    }));
+    assert!(
+        !patch_file.exists(),
+        "proxy must not execute native apply_patch"
+    );
+
+    let summary = store.runtime_summary(10).await.expect("runtime summary");
+    assert_eq!(summary.request_count, 0);
+    let (events, _) = store
+        .recent_visible_events(20, None)
+        .await
+        .expect("visible events");
+    assert!(!events
+        .iter()
+        .any(|event| event.event_type == "request_completed"));
+
+    let _ = std::fs::remove_file(&patch_file);
+    let _ = std::fs::remove_dir_all(patch_dir);
+    let _ = std::fs::remove_dir_all(data_dir);
 }
 
 #[tokio::test]

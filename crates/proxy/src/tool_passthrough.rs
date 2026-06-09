@@ -388,7 +388,6 @@ fn is_conflicting_visual_tool(name: &str) -> bool {
             | "create_image"
             | "vision_analyze"
             | "vision_generate"
-            | "visual_search"
     )
 }
 

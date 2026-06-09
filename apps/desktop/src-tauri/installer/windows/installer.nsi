@@ -64,6 +64,7 @@ ${StrLoc}
 !define UNINSTALLERSIGNCOMMAND "{{uninstaller_sign_cmd}}"
 !define ESTIMATEDSIZE "{{estimated_size}}"
 !define STARTMENUFOLDER "{{start_menu_folder}}"
+!define QUITFORUPDATEARG "--quit-for-update"
 
 Var PassiveMode
 Var UpdateMode
@@ -465,6 +466,34 @@ Function RunMainBinary
   nsis_tauri_utils::RunAsUser "$INSTDIR\${MAINBINARYNAME}.exe" ""
 FunctionEnd
 
+Function EnsureExistingCodeSeeXStopped
+  IfFileExists "$INSTDIR\${MAINBINARYNAME}.exe" 0 install_shutdown_done
+  DetailPrint "Stopping running ${PRODUCTNAME}..."
+  nsis_tauri_utils::RunAsUser "$INSTDIR\${MAINBINARYNAME}.exe" "${QUITFORUPDATEARG}"
+  Sleep 500
+  nsExec::ExecToStack 'powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$$t = ''$INSTDIR\${MAINBINARYNAME}.exe''; $$d = (Get-Date).AddSeconds(8); do { $$p = @(Get-Process -Name ''${MAINBINARYNAME}'' -ErrorAction SilentlyContinue | Where-Object { $$_.Path -and $$_.Path -ieq $$t }); if ($$p.Count -eq 0) { exit 0 }; Start-Sleep -Milliseconds 250 } while ((Get-Date) -lt $$d); $$p | Stop-Process -Force; Start-Sleep -Milliseconds 500; $$r = @(Get-Process -Name ''${MAINBINARYNAME}'' -ErrorAction SilentlyContinue | Where-Object { $$_.Path -and $$_.Path -ieq $$t }); if ($$r.Count -eq 0) { exit 0 }; exit 1"'
+  Pop $0
+  Pop $1
+  ${If} $0 != 0
+    DetailPrint "Could not stop the existing ${PRODUCTNAME} process automatically."
+  ${EndIf}
+install_shutdown_done:
+FunctionEnd
+
+Function un.EnsureExistingCodeSeeXStopped
+  IfFileExists "$INSTDIR\${MAINBINARYNAME}.exe" 0 uninstall_shutdown_done
+  DetailPrint "Stopping running ${PRODUCTNAME}..."
+  nsis_tauri_utils::RunAsUser "$INSTDIR\${MAINBINARYNAME}.exe" "${QUITFORUPDATEARG}"
+  Sleep 500
+  nsExec::ExecToStack 'powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$$t = ''$INSTDIR\${MAINBINARYNAME}.exe''; $$d = (Get-Date).AddSeconds(8); do { $$p = @(Get-Process -Name ''${MAINBINARYNAME}'' -ErrorAction SilentlyContinue | Where-Object { $$_.Path -and $$_.Path -ieq $$t }); if ($$p.Count -eq 0) { exit 0 }; Start-Sleep -Milliseconds 250 } while ((Get-Date) -lt $$d); $$p | Stop-Process -Force; Start-Sleep -Milliseconds 500; $$r = @(Get-Process -Name ''${MAINBINARYNAME}'' -ErrorAction SilentlyContinue | Where-Object { $$_.Path -and $$_.Path -ieq $$t }); if ($$r.Count -eq 0) { exit 0 }; exit 1"'
+  Pop $0
+  Pop $1
+  ${If} $0 != 0
+    DetailPrint "Could not stop the existing ${PRODUCTNAME} process automatically."
+  ${EndIf}
+uninstall_shutdown_done:
+FunctionEnd
+
 ; Uninstaller Pages
 ; 1. Confirm uninstall page
 Var DeleteAppDataCheckbox
@@ -694,6 +723,7 @@ Section Install
     !insertmacro NSIS_HOOK_PREINSTALL
   !endif
 
+  Call EnsureExistingCodeSeeXStopped
   !insertmacro CheckIfAppIsRunning "${MAINBINARYNAME}.exe" "${PRODUCTNAME}"
 
   ; Copy main executable
@@ -831,6 +861,7 @@ Section Uninstall
     !insertmacro NSIS_HOOK_PREUNINSTALL
   !endif
 
+  Call un.EnsureExistingCodeSeeXStopped
   !insertmacro CheckIfAppIsRunning "${MAINBINARYNAME}.exe" "${PRODUCTNAME}"
 
   ; Delete the app directory and its content from disk

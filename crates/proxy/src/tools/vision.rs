@@ -2,8 +2,10 @@ use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use codeseex_core::{AppConfig, UserConfig};
 use reqwest::header;
 use serde_json::{json, Map, Value};
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
@@ -11,7 +13,6 @@ use super::permissions::ToolPermissionError;
 use super::ToolExecutionContext;
 
 pub(crate) const ANALYZE_TOOL_NAME: &str = "vision_analyze";
-pub(crate) const LEGACY_ANALYZE_TOOL_NAME: &str = "visual_search";
 pub(crate) const GENERATE_TOOL_NAME: &str = "vision_generate";
 pub(crate) const GENERATE_ALIAS_TOOL_NAME: &str = "image_gen";
 pub(crate) const ANALYZE_URL_KEY: &str = "VISION_ANALYZE_URL";
@@ -20,10 +21,6 @@ pub(crate) const GENERATE_URL_KEY: &str = "VISION_GENERATE_URL";
 pub(crate) const GENERATE_MODEL_KEY: &str = "VISION_GENERATE_MODEL";
 pub(crate) const API_KEY_KEY: &str = "VISION_API_KEY";
 
-const LEGACY_ANALYZE_URL_KEY: &str = "VISUAL_SEARCH_URL";
-const LEGACY_ANALYZE_MODEL_KEY: &str = "VISUAL_SEARCH_MODEL";
-const LEGACY_API_KEY_KEY: &str = "VISUAL_SEARCH_API_KEY";
-
 const MAX_IMAGE_REFERENCES: usize = 4;
 const MAX_IMAGE_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_IMAGE_URL_CHARS: usize = 12 * 1024 * 1024;
@@ -31,6 +28,7 @@ const MAX_PROMPT_CHARS: usize = 4_000;
 const MAX_ERROR_CHARS: usize = 1_200;
 const DEFAULT_GENERATE_SIZE: &str = "1024x1024";
 const MAX_GENERATE_PROMPT_CHARS: usize = 4_000;
+const MAX_GENERATED_IMAGE_SCAN_DEPTH: usize = 8;
 
 #[derive(Debug, Clone)]
 struct VisionAnalyzeConfig {
@@ -58,16 +56,13 @@ enum GenerateEndpointKind {
     Responses,
 }
 
-pub(crate) fn config_keys() -> [&'static str; 8] {
+pub(crate) fn config_keys() -> [&'static str; 5] {
     [
         ANALYZE_URL_KEY,
         ANALYZE_MODEL_KEY,
         GENERATE_URL_KEY,
         GENERATE_MODEL_KEY,
         API_KEY_KEY,
-        LEGACY_ANALYZE_URL_KEY,
-        LEGACY_ANALYZE_MODEL_KEY,
-        LEGACY_API_KEY_KEY,
     ]
 }
 
@@ -82,7 +77,7 @@ pub(crate) fn registry_config_fields(settings: &BTreeMap<String, String>) -> Vec
             "description": "Complete OpenAI-compatible image understanding endpoint. Local image pixels are sent to this endpoint.",
             "placeholderKey": "visionAnalyzeRequestUrlPlaceholder",
             "placeholder": "https://api.example.com/v1/responses",
-            "value": setting_value(settings, ANALYZE_URL_KEY, LEGACY_ANALYZE_URL_KEY)
+            "value": setting_value(settings, ANALYZE_URL_KEY)
         }),
         json!({
             "key": ANALYZE_MODEL_KEY,
@@ -93,7 +88,7 @@ pub(crate) fn registry_config_fields(settings: &BTreeMap<String, String>) -> Vec
             "description": "Model name sent to the visual endpoint.",
             "placeholderKey": "visionAnalyzeModelPlaceholder",
             "placeholder": "gpt-4o-mini",
-            "value": setting_value(settings, ANALYZE_MODEL_KEY, LEGACY_ANALYZE_MODEL_KEY)
+            "value": setting_value(settings, ANALYZE_MODEL_KEY)
         }),
         json!({
             "key": GENERATE_URL_KEY,
@@ -101,7 +96,7 @@ pub(crate) fn registry_config_fields(settings: &BTreeMap<String, String>) -> Vec
             "labelKey": "visionGenerateRequestUrl",
             "label": "Generate request URL",
             "descriptionKey": "visionGenerateRequestUrlHint",
-            "description": "Complete OpenAI-compatible image generation endpoint. Use /responses for GPT image_generation or /images/generations for image models.",
+            "description": "Complete OpenAI-compatible image generation endpoint. Prefer /responses; use /images/generations only for the official image-model API.",
             "placeholderKey": "visionGenerateRequestUrlPlaceholder",
             "placeholder": "https://api.example.com/v1/responses",
             "value": settings.get(GENERATE_URL_KEY).cloned().unwrap_or_default()
@@ -126,21 +121,13 @@ pub(crate) fn registry_config_fields(settings: &BTreeMap<String, String>) -> Vec
             "description": "Bearer token used only by the Vision module.",
             "placeholderKey": "visionApiKeyPlaceholder",
             "placeholder": "sk-...",
-            "value": setting_value(settings, API_KEY_KEY, LEGACY_API_KEY_KEY)
+            "value": setting_value(settings, API_KEY_KEY)
         }),
     ]
 }
 
-fn setting_value(
-    settings: &BTreeMap<String, String>,
-    key: &'static str,
-    legacy_key: &'static str,
-) -> String {
-    settings
-        .get(key)
-        .or_else(|| settings.get(legacy_key))
-        .cloned()
-        .unwrap_or_default()
+fn setting_value(settings: &BTreeMap<String, String>, key: &'static str) -> String {
+    settings.get(key).cloned().unwrap_or_default()
 }
 
 pub(crate) async fn execute(
@@ -181,7 +168,6 @@ pub(crate) async fn execute(
             "message": "vision_analyze requires image_url/image_urls/url/urls/image/images or workspace path/paths. No image references were found in the current request."
         });
     }
-
     let payload = match endpoint_kind {
         VisualEndpointKind::ChatCompletions => {
             chat_completions_payload(&config.model, &prompt, &images)
@@ -214,12 +200,13 @@ pub(crate) async fn execute(
     let status = response.status();
     if !status.is_success() {
         let body = response.text().await.unwrap_or_default();
+        let message = upstream_http_error_message(status, body.trim(), "Vision analyze endpoint");
         return json!({
             "ok": false,
             "tool": ANALYZE_TOOL_NAME,
             "error": "upstream_error",
             "status": status.as_u16(),
-            "message": truncate_chars(body.trim(), MAX_ERROR_CHARS),
+            "message": message,
             "prompt_sent": prompt,
             "prompt_source": prompt_source
         });
@@ -324,12 +311,14 @@ pub(crate) async fn execute_generate(
     let status = response.status();
     if !status.is_success() {
         let body = response.text().await.unwrap_or_default();
+        let message =
+            upstream_http_error_message(status, body.trim(), "Vision generation endpoint");
         return json!({
             "ok": false,
             "tool": tool_name,
             "error": "upstream_error",
             "status": status.as_u16(),
-            "message": truncate_chars(body.trim(), MAX_ERROR_CHARS),
+            "message": message,
             "prompt_sent": prompt
         });
     }
@@ -370,6 +359,7 @@ pub(crate) async fn execute_generate(
         "endpoint_kind": generation_endpoint_kind_name(endpoint_kind),
         "image_count": images.len(),
         "prompt_sent": prompt,
+        "images_markdown": generated_images_markdown(&images),
         "images": images,
         "usage": body.get("usage").cloned().unwrap_or(Value::Null)
     })
@@ -378,9 +368,9 @@ pub(crate) async fn execute_generate(
 impl VisionAnalyzeConfig {
     fn load(app_config: &AppConfig) -> Result<Self, Value> {
         let settings = read_tool_settings(app_config);
-        let request_url = setting_value_opt(&settings, ANALYZE_URL_KEY, LEGACY_ANALYZE_URL_KEY);
-        let model = setting_value_opt(&settings, ANALYZE_MODEL_KEY, LEGACY_ANALYZE_MODEL_KEY);
-        let api_key = setting_value_opt(&settings, API_KEY_KEY, LEGACY_API_KEY_KEY);
+        let request_url = setting_value_opt(&settings, ANALYZE_URL_KEY);
+        let model = setting_value_opt(&settings, ANALYZE_MODEL_KEY);
+        let api_key = setting_value_opt(&settings, API_KEY_KEY);
         let mut missing = Vec::new();
         if request_url.is_none() {
             missing.push(ANALYZE_URL_KEY);
@@ -413,7 +403,7 @@ impl VisionGenerateConfig {
             .get(GENERATE_MODEL_KEY)
             .map(|value| value.trim().to_owned())
             .filter(|value| !value.is_empty());
-        let api_key = setting_value_opt(&settings, API_KEY_KEY, LEGACY_API_KEY_KEY);
+        let api_key = setting_value_opt(&settings, API_KEY_KEY);
         let mut missing = Vec::new();
         if request_url.is_none() {
             missing.push(GENERATE_URL_KEY);
@@ -438,18 +428,13 @@ impl VisionGenerateConfig {
 fn read_tool_settings(app_config: &AppConfig) -> BTreeMap<String, String> {
     UserConfig::read_from(&app_config.config_path())
         .ok()
-        .and_then(|config| config.tools.and_then(|tools| tools.settings))
+        .map(|config| crate::config_payload::tool_settings_from_user_config(&config))
         .unwrap_or_default()
 }
 
-fn setting_value_opt(
-    settings: &BTreeMap<String, String>,
-    key: &'static str,
-    legacy_key: &'static str,
-) -> Option<String> {
+fn setting_value_opt(settings: &BTreeMap<String, String>, key: &'static str) -> Option<String> {
     settings
         .get(key)
-        .or_else(|| settings.get(legacy_key))
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty())
 }
@@ -1149,22 +1134,120 @@ fn extract_generated_images(
     tool_name: &'static str,
 ) -> Result<Vec<Value>, Value> {
     let mut images = Vec::new();
+    let mut seen = HashSet::new();
     if let Some(items) = value.get("data").and_then(Value::as_array) {
         for item in items {
-            push_generated_image(app_config, item, arguments, tool_name, &mut images)?;
+            collect_generated_images(
+                app_config,
+                item,
+                arguments,
+                tool_name,
+                &mut images,
+                &mut seen,
+                true,
+                None,
+                0,
+            )?;
         }
     }
     if let Some(output) = value.get("output").and_then(Value::as_array) {
         for item in output {
-            push_generated_image(app_config, item, arguments, tool_name, &mut images)?;
-            if let Some(content) = item.get("content").and_then(Value::as_array) {
-                for part in content {
-                    push_generated_image(app_config, part, arguments, tool_name, &mut images)?;
-                }
-            }
+            collect_generated_images(
+                app_config,
+                item,
+                arguments,
+                tool_name,
+                &mut images,
+                &mut seen,
+                generated_image_object_context(item),
+                None,
+                0,
+            )?;
         }
     }
     Ok(images)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_generated_images(
+    app_config: &AppConfig,
+    item: &Value,
+    arguments: &Value,
+    tool_name: &'static str,
+    images: &mut Vec<Value>,
+    seen: &mut HashSet<u64>,
+    image_context: bool,
+    revised_prompt: Option<&Value>,
+    depth: usize,
+) -> Result<(), Value> {
+    if depth > MAX_GENERATED_IMAGE_SCAN_DEPTH {
+        return Ok(());
+    }
+    match item {
+        Value::Object(object) => {
+            let current_revised_prompt = item.get("revised_prompt").or(revised_prompt);
+            let current_context = image_context || object_suggests_generated_image(object);
+            if current_context {
+                push_generated_image(
+                    app_config,
+                    item,
+                    arguments,
+                    tool_name,
+                    images,
+                    seen,
+                    current_revised_prompt,
+                )?;
+            }
+            for (key, child) in object {
+                if key == "revised_prompt" {
+                    continue;
+                }
+                let child_context = current_context
+                    || generated_image_field_key(key)
+                    || generated_image_object_context(child);
+                collect_generated_images(
+                    app_config,
+                    child,
+                    arguments,
+                    tool_name,
+                    images,
+                    seen,
+                    child_context,
+                    current_revised_prompt,
+                    depth + 1,
+                )?;
+            }
+        }
+        Value::Array(items) => {
+            for child in items {
+                collect_generated_images(
+                    app_config,
+                    child,
+                    arguments,
+                    tool_name,
+                    images,
+                    seen,
+                    image_context || generated_image_object_context(child),
+                    revised_prompt,
+                    depth + 1,
+                )?;
+            }
+        }
+        Value::String(raw) if image_context => {
+            push_generated_image_string(
+                app_config,
+                raw,
+                arguments,
+                tool_name,
+                images,
+                seen,
+                revised_prompt,
+                false,
+            )?;
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 fn push_generated_image(
@@ -1173,6 +1256,8 @@ fn push_generated_image(
     arguments: &Value,
     tool_name: &'static str,
     images: &mut Vec<Value>,
+    seen: &mut HashSet<u64>,
+    revised_prompt: Option<&Value>,
 ) -> Result<(), Value> {
     if let Some(url) = item
         .get("url")
@@ -1181,19 +1266,15 @@ fn push_generated_image(
         .map(str::trim)
         .filter(|value| !value.is_empty())
     {
-        if url.starts_with("data:image/") {
-            let saved = attach_revised_prompt(
-                save_generated_data_url(app_config, url, arguments, tool_name)?,
-                item.get("revised_prompt"),
-            );
-            images.push(saved);
-        } else {
-            images.push(json!({
-                "type": "url",
-                "url": url,
-                "revised_prompt": item.get("revised_prompt").cloned().unwrap_or(Value::Null)
-            }));
-        }
+        push_generated_url(
+            app_config,
+            url,
+            arguments,
+            tool_name,
+            images,
+            seen,
+            revised_prompt,
+        )?;
     }
     if let Some(url) = item
         .get("image_url")
@@ -1203,22 +1284,207 @@ fn push_generated_image(
         .map(str::trim)
         .filter(|value| !value.is_empty())
     {
+        push_generated_url(
+            app_config,
+            url,
+            arguments,
+            tool_name,
+            images,
+            seen,
+            revised_prompt,
+        )?;
+    }
+    for key in ["b64_json", "base64", "b64", "image_base64", "result"] {
+        if let Some(raw) = item.get(key).and_then(Value::as_str) {
+            push_generated_image_string(
+                app_config,
+                raw,
+                arguments,
+                tool_name,
+                images,
+                seen,
+                revised_prompt,
+                true,
+            )?;
+        }
+    }
+    if let Some(raw) = item.get("data").and_then(Value::as_str) {
+        let strict = object_image_mime(item);
+        push_generated_image_string(
+            app_config,
+            raw,
+            arguments,
+            tool_name,
+            images,
+            seen,
+            revised_prompt,
+            strict,
+        )?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_generated_url(
+    app_config: &AppConfig,
+    url: &str,
+    arguments: &Value,
+    tool_name: &'static str,
+    images: &mut Vec<Value>,
+    seen: &mut HashSet<u64>,
+    revised_prompt: Option<&Value>,
+) -> Result<(), Value> {
+    if !seen.insert(generated_image_fingerprint("url", url)) {
+        return Ok(());
+    }
+    if url.starts_with("data:image/") {
+        let saved = attach_revised_prompt(
+            save_generated_data_url(app_config, url, arguments, tool_name)?,
+            revised_prompt,
+        );
+        images.push(saved);
+    } else {
         images.push(json!({
             "type": "url",
             "url": url,
-            "revised_prompt": item.get("revised_prompt").cloned().unwrap_or(Value::Null)
+            "revised_prompt": revised_prompt.cloned().unwrap_or(Value::Null)
         }));
     }
-    for key in ["b64_json", "base64", "result"] {
-        if let Some(raw) = item.get(key).and_then(Value::as_str) {
-            let saved = attach_revised_prompt(
-                save_generated_base64(app_config, raw, arguments, tool_name)?,
-                item.get("revised_prompt"),
-            );
-            images.push(saved);
-        }
-    }
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_generated_image_string(
+    app_config: &AppConfig,
+    raw: &str,
+    arguments: &Value,
+    tool_name: &'static str,
+    images: &mut Vec<Value>,
+    seen: &mut HashSet<u64>,
+    revised_prompt: Option<&Value>,
+    strict_base64: bool,
+) -> Result<(), Value> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(());
+    }
+    if raw.starts_with("data:image/") {
+        if !seen.insert(generated_image_fingerprint("data_url", raw)) {
+            return Ok(());
+        }
+        let saved = attach_revised_prompt(
+            save_generated_data_url(app_config, raw, arguments, tool_name)?,
+            revised_prompt,
+        );
+        images.push(saved);
+        return Ok(());
+    }
+    if !strict_base64 && !looks_like_base64_image(raw) {
+        return Ok(());
+    }
+    if !seen.insert(generated_image_fingerprint("base64", raw)) {
+        return Ok(());
+    }
+    let saved = attach_revised_prompt(
+        save_generated_base64(app_config, raw, arguments, tool_name)?,
+        revised_prompt,
+    );
+    images.push(saved);
+    Ok(())
+}
+
+fn generated_image_object_context(value: &Value) -> bool {
+    value
+        .as_object()
+        .map(object_suggests_generated_image)
+        .unwrap_or(false)
+}
+
+fn object_suggests_generated_image(object: &Map<String, Value>) -> bool {
+    object_image_mime(&Value::Object(object.clone()))
+        || object
+            .get("type")
+            .or_else(|| object.get("kind"))
+            .or_else(|| object.get("name"))
+            .and_then(Value::as_str)
+            .map(|value| value.to_ascii_lowercase().contains("image"))
+            .unwrap_or(false)
+        || [
+            "b64_json",
+            "base64",
+            "image_base64",
+            "image_url",
+            "image",
+            "file_id",
+        ]
+        .iter()
+        .any(|key| object.contains_key(*key))
+}
+
+fn object_image_mime(value: &Value) -> bool {
+    value
+        .as_object()
+        .and_then(|object| {
+            object
+                .get("mime_type")
+                .or_else(|| object.get("media_type"))
+                .or_else(|| object.get("mime"))
+        })
+        .and_then(Value::as_str)
+        .map(|value| value.starts_with("image/"))
+        .unwrap_or(false)
+}
+
+fn generated_image_field_key(key: &str) -> bool {
+    matches!(
+        key,
+        "image"
+            | "images"
+            | "image_url"
+            | "output_image"
+            | "generated_image"
+            | "source"
+            | "result"
+            | "data"
+            | "b64_json"
+            | "base64"
+            | "image_base64"
+    )
+}
+
+fn looks_like_base64_image(raw: &str) -> bool {
+    let Ok(bytes) = BASE64_STANDARD.decode(raw.trim()) else {
+        return false;
+    };
+    image_mime_from_bytes(&bytes).is_some()
+}
+
+fn generated_image_fingerprint(kind: &str, raw: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    kind.hash(&mut hasher);
+    raw.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn generated_images_markdown(images: &[Value]) -> String {
+    images
+        .iter()
+        .filter_map(generated_image_markdown)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn generated_image_markdown(image: &Value) -> Option<String> {
+    if let Some(markdown) = image.get("markdown").and_then(Value::as_str) {
+        return Some(markdown.to_owned());
+    }
+    if let Some(url) = image.get("url").and_then(Value::as_str) {
+        return Some(format!("![generated image]({url})"));
+    }
+    image
+        .get("path")
+        .and_then(Value::as_str)
+        .map(|path| format!("![generated image]({})", path.replace('\\', "/")))
 }
 
 fn attach_revised_prompt(mut value: Value, revised_prompt: Option<&Value>) -> Value {
@@ -1389,6 +1655,17 @@ fn request_error_message(error: &reqwest::Error) -> String {
     message
 }
 
+fn upstream_http_error_message(
+    status: reqwest::StatusCode,
+    body: &str,
+    endpoint_label: &str,
+) -> String {
+    if body.trim().is_empty() {
+        return format!("{endpoint_label} returned HTTP {}", status.as_u16());
+    }
+    truncate_chars(body.trim(), MAX_ERROR_CHARS)
+}
+
 fn truncate_chars(value: &str, max: usize) -> String {
     if value.chars().count() <= max {
         return value.to_owned();
@@ -1479,6 +1756,17 @@ mod tests {
             generation_endpoint("https://api.example.com/codex").expect_err("base url rejected");
         assert!(error.contains("/responses"));
         assert!(error.contains("/images/generations"));
+    }
+
+    #[test]
+    fn upstream_http_error_message_falls_back_when_body_is_empty() {
+        let message = upstream_http_error_message(
+            reqwest::StatusCode::BAD_GATEWAY,
+            "   ",
+            "Vision generation endpoint",
+        );
+
+        assert_eq!(message, "Vision generation endpoint returned HTTP 502");
     }
 
     #[test]
@@ -1733,6 +2021,69 @@ mod tests {
         let _ = fs::remove_dir_all(data_dir);
     }
 
+    #[test]
+    fn extracts_nested_responses_generated_image_shapes() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "codeseex-vision-nested-generated-{}",
+            Uuid::new_v4().simple()
+        ));
+        let mut config = AppConfig::default();
+        config.data_dir = data_dir.clone();
+        let image_a = BASE64_STANDARD.encode(b"\x89PNG\r\n\x1a\nnested-a");
+        let image_b = BASE64_STANDARD.encode(b"\x89PNG\r\n\x1a\nnested-b");
+
+        let images = extract_generated_images(
+            &config,
+            &json!({
+                "output": [
+                    {
+                        "type": "message",
+                        "content": [{
+                            "type": "output_image",
+                            "image": {
+                                "b64_json": image_a,
+                                "revised_prompt": "Nested prompt A"
+                            }
+                        }]
+                    },
+                    {
+                        "type": "image_generation_call",
+                        "revised_prompt": "Nested prompt B",
+                        "result": {
+                            "media_type": "image/png",
+                            "data": image_b
+                        }
+                    }
+                ]
+            }),
+            &json!({}),
+            GENERATE_ALIAS_TOOL_NAME,
+        )
+        .expect("nested generated images");
+
+        assert_eq!(images.len(), 2);
+        for image in &images {
+            let path = image
+                .get("path")
+                .and_then(Value::as_str)
+                .expect("generated image path");
+            assert!(Path::new(path).exists());
+            assert_eq!(image.get("type").and_then(Value::as_str), Some("file"));
+        }
+        assert_eq!(
+            images[0].get("revised_prompt").and_then(Value::as_str),
+            Some("Nested prompt A")
+        );
+        assert_eq!(
+            images[1].get("revised_prompt").and_then(Value::as_str),
+            Some("Nested prompt B")
+        );
+        let serialized = serde_json::to_string(&images).expect("images json");
+        assert!(!serialized.contains("nested-a"));
+        assert!(!serialized.contains("base64"));
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
     #[tokio::test]
     async fn execute_image_gen_saves_fake_upstream_base64_without_returning_it() {
         let fake_state = FakeVisionState::default();
@@ -1785,10 +2136,17 @@ mod tests {
             Some(prompt)
         );
         let serialized = serde_json::to_string(&result).expect("result json");
+        assert!(!serialized.contains("model_instruction"));
         assert!(!serialized.contains("iVBOR"));
         assert!(!serialized.contains("b64_json"));
-        assert!(!serialized.contains("base64"));
         assert!(serialized.contains("generated-images"));
+        let images_markdown = result
+            .get("images_markdown")
+            .and_then(Value::as_str)
+            .expect("images markdown");
+        assert!(images_markdown.starts_with("![generated image]("));
+        assert!(!images_markdown.contains("base64"));
+        assert!(!images_markdown.contains("iVBOR"));
         let path = result
             .pointer("/images/0/path")
             .and_then(Value::as_str)

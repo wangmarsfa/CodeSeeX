@@ -71,14 +71,6 @@ fn vision_module_exposes_native_image_gen_definition() {
 }
 
 #[test]
-fn legacy_visual_search_enabled_id_exposes_vision_analyze() {
-    let definitions = upstream_tool_definitions(&["visual_search".to_owned()]);
-    assert!(definitions.iter().any(|definition| {
-        definition.pointer("/function/name").and_then(Value::as_str) == Some("vision_analyze")
-    }));
-}
-
-#[test]
 fn apply_patch_definition_requires_paths_in_operation_headers() {
     let definitions = upstream_tool_definitions(&[]);
     let apply_patch = definitions
@@ -115,10 +107,6 @@ fn executable_tool_checks_enabled_allowlist() {
     assert!(is_executable_tool_enabled(
         "image_gen",
         &["vision_analyze".to_owned()]
-    ));
-    assert!(is_executable_tool_enabled(
-        "visual_search",
-        &["visual_search".to_owned()]
     ));
     assert!(!is_executable_tool_enabled("read_file_range", &enabled));
 }

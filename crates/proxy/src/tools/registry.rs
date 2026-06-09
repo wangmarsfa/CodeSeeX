@@ -99,7 +99,7 @@ pub(crate) fn tool_registry(
             "id": "vision_analyze",
             "name": "Vision",
             "nameKey": "toolVisionName",
-            "description": "Analyze images and generate new images with your configured OpenAI-compatible vision endpoints.",
+            "description": "Analyze images and generate images with configured OpenAI-compatible endpoints. Use /responses by default.",
             "descriptionKey": "toolVisionDescription",
             "source": "builtin",
             "system": false,
@@ -131,7 +131,7 @@ pub(crate) fn enabled_tool_ids(config: &AppConfig) -> Vec<String> {
 pub(crate) fn tool_settings(config: &AppConfig) -> BTreeMap<String, String> {
     UserConfig::read_from(&config.config_path())
         .ok()
-        .and_then(|user_config| user_config.tools.and_then(|tools| tools.settings))
+        .map(|user_config| crate::config_payload::tool_settings_from_user_config(&user_config))
         .unwrap_or_default()
 }
 
@@ -192,8 +192,8 @@ fn builtin_tool_enabled(enabled_tools: &[String], id: &str) -> bool {
 
 fn canonical_builtin_tool_id(id: &str) -> &str {
     match id {
-        "visual_search" | "vision_generate" | "image_gen" | "imagegen" | "image_generation"
-        | "generate_image" | "image_generate" | "create_image" => "vision_analyze",
+        "vision_generate" | "image_gen" | "imagegen" | "image_generation" | "generate_image"
+        | "image_generate" | "create_image" => "vision_analyze",
         _ => id,
     }
 }

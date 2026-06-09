@@ -379,6 +379,9 @@ impl Store {
         let Some(request) = inner.requests.get_mut(id) else {
             bail!("request '{id}' was not found while finishing request");
         };
+        if request.status == RequestStatus::Interrupted {
+            return Ok(());
+        }
         request.status = status;
         if let Some(response) = response {
             request.response = memory_json_value(response);
@@ -692,10 +695,12 @@ fn is_diagnostic_event_type(event_type: &str) -> bool {
             | "context_response_diagnostic"
             | "log_maintenance_completed"
             | "manager_action"
+            | "manager_config_saved"
             | "mixed_tool_turn_split"
             | "models_requested"
             | "process_stderr"
             | "process_stdout"
+            | "request_shape_diagnostic"
             | "tool_lifecycle"
             | "tool_exposure_diagnostic"
             | "tool_loop_iteration"
@@ -787,6 +792,34 @@ fn compact_event_detail(event_type: &str, detail: &Value) -> Option<Value> {
                 "mode",
                 "estimated_tokens",
                 "threshold_tokens",
+            ],
+        ),
+        "request_shape_diagnostic" => copy_log_fields(
+            object,
+            &mut output,
+            &[
+                "id",
+                "endpoint",
+                "requested_model",
+                "model",
+                "model_route_hint",
+                "lightweight_auxiliary",
+                "has_previous_response_id",
+                "has_instructions",
+                "has_context_management",
+                "input_items",
+                "input_kind",
+                "estimated_text_chars",
+                "tools_count",
+                "max_output_tokens",
+                "reasoning_effort",
+                "text_format",
+                "store",
+                "metadata_keys",
+                "client_metadata",
+                "prompt_cache_key",
+                "has_title_task_signal",
+                "has_suggestion_task_signal",
             ],
         ),
         _ => copy_log_fields(
@@ -931,7 +964,7 @@ fn completed_turns(inner: &StoreInner) -> Vec<RequestTurn> {
         .request_order
         .iter()
         .filter_map(|id| inner.requests.get(id))
-        .filter(|request| request.status == RequestStatus::Completed)
+        .filter(|request| request_is_completed_final_turn(request))
         .filter_map(turn_from_request)
         .collect::<Vec<_>>();
     if turns.len() > MAX_RUNTIME_TURNS {
@@ -952,7 +985,7 @@ fn runtime_summary_from_inner(
     let request_count = inner
         .requests
         .values()
-        .filter(|request| request.status == RequestStatus::Completed)
+        .filter(|request| request_is_completed_final_turn(request))
         .count() as u64;
     let failed_request_count = inner
         .requests
@@ -993,6 +1026,19 @@ fn runtime_summary_from_inner(
         total_output_tokens,
         average_ms,
     }
+}
+
+fn request_is_completed_final_turn(request: &StoredRequest) -> bool {
+    request.status == RequestStatus::Completed && !request_is_client_tool_handoff(request)
+}
+
+fn request_is_client_tool_handoff(request: &StoredRequest) -> bool {
+    request
+        .diagnostic
+        .as_ref()
+        .and_then(|diagnostic| diagnostic.get("codeseex_lifecycle"))
+        .and_then(Value::as_str)
+        == Some("client_tool_handoff")
 }
 
 fn turn_from_request(request: &StoredRequest) -> Option<RequestTurn> {
@@ -1383,6 +1429,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn runtime_summary_excludes_client_tool_handoff_responses() {
+        let dir = temp_dir("client-tool-handoff-runtime");
+        let store = Store::open(&dir).await.expect("open store");
+        store
+            .checkpoint_request(
+                "resp_handoff",
+                None,
+                Some("deepseek-v4-pro"),
+                &json!({ "model": "deepseek-v4-pro", "input": "use a client tool" }),
+            )
+            .await
+            .expect("checkpoint handoff");
+        store
+            .finish_request(
+                "resp_handoff",
+                RequestStatus::Completed,
+                Some(&json!({
+                    "model": "deepseek-v4-pro",
+                    "usage": { "input_tokens": 5, "output_tokens": 1, "total_tokens": 6 }
+                })),
+                Some(&json!({ "codeseex_lifecycle": "client_tool_handoff" })),
+            )
+            .await
+            .expect("finish handoff");
+
+        let chain = store
+            .response_context_chain("resp_handoff", 1)
+            .await
+            .expect("handoff response remains usable as Codex context");
+        assert_eq!(chain.len(), 1);
+
+        let summary = store.runtime_summary(10).await.expect("summary");
+        assert_eq!(summary.request_count, 0);
+        assert!(summary.last_turn.is_none());
+        assert!(summary.turn_history.is_empty());
+        assert_eq!(summary.total_output_tokens, 0);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn finish_request_does_not_overwrite_interrupted_status() {
+        let dir = temp_dir("finish-interrupted");
+        let store = Store::open(&dir).await.expect("open store");
+        store
+            .checkpoint_request("resp_cancelled", None, Some("deepseek-v4-pro"), &json!({}))
+            .await
+            .expect("checkpoint");
+        store
+            .interrupt_request_if_in_progress("resp_cancelled", "client cancelled")
+            .await
+            .expect("interrupt");
+
+        store
+            .finish_request(
+                "resp_cancelled",
+                RequestStatus::Completed,
+                Some(&json!({ "status": "completed" })),
+                None,
+            )
+            .await
+            .expect("finish ignored");
+
+        assert_eq!(
+            store
+                .response_status("resp_cancelled")
+                .await
+                .expect("status"),
+            Some(RequestStatus::Interrupted)
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
     async fn events_are_written_to_logs_and_redacted() {
         let dir = temp_dir("logs");
         let store = Store::open(&dir).await.expect("open store");
@@ -1430,6 +1550,15 @@ mod tests {
             )
             .await
             .expect("record diagnostic event");
+        store
+            .record_event(
+                "info",
+                "manager_config_saved",
+                "Configuration saved.",
+                Some(&json!({ "path": "/tmp/config.toml" })),
+            )
+            .await
+            .expect("record config diagnostic event");
         store
             .record_event(
                 "info",

@@ -72,7 +72,7 @@ pub async fn execute_tool_with_client(
         };
         return web::execute(client, config.network_proxy, &args, messages).await;
     }
-    if name == vision::ANALYZE_TOOL_NAME || name == vision::LEGACY_ANALYZE_TOOL_NAME {
+    if name == vision::ANALYZE_TOOL_NAME {
         let args = match parse_arguments(arguments) {
             Ok(value) => value,
             Err(error) => return error,

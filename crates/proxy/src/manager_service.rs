@@ -12,6 +12,7 @@ use codeseex_store::Store;
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::env;
+use std::fs;
 use std::sync::Arc;
 
 #[derive(Debug, Clone)]
@@ -194,11 +195,8 @@ impl ManagerRuntime {
             "BILLING_PRO_OUTPUT_CNY": billing.and_then(|value| value.pro_output_cny).unwrap_or(6.0).to_string(),
             "ENABLED_TOOLS": tools.and_then(|value| value.enabled.as_deref()).map(canonical_enabled_tool_ids).map(Value::from).unwrap_or(Value::Null)
         });
-        if let Some(settings) = user_config
-            .tools
-            .as_ref()
-            .and_then(|tools| tools.settings.as_ref())
-        {
+        let settings = crate::config_payload::tool_settings_from_user_config(&user_config);
+        if !settings.is_empty() {
             if let Some(object) = payload.as_object_mut() {
                 let mut tool_config_keys = crate::tools::registry::builtin_tool_config_keys();
                 tool_config_keys.extend(crate::community_tools::community_tool_config_keys(
@@ -209,24 +207,6 @@ impl ManagerRuntime {
                         object.insert(key, Value::String(value.clone()));
                     }
                 }
-                insert_tool_setting_alias(
-                    object,
-                    settings,
-                    "VISION_ANALYZE_URL",
-                    "VISUAL_SEARCH_URL",
-                );
-                insert_tool_setting_alias(
-                    object,
-                    settings,
-                    "VISION_ANALYZE_MODEL",
-                    "VISUAL_SEARCH_MODEL",
-                );
-                insert_tool_setting_alias(
-                    object,
-                    settings,
-                    "VISION_API_KEY",
-                    "VISUAL_SEARCH_API_KEY",
-                );
             }
         }
         payload
@@ -519,11 +499,27 @@ impl ManagerRuntime {
 }
 
 pub fn ensure_catalog(config: &AppConfig) -> anyhow::Result<()> {
-    if catalog_file_is_compatible(&config.catalog_path()) {
+    let catalog = build_codeseex_catalog();
+    if catalog_file_matches_current(&config.catalog_path(), &catalog) {
         return Ok(());
     }
-    let catalog = build_codeseex_catalog();
     write_catalog_atomic(&config.catalog_path(), &catalog)
+}
+
+fn catalog_file_matches_current(
+    path: &std::path::Path,
+    catalog: &codeseex_core::catalog::Catalog,
+) -> bool {
+    let Ok(existing) = fs::read_to_string(path) else {
+        return false;
+    };
+    if !catalog_file_is_compatible(path) {
+        return false;
+    }
+    let Ok(expected) = serde_json::to_string_pretty(catalog).map(|text| text + "\n") else {
+        return false;
+    };
+    existing == expected
 }
 
 fn ok(body: Value) -> ManagerJsonResponse {
@@ -551,25 +547,11 @@ fn network_proxy_to_ui(value: codeseex_core::NetworkProxyMode) -> &'static str {
     }
 }
 
-fn insert_tool_setting_alias(
-    object: &mut serde_json::Map<String, Value>,
-    settings: &std::collections::BTreeMap<String, String>,
-    key: &str,
-    legacy_key: &str,
-) {
-    if object.contains_key(key) {
-        return;
-    }
-    if let Some(value) = settings.get(legacy_key) {
-        object.insert(key.to_owned(), Value::String(value.clone()));
-    }
-}
-
 fn canonical_enabled_tool_ids(ids: &[String]) -> Vec<String> {
     let mut output = Vec::new();
     for id in ids {
         let canonical = match id.as_str() {
-            "visual_search" | "vision_generate" | "image_gen" | "imagegen" | "image_generation"
+            "vision_generate" | "image_gen" | "imagegen" | "image_generation"
             | "generate_image" | "image_generate" | "create_image" => "vision_analyze",
             _ => id.as_str(),
         };
@@ -683,6 +665,33 @@ mod tests {
         let _ = std::fs::remove_dir_all(config.data_dir);
     }
 
+    #[test]
+    fn ensure_catalog_rewrites_compatible_but_stale_catalog() {
+        let config = temp_config("stale-embedded-catalog");
+
+        ensure_catalog(&config).expect("ensure embedded catalog");
+        let mut stale =
+            serde_json::from_str::<Value>(&std::fs::read_to_string(config.catalog_path()).unwrap())
+                .expect("catalog json");
+        stale["_codeseex_stale_marker"] = json!(true);
+        std::fs::write(
+            config.catalog_path(),
+            serde_json::to_string_pretty(&stale).unwrap() + "\n",
+        )
+        .expect("write stale catalog");
+        assert!(catalog_file_is_compatible(&config.catalog_path()));
+
+        ensure_catalog(&config).expect("refresh stale catalog");
+
+        let refreshed = std::fs::read_to_string(config.catalog_path()).unwrap();
+        assert!(!refreshed.contains("_codeseex_stale_marker"));
+        assert!(catalog_file_matches_current(
+            &config.catalog_path(),
+            &build_codeseex_catalog()
+        ));
+        let _ = std::fs::remove_dir_all(config.data_dir);
+    }
+
     #[tokio::test]
     async fn adapter_reports_builtin_catalog_for_legacy_modes() {
         let config = temp_config("builtin-catalog-mode");
@@ -761,26 +770,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn config_payload_maps_legacy_visual_search_settings_to_vision_fields() {
-        let config = temp_config("legacy-vision-config");
-        let mut settings = std::collections::BTreeMap::new();
-        settings.insert(
-            "VISUAL_SEARCH_URL".to_owned(),
-            "https://vision.example.com/v1".to_owned(),
-        );
-        settings.insert("VISUAL_SEARCH_MODEL".to_owned(), "vision-model".to_owned());
-        settings.insert("VISUAL_SEARCH_API_KEY".to_owned(), "secret-key".to_owned());
+    async fn config_payload_maps_vision_tool_section_to_ui_fields() {
+        let config = temp_config("vision-config");
         let user_config = UserConfig {
             tools: Some(codeseex_core::UserToolsConfig {
-                enabled: Some(vec!["visual_search".to_owned()]),
-                settings: Some(settings),
+                enabled: Some(vec!["vision_analyze".to_owned()]),
+                vision_analyze: Some(codeseex_core::UserVisionToolConfig {
+                    analyze_url: Some("https://vision.example.com/v1".to_owned()),
+                    analyze_model: Some("vision-model".to_owned()),
+                    api_key: Some("secret-key".to_owned()),
+                    ..Default::default()
+                }),
                 ..Default::default()
             }),
             ..UserConfig::default()
         };
         user_config
             .write_atomic(&config.config_path())
-            .expect("write legacy vision config");
+            .expect("write vision config");
         let runtime = ManagerRuntime::open(config.clone())
             .await
             .expect("open manager runtime");

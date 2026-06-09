@@ -63,7 +63,7 @@ async fn balance(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Resp
         .to_owned();
     let request = json!({
         "path": "/user/balance",
-        "authorization": authorization
+        "authorization": redact_secret_text(&authorization)
     });
     if let Err(error) = write_json(&state.balance_file, &request) {
         return error_response(
@@ -100,7 +100,7 @@ async fn chat_completions(
         &state.payload_file,
         &json!({
             "path": uri.path(),
-            "body": parsed
+            "body": redact_value(&parsed)
         }),
     ) {
         return error_response(
@@ -589,6 +589,46 @@ fn error_response(
 
 fn write_json(path: &PathBuf, value: &Value) -> std::io::Result<()> {
     std::fs::write(path, value.to_string())
+}
+
+fn redact_value(value: &Value) -> Value {
+    match value {
+        Value::String(value) => Value::String(redact_secret_text(value)),
+        Value::Array(values) => Value::Array(values.iter().map(redact_value).collect()),
+        Value::Object(object) => Value::Object(
+            object
+                .iter()
+                .map(|(key, value)| {
+                    if sensitive_key(key) {
+                        (key.clone(), Value::String("[redacted]".to_owned()))
+                    } else {
+                        (key.clone(), redact_value(value))
+                    }
+                })
+                .collect(),
+        ),
+        _ => value.clone(),
+    }
+}
+
+fn sensitive_key(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    key.contains("authorization")
+        || key.contains("api_key")
+        || key.contains("apikey")
+        || key.contains("access_token")
+        || key.contains("secret")
+        || key.contains("password")
+}
+
+fn redact_secret_text(value: &str) -> String {
+    if value.to_ascii_lowercase().contains("data:") && value.contains(";base64,") {
+        return "[redacted inline data url]".to_owned();
+    }
+    if value.to_ascii_lowercase().starts_with("bearer ") {
+        return "Bearer [redacted]".to_owned();
+    }
+    value.to_owned()
 }
 
 fn now_seconds() -> u64 {

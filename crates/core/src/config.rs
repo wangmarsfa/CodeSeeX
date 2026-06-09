@@ -98,12 +98,22 @@ pub struct UserBillingConfig {
 pub struct UserToolsConfig {
     pub enabled: Option<Vec<String>>,
     pub web_search: Option<UserWebSearchToolConfig>,
+    pub vision_analyze: Option<UserVisionToolConfig>,
     pub settings: Option<BTreeMap<String, String>>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct UserWebSearchToolConfig {
     pub proxy: Option<NetworkProxyMode>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UserVisionToolConfig {
+    pub analyze_url: Option<String>,
+    pub analyze_model: Option<String>,
+    pub generate_url: Option<String>,
+    pub generate_model: Option<String>,
+    pub api_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

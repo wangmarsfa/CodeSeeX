@@ -1,3 +1,4 @@
+use codeseex_core::context::redact_inline_data_urls;
 use serde_json::{json, Value};
 use std::collections::HashSet;
 use uuid::Uuid;
@@ -112,7 +113,7 @@ fn proxy_tool_call_response_item_from_chat_call(call: &ChatToolCall) -> Value {
         "status": "completed",
         "call_id": call.id,
         "name": call.name,
-        "arguments": call.arguments
+        "arguments": redact_inline_data_urls(&call.arguments)
     })
 }
 
@@ -380,5 +381,18 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0]["type"], "proxy_tool_call");
         assert_eq!(items[0]["name"], "list_directory");
+    }
+
+    #[test]
+    fn proxy_tool_call_arguments_redact_inline_image_data_urls() {
+        let items = proxy_visible_response_items(&[call(
+            "call_vision",
+            "vision_analyze",
+            r#"{"image":"data:image/png;base64,AAAASECRETBBBB","prompt":"inspect"}"#,
+        )]);
+
+        let arguments = items[0]["arguments"].as_str().unwrap();
+        assert!(arguments.contains("inline-data-url omitted"));
+        assert!(!arguments.contains("AAAASECRETBBBB"));
     }
 }

@@ -3,6 +3,11 @@ use crate::tools::ownership::ChatToolCall;
 use codeseex_core::context::redact_inline_data_urls;
 use serde_json::Value;
 
+pub(crate) struct ExecutedCodeTool {
+    pub(crate) call: ChatToolCall,
+    pub(crate) result: Value,
+}
+
 pub(crate) fn is_code_tool_executable(
     name: &str,
     enabled_tools: &[String],
@@ -33,6 +38,31 @@ pub(crate) async fn execute_code_tool(
         &call.name,
         &call.arguments,
     )
+    .await
+}
+
+pub(crate) async fn execute_code_tools_concurrently(
+    client: &reqwest::Client,
+    config: &codeseex_core::AppConfig,
+    tool_context: &crate::tools::ToolExecutionContext,
+    messages: &[Value],
+    current_image_refs: &[String],
+    community_tools: &crate::community_tools::CommunityToolSet,
+    calls: &[ChatToolCall],
+) -> Vec<ExecutedCodeTool> {
+    futures_util::future::join_all(calls.iter().cloned().map(|call| async move {
+        let result = execute_code_tool(
+            client,
+            config,
+            tool_context,
+            messages,
+            current_image_refs,
+            community_tools,
+            &call,
+        )
+        .await;
+        ExecutedCodeTool { call, result }
+    }))
     .await
 }
 
@@ -111,6 +141,8 @@ fn failed_tool_summary(result: &Value) -> String {
     let message = result
         .get("message")
         .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
         .map(|value| format!(" - {}", compact_line(value, 180)))
         .unwrap_or_default();
     format!("{tool} failed: {error}{message}")
@@ -201,5 +233,17 @@ mod tests {
             summary,
             "vision_analyze failed: upstream_error - HTTP 502 from provider"
         );
+    }
+
+    #[test]
+    fn log_summary_for_failure_omits_empty_message() {
+        let summary = summarize_tool_result_for_log(&json!({
+            "ok": false,
+            "tool": "image_gen",
+            "error": "upstream_error",
+            "message": ""
+        }));
+
+        assert_eq!(summary, "image_gen failed: upstream_error");
     }
 }

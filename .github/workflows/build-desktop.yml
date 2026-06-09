@@ -20,6 +20,18 @@ jobs:
       - name: Check out source
         uses: actions/checkout@v4
 
+      - name: Restore model catalog seed
+        shell: bash
+        env:
+          CODESEEX_MODEL_CATALOG_SEED_JSON: ${{ secrets.CODESEEX_MODEL_CATALOG_SEED_JSON }}
+        run: |
+          if [ -z "$CODESEEX_MODEL_CATALOG_SEED_JSON" ]; then
+            echo "Missing CODESEEX_MODEL_CATALOG_SEED_JSON secret."
+            exit 1
+          fi
+          mkdir -p .private
+          printf '%s\n' "$CODESEEX_MODEL_CATALOG_SEED_JSON" > .private/model-catalog.seed.json
+
       - name: Install Linux desktop dependencies
         run: |
           sudo apt-get update
@@ -77,6 +89,18 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@v4
+
+      - name: Restore model catalog seed
+        shell: bash
+        env:
+          CODESEEX_MODEL_CATALOG_SEED_JSON: ${{ secrets.CODESEEX_MODEL_CATALOG_SEED_JSON }}
+        run: |
+          if [ -z "$CODESEEX_MODEL_CATALOG_SEED_JSON" ]; then
+            echo "Missing CODESEEX_MODEL_CATALOG_SEED_JSON secret."
+            exit 1
+          fi
+          mkdir -p .private
+          printf '%s\n' "$CODESEEX_MODEL_CATALOG_SEED_JSON" > .private/model-catalog.seed.json
 
       - name: Install Linux desktop dependencies
         if: runner.os == 'Linux'
