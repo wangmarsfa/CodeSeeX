@@ -107,10 +107,17 @@ fn desktop_refresh_tray(app: AppHandle) -> Result<(), String> {
 #[tauri::command]
 fn desktop_open_external(url: String) -> Result<(), String> {
     let url = url.trim();
-    if !(url.starts_with("https://") || url.starts_with("http://")) {
-        return Err("only http and https links can be opened externally".to_owned());
+    if !allowed_external_url(url) {
+        return Err("only http, https, and ccswitch links can be opened externally".to_owned());
     }
     open_external_url(url)
+}
+
+fn allowed_external_url(url: &str) -> bool {
+    let lower = url.to_ascii_lowercase();
+    lower.starts_with("https://")
+        || lower.starts_with("http://")
+        || lower.starts_with("ccswitch://")
 }
 
 #[tauri::command]

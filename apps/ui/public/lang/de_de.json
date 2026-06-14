@@ -57,6 +57,14 @@
   "configTabProxy": "Proxy",
   "configTabTools": "Werkzeuge",
   "configTomlTitle": "config.toml-Konfiguration",
+  "importToCcs": "In CCS importieren",
+  "ccsImportStarted": "CCS-Import geoeffnet.",
+  "ccsImportFailed": "CCS-Import fehlgeschlagen.",
+  "ccsApiKeyTitle": "API-Key fuer CCS-Import",
+  "ccsApiKeyHint": "Geben Sie den echten API-Key ein, den CCS fuer diesen Import verlangt. CodeSeeX nutzt ihn nur fuer diesen Deep Link und speichert ihn nicht.",
+  "ccsApiKeyPlaceholder": "API-Key",
+  "cancel": "Abbrechen",
+  "troubleshoot": "Fehlerbehebung",
   "contextCopy": "Kopieren",
   "contextSelectAll": "Alles auswählen",
   "copied": "Kopiert.",
@@ -150,7 +158,7 @@
   "runtimeEvent": "Laufzeitereignis.",
   "runtimeStats": "Laufzeitstatistiken",
   "showThinking": "Denkprozess anzeigen",
-  "sidebarFooter": "Inoffizielles Tool nur zum Lernen und Forschen.\nBitte Codex- und DeepSeek-Bedingungen beachten.",
+  "sidebarFooter": "Powered by TasteSteak / 牛排吖",
   "source": "Quellcode ansehen",
   "sourceUnavailable": "Keine Quellcode-URL in dieser Version konfiguriert.",
   "start": "Starten",
@@ -279,5 +287,8 @@
   "usageStageOutputHint": "Tokens returned by the model in the final response.",
   "usageStageTotal": "Total",
   "usageStageTotalHint": "Estimated cost: {cost}.",
-  "logCleanHint": "Only key user-level runtime events are expanded here; usage detail belongs in Usage."
+  "logCleanHint": "Only key user-level runtime events are expanded here; usage detail belongs in Usage.",
+  "aboutProductSubtitle": "Codex-Brücke",
+  "aboutProductDescription": "Lokale Codex-Brücke mit Desktop-Manager, Proxy, Katalog und Werkzeugsteuerung.",
+  "aboutFooterNote": "通过本地桌面管理器连接 Codex 与已配置的模型服务\n请使用合规的 API 凭证与端点，并遵守相关服务提供方的使用条款"
 }

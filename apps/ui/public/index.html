@@ -35,8 +35,7 @@
       </nav>
 
       <div class="sidebar-footer" data-i18n="sidebarFooter">
-        Unofficial tool for learning and research only.
-        Follow Codex and DeepSeek terms.
+        Powered by TasteSteak / 牛排吖
       </div>
     </aside>
 
@@ -77,7 +76,7 @@
           <div class="panel">
             <div class="panel-header dashboard-card-header">
               <div>
-                <h2 class="icon-heading"><span class="heading-icon heading-icon-coin" aria-hidden="true"></span><span data-i18n="balanceTitle">Proxy Console</span></h2>
+                <h2 class="icon-heading"><span class="heading-icon heading-icon-bank-card" aria-hidden="true"></span><span data-i18n="balanceTitle">Proxy Console</span></h2>
                 <p data-i18n="dashboardBalanceSubtitle">Balance, local proxy state, and Codex connection config.</p>
               </div>
             </div>
@@ -101,7 +100,13 @@
 
                 <div class="right-wing">
                   <div class="readiness-block">
-                    <span class="metric-label section-kicker" data-i18n="dashboardReadinessTitle">Proxy state</span>
+                    <div class="readiness-heading-row">
+                      <span class="metric-label section-kicker" data-i18n="dashboardReadinessTitle">Proxy state</span>
+                      <button class="btn btn-secondary btn-icon-label dashboard-troubleshoot-btn" type="button" id="troubleshootButton" disabled>
+                        <span class="btn-icon btn-icon-heartbeat" aria-hidden="true"></span>
+                        <span data-i18n="troubleshoot">Troubleshoot</span>
+                      </button>
+                    </div>
                     <div class="readiness-chain">
                       <div class="compact-stage" id="stagePortCheck">
                         <div class="compact-stage-info">
@@ -136,13 +141,20 @@
           <section class="config-toml-card dashboard-toml-card">
             <div class="config-toml-header">
               <div class="config-toml-title">
-                <h3 data-i18n="configTomlTitle">config.toml configuration</h3>
+                <h3 class="icon-heading config-toml-heading"><span class="heading-icon heading-icon-toml" aria-hidden="true"></span><span data-i18n="configTomlTitle">config.toml configuration</span></h3>
                 <p id="configTomlStatus">~/.codex/config.toml</p>
               </div>
-              <span class="copy-status" id="configTomlCopyStatus" aria-live="polite"></span>
-              <button class="btn btn-secondary icon-only-btn" type="button" id="copyTomlButton" title="Copy">
-                <span aria-hidden="true"></span>
-              </button>
+              <div class="config-toml-actions">
+                <span class="copy-status" id="configTomlCopyStatus" aria-live="polite"></span>
+                <button class="btn btn-secondary btn-icon-label" type="button" id="importCcsButton">
+                  <span class="btn-icon btn-icon-import" aria-hidden="true"></span>
+                  <span data-i18n="importToCcs">Import to CCS</span>
+                </button>
+                <button class="btn btn-secondary btn-icon-label" type="button" id="copyTomlButton">
+                  <span class="btn-icon btn-icon-copy" aria-hidden="true"></span>
+                  <span data-i18n="contextCopy">Copy</span>
+                </button>
+              </div>
             </div>
             <pre class="toml-snippet config-toml-code selectable" id="configTomlCode">-</pre>
           </section>
@@ -436,36 +448,79 @@
         </div>
 
         <div class="about-page page-stack">
-          <section class="panel about-hero">
-            <div class="panel-body about-hero-body">
-              <div class="about-mark app-icon" aria-hidden="true"></div>
-              <div>
-                <span class="eyebrow">Desktop Bridge</span>
-                <h2 id="appProductName" data-product-name>CodeSeeX</h2>
-                <p id="appDescription" data-i18n="productDescription">Local Codex and DeepSeek bridge with a desktop manager.</p>
-                <div class="version-pill" id="appVersion">v-</div>
-              </div>
-            </div>
-          </section>
+          <section class="panel about-native-panel">
+            <div class="panel-body about-native-layout">
+              <aside class="about-product-card">
+                <div class="about-product-icon app-icon" aria-hidden="true"></div>
+                <h2 class="about-product-name" data-product-name>CodeSeeX</h2>
+                <p class="about-product-subtitle" data-i18n="aboutProductSubtitle">Codex Bridge</p>
+                <p class="about-product-description" id="appDescription" data-i18n="aboutProductDescription">Local Codex bridge with a desktop manager, proxy, catalog, and tool controls.</p>
+                <span class="about-version-chip tabular-nums" id="appVersion">v-</span>
+                <span id="appProductName" data-product-name hidden>CodeSeeX</span>
+              </aside>
 
-          <section class="about-grid">
-            <div class="panel about-info-panel">
-              <div class="panel-header"><h2 data-i18n="versionInfo">Version info</h2></div>
-              <div class="panel-body info-list selectable">
-                <div class="info-row"><span data-i18n="appName">App name</span><strong id="appName">-</strong></div>
-                <div class="info-row"><span data-i18n="currentVersion">Version</span><strong id="aboutVersion">-</strong></div>
-                <div class="info-row"><span data-i18n="license">License</span><strong id="appLicense">-</strong></div>
-              </div>
-            </div>
+              <div class="about-settings-stack">
+                <section class="about-group">
+                  <h3 class="about-group-title" data-i18n="versionInfo">Version info</h3>
+                  <div class="about-row-list">
+                    <div class="about-row">
+                      <span class="about-row-label" data-i18n="currentVersion">Version</span>
+                      <span class="about-row-value tabular-nums" id="aboutVersion">-</span>
+                    </div>
+                    <button class="about-row about-row-button" type="button" data-about-action="license">
+                      <span class="about-row-label" data-i18n="licenseButton">License</span>
+                      <span class="about-row-value" id="appLicense">-</span>
+                    </button>
+                    <div class="about-row">
+                      <span class="about-row-label" data-i18n="checkUpdate">Check updates</span>
+                      <button class="btn btn-secondary about-inline-button update-button" type="button" data-about-action="update">
+                        <span data-i18n="checkUpdate">Check updates</span>
+                        <span class="update-dot" id="updateButtonDot" hidden></span>
+                      </button>
+                    </div>
+                  </div>
+                </section>
 
-            <div class="panel">
-              <div class="panel-header"><h2 data-i18n="projectSupport">Project &amp; support</h2></div>
-              <div class="panel-body about-actions">
-                <button class="btn btn-secondary btn-link-icon" type="button" data-about-action="source"><span aria-hidden="true"></span><span data-i18n="source">View source</span></button>
-                <button class="btn btn-secondary btn-link-icon" type="button" data-about-action="feedback"><span aria-hidden="true"></span><span data-i18n="feedback">Feedback</span></button>
-                <button class="btn btn-secondary btn-link-icon" type="button" data-about-action="license"><span aria-hidden="true"></span><span data-i18n="licenseButton">License</span></button>
-                <button class="btn btn-primary btn-link-icon update-button" type="button" data-about-action="update"><span aria-hidden="true"></span><span data-i18n="checkUpdate">Check updates</span><span class="update-dot" id="updateButtonDot" hidden></span></button>
+                <section class="about-group">
+                  <h3 class="about-group-title" data-i18n="runtimeStats">Runtime stats</h3>
+                  <div class="about-row-list">
+                    <div class="about-row">
+                      <span class="about-row-label" data-i18n="model">Model</span>
+                      <span class="about-row-value">deepseek-v4-pro / flash</span>
+                    </div>
+                    <div class="about-row">
+                      <span class="about-row-label" data-i18n="codexAdapter">Codex adapter</span>
+                      <span class="about-row-value">Responses API catalog</span>
+                    </div>
+                    <div class="about-row">
+                      <span class="about-row-label" data-i18n="proxyConnection">Connection</span>
+                      <span class="about-row-value">127.0.0.1 /v1</span>
+                    </div>
+                  </div>
+                </section>
+
+                <section class="about-group">
+                  <h3 class="about-group-title" data-i18n="projectSupport">Project &amp; support</h3>
+                  <div class="about-resource-actions">
+                    <button class="about-resource-button" type="button" data-about-action="source">
+                      <span class="btn-icon btn-icon-github" aria-hidden="true"></span>
+                      <span data-i18n="source">View source</span>
+                    </button>
+                    <button class="about-resource-button" type="button" data-about-action="feedback">
+                      <span class="btn-icon btn-icon-link" aria-hidden="true"></span>
+                      <span data-i18n="feedback">Feedback</span>
+                    </button>
+                  </div>
+                </section>
+
                 <p class="about-status" id="aboutStatus" data-i18n="ready">Ready.</p>
+                <p class="about-footer-note" data-i18n="aboutFooterNote">通过本地桌面管理器连接 Codex 与已配置的模型服务
+请使用合规的 API 凭证与端点，并遵守相关服务提供方的使用条款</p>
+
+                <div class="about-hidden-meta" hidden>
+                  <span id="appName">-</span>
+                  <span id="aboutVersionMeta">-</span>
+                </div>
               </div>
             </div>
           </section>
@@ -474,11 +529,25 @@
     </main>
   </div>
 
-  <div class="loading-overlay" id="loadingOverlay" hidden>
-    <div class="loading-card">
+  <div class="overlay-layer" id="loadingOverlay" hidden>
+    <div class="overlay-card loading-card">
       <div class="spinner"></div>
       <strong id="loadingTitle" data-i18n="busyTitle">Processing</strong>
       <span id="loadingDetail" data-i18n="busyDetail">Please wait...</span>
+    </div>
+  </div>
+
+  <div class="overlay-layer" id="ccsKeyModal" hidden>
+    <div class="overlay-card modal-card" role="dialog" aria-modal="true" aria-labelledby="ccsKeyTitle">
+      <div class="modal-header">
+        <h2 id="ccsKeyTitle" data-i18n="ccsApiKeyTitle">CCS import API key</h2>
+        <p data-i18n="ccsApiKeyHint">Enter the real API key required by CCS for this import. CodeSeeX uses it only to build this one deep link and does not save it.</p>
+      </div>
+      <input class="inline-control modal-input" type="password" id="ccsApiKeyInput" spellcheck="false" autocomplete="new-password" data-i18n-placeholder="ccsApiKeyPlaceholder" placeholder="API key">
+      <div class="modal-actions">
+        <button class="btn btn-secondary" type="button" id="ccsKeyCancel" data-i18n="cancel">Cancel</button>
+        <button class="btn btn-primary" type="button" id="ccsKeyConfirm" data-i18n="importToCcs">Import to CCS</button>
+      </div>
     </div>
   </div>
 

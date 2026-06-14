@@ -7,6 +7,9 @@ const CONFIG_TEXT_AUTOSAVE_DELAY_MS = 2500;
 const CONFIG_AUTOSAVE_RETRY_MS = 700;
 const DEBUG_MANAGER_BASE_URL = "http://127.0.0.1:8787";
 const DEEPSEEK_RECHARGE_URL = "https://platform.deepseek.com/top_up";
+const CCS_IMPORT_URL = "ccswitch://v1/import";
+const DEFAULT_CCS_ENDPOINT = "http://127.0.0.1:8787/v1";
+const DEFAULT_CCS_MODEL = "deepseek-v4-pro";
 const CODEX_CONFIG_PATH_UNIX = "~/.codex/config.toml";
 const CODEX_CONFIG_PATH_WINDOWS = "%USERPROFILE%\\.codex\\config.toml";
 const REFRESH_RUNNING_MS = 2000;
@@ -42,6 +45,7 @@ const els = {
   appProductName: byId("appProductName"),
   appVersion: byId("appVersion"),
   aboutVersion: byId("aboutVersion"),
+  aboutVersionMeta: byId("aboutVersionMeta"),
   balanceGranted: byId("balanceGranted"),
   balanceStatus: byId("balanceStatus"),
   balanceToppedUp: byId("balanceToppedUp"),
@@ -58,6 +62,11 @@ const els = {
   configTomlCopyStatus: byId("configTomlCopyStatus"),
   configTomlStatus: byId("configTomlStatus"),
   copyTomlButton: byId("copyTomlButton"),
+  importCcsButton: byId("importCcsButton"),
+  ccsApiKeyInput: byId("ccsApiKeyInput"),
+  ccsKeyCancel: byId("ccsKeyCancel"),
+  ccsKeyConfirm: byId("ccsKeyConfirm"),
+  ccsKeyModal: byId("ccsKeyModal"),
   failedTurns: byId("failedTurns"),
   loadingDetail: byId("loadingDetail"),
   loadingOverlay: byId("loadingOverlay"),
@@ -140,6 +149,8 @@ let latestAdapter = null;
 let latestUpdateCheck = null;
 let latestConfigVersion = "";
 let externalConfigSyncTimer = null;
+let configTomlStatusTimer = null;
+let ccsKeyResolve = null;
 let uiLanguage = FALLBACK_LANGUAGE;
 let contextMenuEl = null;
 let contextMenuTarget = null;
@@ -213,11 +224,22 @@ function bind() {
   if (els.refreshBalanceButton) els.refreshBalanceButton.addEventListener("click", refreshBalance);
   if (els.rechargeBalanceButton) els.rechargeBalanceButton.addEventListener("click", openRechargePage);
   if (els.copyTomlButton) els.copyTomlButton.addEventListener("click", copyConfigToml);
+  if (els.importCcsButton) els.importCcsButton.addEventListener("click", importConfigToCcs);
+  if (els.ccsKeyCancel) els.ccsKeyCancel.addEventListener("click", () => closeCcsKeyModal(""));
+  if (els.ccsKeyConfirm) els.ccsKeyConfirm.addEventListener("click", confirmCcsKeyModal);
+  if (els.ccsApiKeyInput) {
+    els.ccsApiKeyInput.addEventListener("input", updateCcsKeyConfirmState);
+    els.ccsApiKeyInput.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" && !els.ccsKeyConfirm.disabled) confirmCcsKeyModal();
+      if (event.key === "Escape") closeCcsKeyModal("");
+    });
+  }
   if (els.logStream) els.logStream.addEventListener("scroll", handleLogScroll);
   document.addEventListener("contextmenu", handleContextMenu);
   document.addEventListener("click", hideContextMenu);
   document.addEventListener("scroll", hideContextMenu, true);
   document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && els.ccsKeyModal && !els.ccsKeyModal.hidden) closeCcsKeyModal("");
     if (event.key === "Escape") hideContextMenu();
   });
   document.addEventListener("visibilitychange", () => scheduleNextRefresh(0));
@@ -1011,27 +1033,70 @@ function renderCodexAdapter(adapter) {
   if (signature === currentAdapterSignature) return;
   currentAdapterSignature = signature;
   const toml = String(latestAdapter.toml_snippet || "");
-  if (els.configTomlCode) els.configTomlCode.textContent = toml || "-";
+  renderConfigToml(toml || "-");
   if (els.configTomlStatus) els.configTomlStatus.textContent = codexConfigPathHint();
 }
 
 async function copyConfigToml() {
   const text = configTomlCopyText(els.configTomlCode ? els.configTomlCode.textContent : "");
   if (!text || text === "-") {
-    if (els.configTomlCopyStatus) els.configTomlCopyStatus.textContent = t("codexAdapterMissing");
+    setConfigTomlActionStatus(t("codexAdapterMissing"), { warning: true, timeout: 2200 });
     return;
   }
   try {
     await navigator.clipboard.writeText(text);
-    if (els.configTomlCopyStatus) {
-      els.configTomlCopyStatus.textContent = t("copied");
-      window.setTimeout(() => {
-        if (els.configTomlCopyStatus) els.configTomlCopyStatus.textContent = "";
-      }, 1800);
-    }
+    setConfigTomlActionStatus(t("copied"));
   } catch {
-    if (els.configTomlCopyStatus) els.configTomlCopyStatus.textContent = t("copyFailed");
+    setConfigTomlActionStatus(t("copyFailed"), { warning: true, timeout: 2200 });
   }
+}
+
+async function importConfigToCcs() {
+  const toml = configTomlCopyText(els.configTomlCode ? els.configTomlCode.textContent : "");
+  if (!toml || toml === "-") {
+    setConfigTomlActionStatus(t("codexAdapterMissing"), { warning: true, timeout: 2200 });
+    return;
+  }
+  const apiKey = await requestCcsApiKey();
+  if (!apiKey) return;
+  try {
+    await openExternalUrl(ccsImportUrl(toml, { apiKey }));
+    setConfigTomlActionStatus(t("ccsImportStarted"), { timeout: 2200 });
+  } catch {
+    setConfigTomlActionStatus(t("ccsImportFailed"), { warning: true, timeout: 2600 });
+  }
+}
+
+function requestCcsApiKey() {
+  if (!els.ccsKeyModal || !els.ccsApiKeyInput) return Promise.resolve("");
+  if (ccsKeyResolve) closeCcsKeyModal("");
+  els.ccsApiKeyInput.value = "";
+  updateCcsKeyConfirmState();
+  els.ccsKeyModal.hidden = false;
+  window.setTimeout(() => els.ccsApiKeyInput.focus(), 0);
+  return new Promise((resolve) => {
+    ccsKeyResolve = resolve;
+  });
+}
+
+function confirmCcsKeyModal() {
+  const value = String(els.ccsApiKeyInput ? els.ccsApiKeyInput.value : "").trim();
+  if (!value) return;
+  closeCcsKeyModal(value);
+}
+
+function closeCcsKeyModal(value) {
+  if (els.ccsKeyModal) els.ccsKeyModal.hidden = true;
+  if (els.ccsApiKeyInput) els.ccsApiKeyInput.value = "";
+  updateCcsKeyConfirmState();
+  const resolve = ccsKeyResolve;
+  ccsKeyResolve = null;
+  if (resolve) resolve(String(value || "").trim());
+}
+
+function updateCcsKeyConfirmState() {
+  if (!els.ccsKeyConfirm || !els.ccsApiKeyInput) return;
+  els.ccsKeyConfirm.disabled = !String(els.ccsApiKeyInput.value || "").trim();
 }
 
 function configTomlCopyText(value) {
@@ -1042,6 +1107,122 @@ function configTomlCopyText(value) {
     .filter((line) => !line.trimStart().startsWith("#"))
     .join("\n")
     .trim();
+}
+
+function renderConfigToml(toml) {
+  if (!els.configTomlCode) return;
+  const text = String(toml || "-");
+  if (!text || text === "-") {
+    els.configTomlCode.textContent = "-";
+    return;
+  }
+  els.configTomlCode.innerHTML = highlightToml(text);
+}
+
+function highlightToml(text) {
+  return String(text || "")
+    .replace(/\r\n/g, "\n")
+    .replace(/\r/g, "\n")
+    .split("\n")
+    .map(highlightTomlLine)
+    .join("\n");
+}
+
+function highlightTomlLine(line) {
+  const raw = String(line || "");
+  const trimmed = raw.trim();
+  if (!trimmed) return "";
+  if (trimmed.startsWith("#")) return `<span class="toml-comment">${escapeHtml(raw)}</span>`;
+
+  const section = raw.match(/^(\s*)(\[[^\]]+\])(\s*)$/);
+  if (section) {
+    return `${escapeHtml(section[1])}<span class="toml-section">${escapeHtml(section[2])}</span>${escapeHtml(section[3])}`;
+  }
+
+  const keyValue = raw.match(/^(\s*)([A-Za-z0-9_.-]+)(\s*=\s*)(.*)$/);
+  if (!keyValue) return escapeHtml(raw);
+  return `${escapeHtml(keyValue[1])}<span class="toml-key">${escapeHtml(keyValue[2])}</span>${escapeHtml(keyValue[3])}${highlightTomlValue(keyValue[4])}`;
+}
+
+function highlightTomlValue(value) {
+  const raw = String(value || "");
+  const stringValue = raw.match(/^("(?:\\.|[^"])*")(\s*)$/);
+  if (stringValue) {
+    return `<span class="toml-string">${escapeHtml(stringValue[1])}</span>${escapeHtml(stringValue[2])}`;
+  }
+  if (/^(true|false)\s*$/i.test(raw)) return `<span class="toml-bool">${escapeHtml(raw)}</span>`;
+  return escapeHtml(raw);
+}
+
+function escapeHtml(value) {
+  return String(value ?? "").replace(/[&<>"']/g, (ch) => ({
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    "\"": "&quot;",
+    "'": "&#39;",
+  })[ch]);
+}
+
+function ccsImportUrl(toml, options = {}) {
+  const apiKey = String(options.apiKey || "").trim();
+  const params = new URLSearchParams({
+    resource: "provider",
+    app: "codex",
+    name: appInfo && appInfo.product_name ? appInfo.product_name : "CodeSeeX",
+    endpoint: parseTomlStringValue(toml, "base_url") || DEFAULT_CCS_ENDPOINT,
+    model: parseTomlStringValue(toml, "model") || DEFAULT_CCS_MODEL,
+    config: utf8Base64(toml),
+    configFormat: "toml",
+  });
+  if (apiKey) params.set("apiKey", apiKey);
+  return CCS_IMPORT_URL + "?" + params.toString();
+}
+
+function parseTomlStringValue(toml, key) {
+  const escapedKey = String(key || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const match = String(toml || "").match(new RegExp("^\\s*" + escapedKey + "\\s*=\\s*\"((?:\\\\.|[^\"])*)\"\\s*$", "m"));
+  return match ? unescapeTomlBasicString(match[1]).trim() : "";
+}
+
+function unescapeTomlBasicString(value) {
+  return String(value || "").replace(/\\([btnfr"\\])/g, (_, ch) => {
+    if (ch === "b") return "\b";
+    if (ch === "t") return "\t";
+    if (ch === "n") return "\n";
+    if (ch === "f") return "\f";
+    if (ch === "r") return "\r";
+    return ch;
+  });
+}
+
+function utf8Base64(value) {
+  const bytes = new TextEncoder().encode(String(value || ""));
+  let binary = "";
+  const chunkSize = 0x8000;
+  for (let index = 0; index < bytes.length; index += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(index, index + chunkSize));
+  }
+  return btoa(binary);
+}
+
+function setConfigTomlActionStatus(message, options = {}) {
+  if (!els.configTomlCopyStatus) return;
+  if (configTomlStatusTimer) {
+    window.clearTimeout(configTomlStatusTimer);
+    configTomlStatusTimer = null;
+  }
+  els.configTomlCopyStatus.textContent = message || "";
+  els.configTomlCopyStatus.classList.toggle("warning", Boolean(options.warning));
+  const timeout = Number(options.timeout === undefined ? 1800 : options.timeout);
+  if (timeout > 0) {
+    configTomlStatusTimer = window.setTimeout(() => {
+      configTomlStatusTimer = null;
+      if (!els.configTomlCopyStatus) return;
+      els.configTomlCopyStatus.textContent = "";
+      els.configTomlCopyStatus.classList.remove("warning");
+    }, timeout);
+  }
 }
 
 function renderUpdateState(options = {}) {
@@ -1765,10 +1946,11 @@ function renderAppInfo(info) {
   });
   document.title = productName;
   els.appProductName.textContent = productName;
-  els.appDescription.textContent = info.description || t("productDescription");
+  els.appDescription.textContent = t("aboutProductDescription");
   els.appVersion.textContent = "v" + version;
   els.appName.textContent = productName;
   els.aboutVersion.textContent = version;
+  if (els.aboutVersionMeta) els.aboutVersionMeta.textContent = version;
   els.appLicense.textContent = info.license || t("notDeclared");
 }
 
@@ -2034,6 +2216,9 @@ function applyLanguage(value) {
   document.documentElement.lang = uiLanguage;
   document.querySelectorAll("[data-i18n]").forEach((element) => {
     element.textContent = t(element.dataset.i18n);
+  });
+  document.querySelectorAll("[data-i18n-placeholder]").forEach((element) => {
+    element.setAttribute("placeholder", t(element.dataset.i18nPlaceholder));
   });
   if (els.uiLanguage && els.uiLanguage.value !== configuredLanguage) els.uiLanguage.value = configuredLanguage;
   setView(currentView);
