@@ -701,6 +701,9 @@ fn is_diagnostic_event_type(event_type: &str) -> bool {
             | "process_stderr"
             | "process_stdout"
             | "request_shape_diagnostic"
+            | "previous_response_resolution_warning"
+            | "runtime_context_storage"
+            | "runtime_context_storage_warning"
             | "tool_lifecycle"
             | "tool_exposure_diagnostic"
             | "tool_loop_iteration"
@@ -728,19 +731,42 @@ fn compact_event_detail(event_type: &str, detail: &Value) -> Option<Value> {
     };
     let mut output = Map::new();
     match event_type {
-        "request_started" => copy_log_fields(
-            object,
-            &mut output,
-            &[
-                "id",
-                "endpoint",
-                "requested_model",
-                "model",
-                "previous_response_id",
-                "resolved_previous_response_id",
-                "history_messages",
-            ],
-        ),
+        "request_started" => {
+            copy_log_fields(
+                object,
+                &mut output,
+                &[
+                    "id",
+                    "endpoint",
+                    "requested_model",
+                    "model",
+                    "previous_response_id",
+                    "resolved_previous_response_id",
+                    "history_messages",
+                ],
+            );
+            copy_structured_log_fields(
+                object,
+                &mut output,
+                &["previous_response_resolution", "runtime_context_storage"],
+            );
+        }
+        "previous_response_resolution_warning" => {
+            copy_log_fields(
+                object,
+                &mut output,
+                &["id", "requires_full_context_for_lossless_replay"],
+            );
+            copy_structured_log_fields(object, &mut output, &["previous_response_resolution"]);
+        }
+        "runtime_context_storage" | "runtime_context_storage_warning" => {
+            copy_log_fields(
+                object,
+                &mut output,
+                &["id", "requires_full_context_for_lossless_replay"],
+            );
+            copy_structured_log_fields(object, &mut output, &["runtime_context_storage"]);
+        }
         "request_completed" => copy_log_fields(
             object,
             &mut output,
@@ -822,6 +848,25 @@ fn compact_event_detail(event_type: &str, detail: &Value) -> Option<Value> {
                 "has_suggestion_task_signal",
             ],
         ),
+        "tool_exposure_diagnostic" => {
+            copy_log_fields(
+                object,
+                &mut output,
+                &["id", "incoming_tool_items", "discovered_tool_items"],
+            );
+            copy_structured_log_fields(
+                object,
+                &mut output,
+                &[
+                    "external_callable_tools",
+                    "external_upstream_tools",
+                    "final_upstream_tools",
+                    "codex_request_markers",
+                    "tool_search_bridge",
+                    "interesting_tools",
+                ],
+            );
+        }
         _ => copy_log_fields(
             object,
             &mut output,
@@ -861,11 +906,67 @@ fn copy_log_fields(object: &Map<String, Value>, output: &mut Map<String, Value>,
     }
 }
 
+fn copy_structured_log_fields(
+    object: &Map<String, Value>,
+    output: &mut Map<String, Value>,
+    keys: &[&str],
+) {
+    for key in keys {
+        let Some(value) = object.get(*key) else {
+            continue;
+        };
+        if value.is_null() {
+            continue;
+        }
+        output.insert((*key).to_owned(), compact_structured_log_value(value));
+    }
+}
+
 fn compact_log_field_value(key: &str, value: &Value) -> Value {
     match key {
         "summary" => compact_log_value(value, MAX_LOG_SUMMARY_CHARS),
         "upstream_error" => compact_upstream_error(value),
         _ => compact_log_value(value, MAX_LOG_STRING_CHARS),
+    }
+}
+
+fn compact_structured_log_value(value: &Value) -> Value {
+    match value {
+        Value::String(value) => {
+            Value::String(truncate_chars_with_hash(value, MAX_LOG_STRING_CHARS))
+        }
+        Value::Array(values) => {
+            let mut output = values
+                .iter()
+                .take(MAX_LOG_ARRAY_ITEMS)
+                .map(compact_structured_log_value)
+                .collect::<Vec<_>>();
+            if values.len() > MAX_LOG_ARRAY_ITEMS {
+                output.push(json!({
+                    "_codeseex_log_notice": "array tail omitted from diagnostic log detail",
+                    "omitted_items": values.len().saturating_sub(MAX_LOG_ARRAY_ITEMS)
+                }));
+            }
+            Value::Array(output)
+        }
+        Value::Object(object) => {
+            let mut output = Map::new();
+            for (key, value) in object.iter().take(MAX_LOG_ARRAY_ITEMS) {
+                output.insert(key.clone(), compact_structured_log_value(value));
+            }
+            if object.len() > MAX_LOG_ARRAY_ITEMS {
+                output.insert(
+                    "_codeseex_log_notice".to_owned(),
+                    json!("object tail omitted from diagnostic log detail"),
+                );
+                output.insert(
+                    "omitted_fields".to_owned(),
+                    json!(object.len().saturating_sub(MAX_LOG_ARRAY_ITEMS)),
+                );
+            }
+            Value::Object(output)
+        }
+        _ => value.clone(),
     }
 }
 
@@ -1623,6 +1724,47 @@ mod tests {
             .path();
         let bytes = std::fs::metadata(log_file).expect("log metadata").len();
         assert!(bytes < 1_000);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn tool_exposure_diagnostic_keeps_structured_summary_when_enabled() {
+        let old = std::env::var("CODESEEX_DIAGNOSTIC_LOGS").ok();
+        std::env::set_var("CODESEEX_DIAGNOSTIC_LOGS", "1");
+        let dir = temp_dir("tool-exposure-diagnostic-log");
+        let store = Store::open(&dir).await.expect("open store");
+        store
+            .record_event(
+                "debug",
+                "tool_exposure_diagnostic",
+                "CodeSeeX tool exposure diagnostic.",
+                Some(&json!({
+                    "id": "resp_1",
+                    "incoming_tool_items": 1,
+                    "discovered_tool_items": 1,
+                    "external_callable_tools": { "count": 1, "names": ["tool_search_tool"], "omitted": 0 },
+                    "final_upstream_tools": { "count": 2, "names": ["tool_search_tool", "spawn_agent"], "omitted": 0 },
+                    "codex_request_markers": { "client_metadata": true },
+                    "tool_search_bridge": { "injected": false, "reason": "already_present" },
+                    "interesting_tools": ["tool_search_tool", "spawn_agent"],
+                    "large_unused_field": "x".repeat(5_000)
+                })),
+            )
+            .await
+            .expect("record diagnostic");
+
+        let (events, _) = store.recent_events(10, None).await.expect("events");
+        assert_eq!(events.len(), 1);
+        let detail = events[0].detail.as_ref().expect("detail");
+        assert_eq!(detail["id"], "resp_1");
+        assert_eq!(detail["tool_search_bridge"]["reason"], "already_present");
+        assert_eq!(detail["discovered_tool_items"], 1);
+        assert!(detail.get("large_unused_field").is_none());
+        if let Some(old) = old {
+            std::env::set_var("CODESEEX_DIAGNOSTIC_LOGS", old);
+        } else {
+            std::env::remove_var("CODESEEX_DIAGNOSTIC_LOGS");
+        }
         let _ = std::fs::remove_dir_all(dir);
     }
 

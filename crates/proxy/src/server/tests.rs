@@ -856,6 +856,57 @@ fn codex_request_marker_gets_synthetic_tool_search_bridge() {
 }
 
 #[test]
+fn codex_request_marker_promotes_existing_tool_search_bridge() {
+    let mut context = ToolContext::from_request_tools(Some(&json!([{
+        "type": "function",
+        "name": "tool_search_tool",
+        "description": "Search deferred tools.",
+        "parameters": { "type": "object", "properties": {} }
+    }])));
+    let request = json!({ "client_metadata": {} });
+    let decision = codex_tool_search_bridge_decision(&request, false, &context);
+
+    assert!(!decision.injected);
+    assert_eq!(decision.reason, "already_present");
+    assert!(decision.upstream_had_tool_search);
+    context.promote_codex_tool_search_tools();
+
+    let item = context.response_item_from_chat_call(&ChatToolCall {
+        id: "call_search".to_owned(),
+        name: "tool_search_tool".to_owned(),
+        arguments: r#"{"query":"spawn_agent"}"#.to_owned(),
+    });
+    assert_eq!(
+        item.get("type").and_then(Value::as_str),
+        Some("tool_search_call")
+    );
+}
+
+#[test]
+fn plain_external_existing_tool_search_stays_function_call() {
+    let context = ToolContext::from_request_tools(Some(&json!([{
+        "type": "function",
+        "name": "tool_search_tool",
+        "description": "Plain external tool.",
+        "parameters": { "type": "object", "properties": {} }
+    }])));
+    let request = json!({});
+    let decision = codex_tool_search_bridge_decision(&request, false, &context);
+
+    assert!(!decision.injected);
+    assert_eq!(decision.reason, "already_present");
+    let item = context.response_item_from_chat_call(&ChatToolCall {
+        id: "call_search".to_owned(),
+        name: "tool_search_tool".to_owned(),
+        arguments: r#"{"query":"spawn_agent"}"#.to_owned(),
+    });
+    assert_eq!(
+        item.get("type").and_then(Value::as_str),
+        Some("function_call")
+    );
+}
+
+#[test]
 fn plain_external_client_tool_does_not_get_synthetic_tool_search_bridge() {
     let context = ToolContext::from_request_tools(Some(&json!([{
         "type": "function",
@@ -1004,7 +1055,7 @@ fn mixed_native_and_code_tool_replay_keeps_only_executed_code_tools() {
 }
 
 #[test]
-fn internal_code_tools_keep_codeseex_ownership_without_client_function_calls() {
+fn external_collision_takes_ownership_from_ordinary_codeseex_code_tool() {
     let config = test_config(temp_workspace("tool-calls-response"));
     let chat = json!({
         "choices": [{
@@ -1037,7 +1088,7 @@ fn internal_code_tools_keep_codeseex_ownership_without_client_function_calls() {
             "type": "function",
             "function": {
                 "name": "list_directory",
-                "description": "A colliding client-side tool that must not override CodeSeeX internal ownership.",
+                "description": "A colliding client-side tool that should take ownership from ordinary CodeSeeX tools.",
                 "parameters": { "type": "object", "properties": {} }
             }
         },
@@ -1062,23 +1113,24 @@ fn internal_code_tools_keep_codeseex_ownership_without_client_function_calls() {
     );
     let output = response["output"].as_array().unwrap();
 
-    assert!(output.iter().any(|item| {
+    assert!(!output.iter().any(|item| {
         item.get("type").and_then(Value::as_str) == Some("proxy_tool_call")
             && item.get("name").and_then(Value::as_str) == Some("list_directory")
+    }));
+    assert!(output.iter().any(|item| {
+        item.get("type").and_then(Value::as_str) == Some("function_call")
+            && item.get("name").and_then(Value::as_str) == Some("list_directory")
+            && item.get("call_id").and_then(Value::as_str) == Some("call_internal")
     }));
     assert!(output.iter().any(|item| {
         item.get("type").and_then(Value::as_str) == Some("function_call")
             && item.get("name").and_then(Value::as_str) == Some("js")
             && item.get("call_id").and_then(Value::as_str) == Some("call_external")
     }));
-    assert!(!output.iter().any(|item| {
-        item.get("type").and_then(Value::as_str) == Some("function_call")
-            && item.get("name").and_then(Value::as_str) == Some("list_directory")
-    }));
 }
 
 #[test]
-fn internal_code_tools_do_not_trigger_external_passthrough() {
+fn external_collision_triggers_external_passthrough_for_ordinary_codeseex_tool() {
     let tool_calls = vec![ChatToolCall {
         id: "call_internal".to_owned(),
         name: "workspace_search".to_owned(),
@@ -1106,8 +1158,8 @@ fn internal_code_tools_do_not_trigger_external_passthrough() {
         ])));
 
     let partition = partition_tool_calls(tool_calls, &community_tools, &external_tool_context);
-    assert_eq!(partition.code.len(), 1);
-    assert!(partition.external.is_empty());
+    assert!(partition.code.is_empty());
+    assert_eq!(partition.external.len(), 1);
     assert!(partition.unknown.is_empty());
 }
 
@@ -1485,6 +1537,20 @@ async fn responses_missing_previous_response_id_is_ignored_without_local_replay(
         .await
         .unwrap();
     assert_eq!(chain[0].previous_response_id, None);
+    let (events, _) = store.recent_events(20, None).await.unwrap();
+    let request_started = events
+        .iter()
+        .find(|event| event.event_type == "request_started")
+        .expect("request_started event should be recorded");
+    assert_eq!(
+        request_started
+            .detail
+            .as_ref()
+            .unwrap()
+            .pointer("/previous_response_resolution/kind")
+            .and_then(Value::as_str),
+        Some("missing")
+    );
 
     let _ = std::fs::remove_dir_all(data_dir);
 }
@@ -1557,6 +1623,149 @@ async fn responses_missing_previous_response_id_allows_codex_full_context() {
         .unwrap();
     assert_eq!(chain[0].previous_response_id, None);
     assert_eq!(chain[0].input["input"].as_array().unwrap().len(), 0);
+    let (events, _) = store.recent_events(20, None).await.unwrap();
+    let request_started = events
+        .iter()
+        .find(|event| event.event_type == "request_started")
+        .expect("request_started event should be recorded");
+    assert_eq!(
+        request_started
+            .detail
+            .as_ref()
+            .unwrap()
+            .pointer("/runtime_context_storage/current/mode")
+            .and_then(Value::as_str),
+        Some("codex_full_context_not_stored")
+    );
+
+    let _ = std::fs::remove_dir_all(data_dir);
+}
+
+#[tokio::test]
+async fn non_full_context_continuation_warns_when_parent_input_was_not_stored() {
+    let fake_state = FakeUpstreamState::default();
+    let fake_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let fake_addr = fake_listener.local_addr().unwrap();
+    let fake_app = Router::new()
+        .route("/chat/completions", post(fake_final_chat_completions))
+        .with_state(fake_state.clone());
+    tokio::spawn(async move {
+        axum::serve(fake_listener, fake_app).await.unwrap();
+    });
+
+    let data_dir = temp_workspace("full-context-continuation-warning");
+    let config = test_config_with_upstream(data_dir.clone(), fake_addr);
+    let store = Store::open(&config.data_dir).await.unwrap();
+    let input_items = (0..81)
+        .map(|index| {
+            json!({
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": format!("full context item {index}") }]
+            })
+        })
+        .collect::<Vec<_>>();
+    store
+        .checkpoint_request(
+            "resp_full_context_parent",
+            None,
+            Some("deepseek-v4-pro"),
+            &json!({
+                "model": "deepseek-v4-pro",
+                "prompt_cache_key": "thread-full-context",
+                "instructions": "answer briefly",
+                "tools": [],
+                "input": input_items
+            }),
+        )
+        .await
+        .unwrap();
+    store
+        .replace_request_turn_messages(
+            "resp_full_context_parent",
+            &[json!({ "role": "user", "content": "summary replay survives" })],
+        )
+        .await
+        .unwrap();
+    store
+        .finish_request(
+            "resp_full_context_parent",
+            RequestStatus::Completed,
+            Some(&json!({
+                "id": "resp_full_context_parent",
+                "status": "completed",
+                "output": [{
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{ "type": "output_text", "text": "parent done" }]
+                }]
+            })),
+            None,
+        )
+        .await
+        .unwrap();
+    let proxy_state = ProxyState {
+        config: Arc::new(config),
+        client: reqwest::Client::new(),
+        store: store.clone(),
+    };
+    let proxy_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    let proxy_app = Router::new()
+        .route("/v1/responses", post(responses))
+        .with_state(proxy_state);
+    tokio::spawn(async move {
+        axum::serve(proxy_listener, proxy_app).await.unwrap();
+    });
+
+    let response = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/responses"))
+        .json(&json!({
+            "id": "resp_after_full_context_parent",
+            "model": "deepseek-v4-pro",
+            "previous_response_id": "resp_full_context_parent",
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "continue" }]
+            }]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let (events, _) = store.recent_events(20, None).await.unwrap();
+    let request_started = events
+        .iter()
+        .find(|event| {
+            event.event_type == "request_started"
+                && event
+                    .detail
+                    .as_ref()
+                    .and_then(|detail| detail.get("id"))
+                    .and_then(Value::as_str)
+                    == Some("resp_after_full_context_parent")
+        })
+        .expect("request_started event should be recorded");
+    assert_eq!(
+        request_started
+            .detail
+            .as_ref()
+            .unwrap()
+            .pointer("/runtime_context_storage/previous/full_context_not_stored")
+            .and_then(Value::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        request_started
+            .detail
+            .as_ref()
+            .unwrap()
+            .pointer("/runtime_context_storage/continuation_warning")
+            .and_then(Value::as_bool),
+        Some(true)
+    );
 
     let _ = std::fs::remove_dir_all(data_dir);
 }
@@ -1589,6 +1798,7 @@ async fn responses_interrupted_previous_is_ignored_without_local_replay() {
         .interrupt_request_if_in_progress("resp_interrupted_parent", "client cancelled")
         .await
         .unwrap();
+    let inspection_store = store.clone();
     let proxy_state = ProxyState {
         config: Arc::new(config),
         client: reqwest::Client::new(),
@@ -1628,6 +1838,20 @@ async fn responses_interrupted_previous_is_ignored_without_local_replay() {
             .len(),
         1,
         "interrupted parent should not block Codex-provided input"
+    );
+    let (events, _) = inspection_store.recent_events(20, None).await.unwrap();
+    let request_started = events
+        .iter()
+        .find(|event| event.event_type == "request_started")
+        .expect("request_started event should be recorded");
+    assert_eq!(
+        request_started
+            .detail
+            .as_ref()
+            .unwrap()
+            .pointer("/previous_response_resolution/status")
+            .and_then(Value::as_str),
+        Some("interrupted")
     );
 
     let _ = std::fs::remove_dir_all(data_dir);
@@ -2339,43 +2563,35 @@ async fn streaming_mixed_internal_and_external_tools_runs_internal_first() {
     });
 
     let body = reqwest::Client::new()
-            .post(format!("http://{proxy_addr}/v1/responses"))
-            .json(&json!({
-                "id": "resp_stream_mixed_tool",
-                "model": "deepseek-v4-pro",
-                "stream": true,
-                "input": [
-                    {
-                        "type": "message",
-                        "role": "user",
-                        "content": [{ "type": "input_text", "text": "use local files and js" }]
+        .post(format!("http://{proxy_addr}/v1/responses"))
+        .json(&json!({
+            "id": "resp_stream_mixed_tool",
+            "model": "deepseek-v4-pro",
+            "stream": true,
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{ "type": "input_text", "text": "use local files and js" }]
+                }
+            ],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "js",
+                        "description": "External JavaScript tool.",
+                        "parameters": { "type": "object", "properties": {} }
                     }
-                ],
-                "tools": [
-                    {
-                        "type": "function",
-                        "function": {
-                            "name": "list_directory",
-                            "description": "Colliding client tool that must not take internal ownership.",
-                            "parameters": { "type": "object", "properties": {} }
-                        }
-                    },
-                    {
-                        "type": "function",
-                        "function": {
-                            "name": "js",
-                            "description": "External JavaScript tool.",
-                            "parameters": { "type": "object", "properties": {} }
-                        }
-                    }
-                ]
-            }))
-            .send()
-            .await
-            .unwrap()
-            .text()
-            .await
-            .unwrap();
+                }
+            ]
+        }))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
 
     assert!(
         body.contains("response.function_call_arguments.delta"),

@@ -59,7 +59,7 @@ use axum::http::{header, HeaderMap, Response, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use codeseex_core::context::redact_inline_data_urls;
+use codeseex_core::context::{redact_inline_data_urls, request_looks_like_codex_full_context};
 use codeseex_core::models::available_models;
 use codeseex_core::protocol::ChatMessage;
 use codeseex_core::{AppConfig, UserConfig};
@@ -67,7 +67,7 @@ use codeseex_store::{RequestStatus, Store};
 use futures_util::stream::BoxStream;
 use futures_util::StreamExt;
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -227,6 +227,7 @@ fn tool_exposure_diagnostic(
     json!({
         "id": request_id,
         "incoming_tool_items": external_tool_context.request_tool_items(),
+        "discovered_tool_items": external_tool_context.discovered_tool_items(),
         "external_callable_tools": limited_tool_names(external_tool_context.source_names()),
         "external_upstream_tools": limited_tool_names(external_tool_context.upstream_names()),
         "final_upstream_tools": limited_tool_names(upstream_names.clone()),
@@ -304,6 +305,41 @@ fn request_has_codex_native_tool_surface(external_tool_context: &ToolContext) ->
         "create_goal",
         "update_goal",
     ])
+}
+
+async fn immediate_previous_response_tool_call_ids(
+    state: &ProxyState,
+    previous: Option<&str>,
+) -> BTreeSet<String> {
+    let Some(previous) = previous else {
+        return BTreeSet::new();
+    };
+    let Ok(chain) = state.store.response_context_chain(previous, 1).await else {
+        return BTreeSet::new();
+    };
+    chain
+        .last()
+        .filter(|record| record.status == RequestStatus::Completed)
+        .and_then(|record| record.response.get("output").and_then(Value::as_array))
+        .into_iter()
+        .flat_map(|items| items.iter())
+        .filter(|item| {
+            matches!(
+                item.get("type").and_then(Value::as_str),
+                Some("function_call") | Some("custom_tool_call") | Some("tool_search_call")
+            )
+        })
+        .filter_map(response_item_call_id)
+        .map(str::to_owned)
+        .collect()
+}
+
+fn response_item_call_id(item: &Value) -> Option<&str> {
+    item.get("call_id")
+        .or_else(|| item.get("tool_call_id"))
+        .or_else(|| item.get("id"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -566,11 +602,15 @@ async fn responses_compact(
     if let Err(response) = ensure_new_response_id(&state, &id, previous).await {
         return response;
     }
-    let resolved_previous = match resolve_previous_response_id(&state, previous).await {
-        Ok(previous) => previous,
+    let previous_resolution = match resolve_previous_response_id(&state, previous).await {
+        Ok(resolution) => resolution,
         Err(response) => return response,
     };
-    let previous_for_context = resolved_previous.as_deref();
+    record_previous_response_resolution_warning(&state, &id, &input, &previous_resolution).await;
+    let previous_for_context = previous_resolution.resolved.as_deref();
+    let runtime_context_storage =
+        runtime_context_storage_diagnostic(&state, &input, previous_for_context).await;
+    record_runtime_context_storage_events(&state, &id, &runtime_context_storage).await;
 
     if let Err(error) = state
         .store
@@ -592,7 +632,9 @@ async fn responses_compact(
             Some(&json!({
                 "id": id,
                 "previous_response_id": previous,
-                "resolved_previous_response_id": previous_for_context
+                "resolved_previous_response_id": previous_for_context,
+                "previous_response_resolution": previous_resolution.diagnostic(),
+                "runtime_context_storage": runtime_context_storage.diagnostic()
             })),
         )
         .await;
@@ -758,11 +800,15 @@ async fn responses(
     if let Err(response) = ensure_new_response_id(&state, &id, previous).await {
         return response;
     }
-    let resolved_previous = match resolve_previous_response_id(&state, previous).await {
-        Ok(previous) => previous,
+    let previous_resolution = match resolve_previous_response_id(&state, previous).await {
+        Ok(resolution) => resolution,
         Err(response) => return response,
     };
-    let previous_for_context = resolved_previous.as_deref();
+    record_previous_response_resolution_warning(&state, &id, &input, &previous_resolution).await;
+    let previous_for_context = previous_resolution.resolved.as_deref();
+    let runtime_context_storage =
+        runtime_context_storage_diagnostic(&state, &input, previous_for_context).await;
+    record_runtime_context_storage_events(&state, &id, &runtime_context_storage).await;
     if let Err(error) = state
         .store
         .checkpoint_request(&id, previous_for_context, Some(&model), &input)
@@ -782,6 +828,14 @@ async fn responses(
         object.insert(
             "tool_permissions".to_owned(),
             tool_execution_context.diagnostic(),
+        );
+        object.insert(
+            "previous_response_resolution".to_owned(),
+            previous_resolution.diagnostic(),
+        );
+        object.insert(
+            "runtime_context_storage".to_owned(),
+            runtime_context_storage.diagnostic(),
         );
     }
     let history_message_count = built_context.history_message_count;
@@ -825,8 +879,21 @@ async fn responses(
     );
     let mut external_tool_context =
         crate::tool_passthrough::ToolContext::from_request_tools(input.get("tools"));
+    if !suppress_proxy_tools {
+        let valid_previous_tool_call_ids =
+            immediate_previous_response_tool_call_ids(&state, previous_for_context).await;
+        external_tool_context
+            .add_tool_search_output_tools(input.get("input"), &valid_previous_tool_call_ids);
+    }
     let tool_search_bridge_decision =
         codex_tool_search_bridge_decision(&input, suppress_proxy_tools, &external_tool_context);
+    if !suppress_proxy_tools
+        && tool_search_bridge_decision.upstream_had_tool_search
+        && (tool_search_bridge_decision.markers.has_any()
+            || tool_search_bridge_decision.codex_native_tool_surface)
+    {
+        external_tool_context.promote_codex_tool_search_tools();
+    }
     if tool_search_bridge_decision.injected {
         external_tool_context.ensure_codex_tool_search_bridge();
     }
@@ -902,6 +969,8 @@ async fn responses(
                 "endpoint": "/v1/responses",
                 "previous_response_id": previous,
                 "resolved_previous_response_id": previous_for_context,
+                "previous_response_resolution": previous_resolution.diagnostic(),
+                "runtime_context_storage": runtime_context_storage.diagnostic(),
                 "history_messages": history_message_count,
                 "context": context_diagnostic,
                 "requested_model": requested_model.as_deref(),
@@ -1249,21 +1318,253 @@ async fn ensure_new_response_id(
     }
 }
 
+#[derive(Debug, Clone)]
+struct PreviousResponseResolution {
+    requested: Option<String>,
+    resolved: Option<String>,
+    kind: &'static str,
+    status: Option<&'static str>,
+    warning: Option<&'static str>,
+}
+
+impl PreviousResponseResolution {
+    fn none() -> Self {
+        Self {
+            requested: None,
+            resolved: None,
+            kind: "none",
+            status: None,
+            warning: None,
+        }
+    }
+
+    fn resolved(previous: &str) -> Self {
+        Self {
+            requested: Some(previous.to_owned()),
+            resolved: Some(previous.to_owned()),
+            kind: "resolved",
+            status: Some("completed"),
+            warning: None,
+        }
+    }
+
+    fn missing(previous: &str) -> Self {
+        Self {
+            requested: Some(previous.to_owned()),
+            resolved: None,
+            kind: "missing",
+            status: None,
+            warning: Some("previous_response_id was not found in this CodeSeeX process"),
+        }
+    }
+
+    fn non_completed(previous: &str, status: RequestStatus) -> Self {
+        Self {
+            requested: Some(previous.to_owned()),
+            resolved: None,
+            kind: "non_completed",
+            status: Some(request_status_name(status)),
+            warning: Some(
+                "previous_response_id is not completed; local history replay was skipped",
+            ),
+        }
+    }
+
+    fn should_warn(&self, request: &Value) -> bool {
+        self.warning.is_some() && !request_looks_like_codex_full_context(request)
+    }
+
+    fn diagnostic(&self) -> Value {
+        json!({
+            "requested": self.requested.as_deref(),
+            "resolved": self.resolved.as_deref(),
+            "kind": self.kind,
+            "status": self.status,
+            "warning": self.warning
+        })
+    }
+}
+
+fn request_status_name(status: RequestStatus) -> &'static str {
+    match status {
+        RequestStatus::InProgress => "in_progress",
+        RequestStatus::Completed => "completed",
+        RequestStatus::Failed => "failed",
+        RequestStatus::Interrupted => "interrupted",
+    }
+}
+
 async fn resolve_previous_response_id(
     state: &ProxyState,
     previous: Option<&str>,
-) -> Result<Option<String>, Response<Body>> {
+) -> Result<PreviousResponseResolution, Response<Body>> {
     let Some(previous) = previous.filter(|value| !value.trim().is_empty()) else {
-        return Ok(None);
+        return Ok(PreviousResponseResolution::none());
     };
     match state.store.response_status(previous).await {
-        Ok(Some(RequestStatus::Completed)) => Ok(Some(previous.to_owned())),
-        Ok(Some(_)) | Ok(None) => Ok(None),
+        Ok(Some(RequestStatus::Completed)) => Ok(PreviousResponseResolution::resolved(previous)),
+        Ok(Some(status)) => Ok(PreviousResponseResolution::non_completed(previous, status)),
+        Ok(None) => Ok(PreviousResponseResolution::missing(previous)),
         Err(error) => Err(json_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "state_previous_response_check_failed",
             error.to_string(),
         )),
+    }
+}
+
+async fn record_previous_response_resolution_warning(
+    state: &ProxyState,
+    id: &str,
+    input: &Value,
+    resolution: &PreviousResponseResolution,
+) {
+    if !resolution.should_warn(input) {
+        return;
+    }
+    let _ = state
+        .store
+        .record_event(
+            "warn",
+            "previous_response_resolution_warning",
+            "previous_response_id could not be used for local history replay.",
+            Some(&json!({
+                "id": id,
+                "previous_response_resolution": resolution.diagnostic(),
+                "requires_full_context_for_lossless_replay": true
+            })),
+        )
+        .await;
+}
+
+#[derive(Debug, Clone, Default)]
+struct RuntimeContextStorageDiagnostic {
+    current_mode: &'static str,
+    current_full_context_not_stored: bool,
+    current_original_input_items: Option<usize>,
+    current_original_input_hash: Option<String>,
+    previous_full_context_not_stored: bool,
+    previous_full_context_response_id: Option<String>,
+    continuation_warning: bool,
+}
+
+impl RuntimeContextStorageDiagnostic {
+    fn diagnostic(&self) -> Value {
+        json!({
+            "current": {
+                "mode": self.current_mode,
+                "full_context_not_stored": self.current_full_context_not_stored,
+                "original_input_items": self.current_original_input_items,
+                "original_input_hash": self.current_original_input_hash.as_deref()
+            },
+            "previous": {
+                "full_context_not_stored": self.previous_full_context_not_stored,
+                "response_id": self.previous_full_context_response_id.as_deref()
+            },
+            "continuation_warning": self.continuation_warning
+        })
+    }
+}
+
+async fn runtime_context_storage_diagnostic(
+    state: &ProxyState,
+    input: &Value,
+    previous_for_context: Option<&str>,
+) -> RuntimeContextStorageDiagnostic {
+    let input_items = input.get("input").and_then(Value::as_array).map(Vec::len);
+    let current_full_context_not_stored = request_looks_like_codex_full_context(input);
+    let current_original_input_hash = current_full_context_not_stored.then(|| {
+        stable_log_hash_hex(
+            &serde_json::to_vec(input.get("input").unwrap_or(&Value::Null)).unwrap_or_default(),
+        )
+    });
+    let mut diagnostic = RuntimeContextStorageDiagnostic {
+        current_mode: if current_full_context_not_stored {
+            "codex_full_context_not_stored"
+        } else {
+            "stored_runtime_context"
+        },
+        current_full_context_not_stored,
+        current_original_input_items: input_items.filter(|_| current_full_context_not_stored),
+        current_original_input_hash,
+        previous_full_context_not_stored: false,
+        previous_full_context_response_id: None,
+        continuation_warning: false,
+    };
+
+    if let Some(previous) = previous_for_context {
+        if let Some(response_id) = first_full_context_not_stored_response_id(state, previous).await
+        {
+            diagnostic.previous_full_context_not_stored = true;
+            diagnostic.previous_full_context_response_id = Some(response_id);
+            diagnostic.continuation_warning = !current_full_context_not_stored;
+        }
+    }
+    diagnostic
+}
+
+async fn first_full_context_not_stored_response_id(
+    state: &ProxyState,
+    previous: &str,
+) -> Option<String> {
+    let chain = state
+        .store
+        .response_context_chain(previous, 10_000)
+        .await
+        .ok()?;
+    chain
+        .into_iter()
+        .find(|record| response_has_full_context_not_stored_marker(&record.input))
+        .map(|record| record.id)
+}
+
+fn response_has_full_context_not_stored_marker(input: &Value) -> bool {
+    input
+        .pointer("/_codeseex_runtime/mode")
+        .and_then(Value::as_str)
+        == Some("codex_full_context_not_stored")
+}
+
+fn stable_log_hash_hex(bytes: &[u8]) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+async fn record_runtime_context_storage_events(
+    state: &ProxyState,
+    id: &str,
+    diagnostic: &RuntimeContextStorageDiagnostic,
+) {
+    if diagnostic.current_full_context_not_stored {
+        let _ = state
+            .store
+            .record_event(
+                "debug",
+                "runtime_context_storage",
+                "CodeSeeX did not duplicate Codex full-context input in runtime storage.",
+                Some(&json!({
+                    "id": id,
+                    "runtime_context_storage": diagnostic.diagnostic()
+                })),
+            )
+            .await;
+    }
+    if diagnostic.continuation_warning {
+        let _ = state
+            .store
+            .record_event(
+                "warn",
+                "runtime_context_storage_warning",
+                "Continuation references a prior full-context request whose original input was not duplicated in CodeSeeX runtime storage.",
+                Some(&json!({
+                    "id": id,
+                    "runtime_context_storage": diagnostic.diagnostic(),
+                    "requires_full_context_for_lossless_replay": true
+                })),
+            )
+            .await;
     }
 }
 

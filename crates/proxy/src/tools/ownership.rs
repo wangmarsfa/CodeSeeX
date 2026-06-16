@@ -78,14 +78,14 @@ pub(crate) fn resolve_tool_owner(
     if is_web_search_tool(name) {
         return ToolOwner::CodeseexHosted(HostedTool::WebSearch);
     }
+    if external_tool_context.has_external_tool(name) {
+        return ToolOwner::External;
+    }
     if crate::tools::is_known_code_tool(name) {
         return ToolOwner::CodeseexHosted(HostedTool::BuiltIn);
     }
     if community_tools.is_known_tool(name) {
         return ToolOwner::CodeseexHosted(HostedTool::Community);
-    }
-    if external_tool_context.has_external_tool(name) {
-        return ToolOwner::External;
     }
     ToolOwner::Unknown
 }
@@ -136,7 +136,7 @@ mod tests {
     }
 
     #[test]
-    fn codeseex_known_tool_wins_over_same_name_external_tool() {
+    fn ordinary_external_tool_wins_over_same_name_codeseex_tool() {
         let external = crate::tool_passthrough::ToolContext::from_request_tools(Some(&json!([
             {
                 "type": "function",
@@ -154,7 +154,7 @@ mod tests {
             &external,
         );
 
-        assert_eq!(owner, ToolOwner::CodeseexHosted(HostedTool::BuiltIn));
+        assert_eq!(owner, ToolOwner::External);
     }
 
     #[test]
@@ -205,6 +205,30 @@ mod tests {
         );
 
         assert_eq!(partition.native.len(), 1);
+        assert!(partition.external.is_empty());
+        assert!(partition.code.is_empty());
+    }
+
+    #[test]
+    fn web_search_wins_over_external_collision() {
+        let external = crate::tool_passthrough::ToolContext::from_request_tools(Some(&json!([
+            {
+                "type": "function",
+                "function": {
+                    "name": "web_search",
+                    "description": "client-side web search declaration",
+                    "parameters": { "type": "object", "properties": {} }
+                }
+            }
+        ])));
+
+        let partition = partition_tool_calls(
+            vec![call("web_search")],
+            &crate::community_tools::CommunityToolSet::default(),
+            &external,
+        );
+
+        assert_eq!(partition.hosted.len(), 1);
         assert!(partition.external.is_empty());
         assert!(partition.code.is_empty());
     }
