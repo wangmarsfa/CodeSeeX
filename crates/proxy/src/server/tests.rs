@@ -3080,7 +3080,7 @@ async fn nonstreaming_client_tool_handoff_is_not_user_completed_turn() {
 }
 
 #[tokio::test]
-async fn streaming_synthetic_tool_search_bridge_returns_codex_function_call() {
+async fn streaming_synthetic_tool_search_bridge_returns_codex_tool_search_call() {
     let fake_state = FakeUpstreamState::default();
     let fake_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let fake_addr = fake_listener.local_addr().unwrap();
@@ -3145,12 +3145,13 @@ async fn streaming_synthetic_tool_search_bridge_returns_codex_function_call() {
         .await
         .unwrap();
 
+    assert!(body.contains("\"type\":\"tool_search_call\""), "{body}");
+    assert!(body.contains("\"execution\":\"client\""), "{body}");
+    assert!(body.contains("sub-agent"), "{body}");
     assert!(
-        body.contains("response.function_call_arguments.delta"),
+        !body.contains("response.function_call_arguments.delta"),
         "{body}"
     );
-    assert!(body.contains("\"name\":\"tool_search_tool\""), "{body}");
-    assert!(body.contains("sub-agent"), "{body}");
     assert!(!body.contains("\"type\":\"proxy_tool_call\""), "{body}");
     assert!(!body.contains("tool_loop_failed"), "{body}");
 

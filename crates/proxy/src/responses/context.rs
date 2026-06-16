@@ -708,6 +708,7 @@ fn response_input_tool_output_ids(input: &Value) -> HashSet<String> {
                 Some("function_call_output")
                     | Some("custom_tool_call_output")
                     | Some("web_search_call_output")
+                    | Some("tool_search_output")
             )
         })
         .filter_map(response_item_call_id)
@@ -897,7 +898,11 @@ fn reasoning_text_from_item(item: &Value, config: &AppConfig) -> Option<String> 
 
 fn response_function_call_to_chat_tool_call(item: &Value) -> Option<Value> {
     let call_id = item.get("call_id").or_else(|| item.get("id"))?.as_str()?;
-    let name = item.get("name").and_then(Value::as_str)?;
+    let name = if item.get("type").and_then(Value::as_str) == Some("tool_search_call") {
+        "tool_search_tool"
+    } else {
+        item.get("name").and_then(Value::as_str)?
+    };
     let arguments = normalize_response_tool_arguments(item);
     let arguments = if item.get("type").and_then(Value::as_str) == Some("custom_tool_call")
         && name == "apply_patch"
@@ -924,7 +929,7 @@ fn response_function_call_to_chat_tool_call(item: &Value) -> Option<Value> {
 fn response_item_is_tool_call(item: &Value) -> bool {
     matches!(
         item.get("type").and_then(Value::as_str),
-        Some("function_call") | Some("custom_tool_call")
+        Some("function_call") | Some("custom_tool_call") | Some("tool_search_call")
     )
 }
 
@@ -1590,6 +1595,104 @@ mod tests {
         assert_eq!(tool_message.role, "tool");
         assert_eq!(tool_message.tool_call_id.as_deref(), Some("call_mcp"));
         assert!(tool_message.content.contains("42"));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn history_keeps_parent_tool_search_call_for_matching_output() {
+        let dir =
+            std::env::temp_dir().join(format!("codeseex-context-{}", Uuid::new_v4().simple()));
+        let store = Store::open(&dir).await.expect("open store");
+        let state = ProxyState {
+            config: Arc::new(AppConfig {
+                data_dir: dir.clone(),
+                ..Default::default()
+            }),
+            client: reqwest::Client::new(),
+            store,
+        };
+
+        state
+            .store
+            .checkpoint_request(
+                "resp_parent",
+                None,
+                Some("deepseek-v4-pro"),
+                &json!({
+                    "input": [{"role":"user","content":[{"type":"input_text","text":"find agent tools"}]}]
+                }),
+            )
+            .await
+            .expect("checkpoint parent");
+        state
+            .store
+            .replace_request_turn_messages(
+                "resp_parent",
+                &[
+                    json!({"role":"user","content":"find agent tools"}),
+                    json!({
+                        "role":"assistant",
+                        "content":"",
+                        "tool_calls":[{
+                            "id":"call_search",
+                            "type":"function",
+                            "function":{"name":"tool_search_tool","arguments":"{\"query\":\"spawn_agent\"}"}
+                        }]
+                    }),
+                ],
+            )
+            .await
+            .expect("turn messages");
+        state
+            .store
+            .finish_request(
+                "resp_parent",
+                RequestStatus::Completed,
+                Some(&json!({
+                    "output": [{
+                        "type":"tool_search_call",
+                        "call_id":"call_search",
+                        "execution":"client",
+                        "arguments":{"query":"spawn_agent"}
+                    }]
+                })),
+                None,
+            )
+            .await
+            .expect("finish parent");
+
+        let input = json!({
+            "input": [{
+                "type":"tool_search_output",
+                "call_id":"call_search",
+                "tools":[{
+                    "type":"namespace",
+                    "name":"multi_agent_v1",
+                    "tools":[]
+                }]
+            }]
+        });
+        let built = build_response_context(&state, &input, Some("resp_parent")).await;
+        let assistant_index = built
+            .messages
+            .iter()
+            .position(|message| {
+                message
+                    .tool_calls
+                    .as_ref()
+                    .map(|calls| calls.iter().any(|call| call["id"] == "call_search"))
+                    .unwrap_or(false)
+            })
+            .expect("parent tool_search call should replay");
+        let tool_message = built
+            .messages
+            .get(assistant_index + 1)
+            .expect("tool_search output should immediately follow parent call");
+
+        assert_eq!(tool_message.role, "tool");
+        assert_eq!(tool_message.tool_call_id.as_deref(), Some("call_search"));
+        assert!(tool_message.content.contains("multi_agent_v1"));
 
         let _ = std::fs::remove_dir_all(dir);
     }

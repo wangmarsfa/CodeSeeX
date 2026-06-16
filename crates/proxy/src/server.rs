@@ -1386,6 +1386,43 @@ fn external_client_tool_sse_events(
     output_index: &mut u64,
     sequence: &mut u64,
 ) -> (Bytes, Value) {
+    if external_tool_context.is_codex_tool_search_tool(&call.name) {
+        if let Some(finished) = visible_tool_bridge.finish_codex_tool_search(
+            response_id,
+            call,
+            external_tool_context,
+            sequence,
+        ) {
+            return (finished.bytes, finished.item);
+        }
+        let item = external_tool_context.response_item_from_chat_call(call);
+        let call_output_index = *output_index;
+        *output_index += 1;
+        let mut added_item = item.clone();
+        added_item["status"] = Value::String("in_progress".to_owned());
+        let mut bytes = sse_bytes(
+            "response.output_item.added",
+            json!({
+                "type": "response.output_item.added",
+                "response_id": response_id,
+                "output_index": call_output_index,
+                "item": added_item,
+                "sequence_number": next_sequence(sequence)
+            }),
+        )
+        .to_vec();
+        bytes.extend_from_slice(&sse_bytes(
+            "response.output_item.done",
+            json!({
+                "type": "response.output_item.done",
+                "response_id": response_id,
+                "output_index": call_output_index,
+                "item": item,
+                "sequence_number": next_sequence(sequence)
+            }),
+        ));
+        return (Bytes::from(bytes), item);
+    }
     if let Some(finished) = visible_tool_bridge.finish_external_function(
         response_id,
         call,

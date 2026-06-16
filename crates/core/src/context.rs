@@ -458,7 +458,10 @@ fn response_item_to_chat_tool_call(
     let item_type = item.get("type").and_then(Value::as_str);
     if !matches!(
         item_type,
-        Some("function_call") | Some("custom_tool_call") | Some("web_search_call")
+        Some("function_call")
+            | Some("custom_tool_call")
+            | Some("web_search_call")
+            | Some("tool_search_call")
     ) {
         return None;
     }
@@ -480,6 +483,9 @@ fn response_item_to_chat_tool_call(
 fn response_item_tool_name(item: &Value) -> Option<String> {
     if item.get("type").and_then(Value::as_str) == Some("web_search_call") {
         return Some("web_search".to_owned());
+    }
+    if item.get("type").and_then(Value::as_str) == Some("tool_search_call") {
+        return Some("tool_search_tool".to_owned());
     }
     item.get("name")
         .and_then(Value::as_str)
@@ -533,6 +539,7 @@ fn response_item_is_tool_output(item: &Value) -> bool {
         Some("function_call_output")
             | Some("custom_tool_call_output")
             | Some("web_search_call_output")
+            | Some("tool_search_output")
     )
 }
 
@@ -606,6 +613,10 @@ fn response_item_to_tool_result_message(
         .or_else(|| item.get("content"))
         .or_else(|| item.get("result"))
         .map(content_to_text)
+        .or_else(|| {
+            (item.get("type").and_then(Value::as_str) == Some("tool_search_output"))
+                .then(|| content_to_text(item))
+        })
         .unwrap_or_default();
     let semantic_fact = mcp_resource_listing_semantic_fact(
         seen_tool_call_names.get(call_id).map(String::as_str),
@@ -983,6 +994,41 @@ mod tests {
         assert!(compiled.messages[0]
             .content
             .contains("Success. Updated files."));
+    }
+
+    #[test]
+    fn reconstructs_tool_search_call_output_pair() {
+        let input = json!([
+            {
+                "type": "tool_search_call",
+                "call_id": "call_search",
+                "execution": "client",
+                "arguments": { "query": "spawn_agent", "limit": 5 }
+            },
+            {
+                "type": "tool_search_output",
+                "call_id": "call_search",
+                "tools": [
+                    {
+                        "type": "namespace",
+                        "name": "multi_agent_v1",
+                        "tools": []
+                    }
+                ]
+            }
+        ]);
+        let compiled = compile_responses_input(&input);
+
+        assert_eq!(compiled.messages[0].role, "assistant");
+        assert_eq!(
+            compiled.messages[0].tool_calls.as_ref().unwrap()[0]["function"]["name"],
+            "tool_search_tool"
+        );
+        assert_eq!(compiled.messages[1].role, "tool");
+        assert_eq!(
+            compiled.messages[1].tool_call_id.as_deref(),
+            Some("call_search")
+        );
     }
 
     #[test]

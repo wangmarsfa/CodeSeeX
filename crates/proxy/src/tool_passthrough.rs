@@ -16,6 +16,13 @@ pub struct ToolContext {
 struct ToolEntry {
     response_name: String,
     namespace: Option<String>,
+    kind: ToolEntryKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolEntryKind {
+    Function,
+    CodexToolSearch,
 }
 
 impl ToolContext {
@@ -88,6 +95,7 @@ impl ToolContext {
                 "additionalProperties": false
             }),
             namespace: None,
+            kind: ToolEntryKind::CodexToolSearch,
         });
     }
 
@@ -111,6 +119,7 @@ impl ToolContext {
             ToolEntry {
                 response_name: declaration.response_name,
                 namespace: declaration.namespace,
+                kind: declaration.kind,
             },
         );
     }
@@ -125,6 +134,20 @@ impl ToolContext {
         item_id: &str,
     ) -> Value {
         let entry = self.entries.get(&call.name);
+        if entry
+            .map(|value| value.kind == ToolEntryKind::CodexToolSearch)
+            .unwrap_or(false)
+        {
+            return json!({
+                "id": item_id,
+                "type": "tool_search_call",
+                "status": "completed",
+                "execution": "client",
+                "call_id": call.id,
+                "arguments": parse_tool_arguments(&call.arguments)
+            });
+        }
+
         let mut item = json!({
             "id": item_id,
             "type": "function_call",
@@ -138,6 +161,13 @@ impl ToolContext {
         }
         item
     }
+
+    pub fn is_codex_tool_search_tool(&self, name: &str) -> bool {
+        self.entries
+            .get(name)
+            .map(|entry| entry.kind == ToolEntryKind::CodexToolSearch)
+            .unwrap_or(false)
+    }
 }
 
 #[derive(Debug)]
@@ -146,6 +176,7 @@ struct ToolDeclaration {
     description: String,
     parameters: Value,
     namespace: Option<String>,
+    kind: ToolEntryKind,
 }
 
 fn normalize_tool_declarations(tool: &Value, index: usize) -> Vec<ToolDeclaration> {
@@ -237,7 +268,12 @@ fn normalize_single_tool(
         description,
         parameters: normalize_schema(parameters),
         namespace,
+        kind: ToolEntryKind::Function,
     })
+}
+
+fn parse_tool_arguments(arguments: &str) -> Value {
+    serde_json::from_str(arguments).unwrap_or_else(|_| json!({}))
 }
 
 fn namespace_from_tool(tool: &Value) -> Option<String> {
@@ -500,6 +536,44 @@ mod tests {
             .upstream_names()
             .iter()
             .any(|name| name == "tool_search_tool"));
+    }
+
+    #[test]
+    fn synthetic_tool_search_bridge_returns_native_search_call_item() {
+        let mut context = ToolContext::from_request_tools(Some(&json!([
+            {
+                "type": "function",
+                "function": {
+                    "name": "shell_command",
+                    "description": "Run a shell command",
+                    "parameters": { "type": "object", "properties": {} }
+                }
+            }
+        ])));
+        context.ensure_codex_tool_search_bridge();
+
+        let item = context.response_item_from_chat_call(&ChatToolCall {
+            id: "call_search".to_owned(),
+            name: "tool_search_tool".to_owned(),
+            arguments: r#"{"query":"sub-agent","limit":5}"#.to_owned(),
+        });
+
+        assert_eq!(
+            item.get("type").and_then(Value::as_str),
+            Some("tool_search_call")
+        );
+        assert_eq!(
+            item.get("execution").and_then(Value::as_str),
+            Some("client")
+        );
+        assert_eq!(
+            item.pointer("/arguments/query").and_then(Value::as_str),
+            Some("sub-agent")
+        );
+        assert_eq!(
+            item.pointer("/arguments/limit").and_then(Value::as_u64),
+            Some(5)
+        );
     }
 
     #[test]

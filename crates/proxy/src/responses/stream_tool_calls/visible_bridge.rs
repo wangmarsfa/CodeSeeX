@@ -36,6 +36,7 @@ struct VisibleToolState {
 enum VisibleToolKind {
     NativeApplyPatch,
     ExternalFunction,
+    CodexToolSearch,
 }
 
 impl StreamingVisibleToolBridge {
@@ -181,6 +182,21 @@ impl StreamingVisibleToolBridge {
         })
     }
 
+    pub(crate) fn finish_codex_tool_search(
+        &mut self,
+        response_id: &str,
+        call: &ChatToolCall,
+        external_tool_context: &ToolContext,
+        sequence: &mut u64,
+    ) -> Option<FinishedVisibleTool> {
+        let state = self.find_state_mut(call, VisibleToolKind::CodexToolSearch)?;
+        let item_id = state.item_id.clone()?;
+        let output_index = state.output_index?;
+        let item = external_tool_context.response_item_from_chat_call_with_id(call, &item_id);
+        let bytes = output_item_done_bytes(response_id, output_index, &item, sequence);
+        Some(FinishedVisibleTool { item, bytes })
+    }
+
     fn find_state_mut(
         &mut self,
         call: &ChatToolCall,
@@ -242,6 +258,15 @@ impl VisibleToolState {
             let item = external_tool_context.response_item_from_chat_call_with_id(&call, &item_id);
             self.item_id = Some(item_id);
             self.output_index = Some(call_output_index);
+            if external_tool_context.is_codex_tool_search_tool(&self.name) {
+                self.kind = Some(VisibleToolKind::CodexToolSearch);
+                return Some(output_item_added_bytes(
+                    response_id,
+                    call_output_index,
+                    &item,
+                    sequence,
+                ));
+            }
             self.kind = Some(VisibleToolKind::ExternalFunction);
             return Some(function_call_sse_added(
                 response_id,
@@ -289,9 +314,50 @@ impl VisibleToolState {
                     ));
                 }
             }
+            VisibleToolKind::CodexToolSearch => {
+                self.emitted_input.push_str(chunk);
+            }
         }
         None
     }
+}
+
+fn output_item_added_bytes(
+    response_id: &str,
+    output_index: u64,
+    item: &Value,
+    sequence: &mut u64,
+) -> Bytes {
+    let mut added_item = item.clone();
+    added_item["status"] = Value::String("in_progress".to_owned());
+    sse_bytes(
+        "response.output_item.added",
+        json!({
+            "type": "response.output_item.added",
+            "response_id": response_id,
+            "output_index": output_index,
+            "item": added_item,
+            "sequence_number": next_sequence(sequence)
+        }),
+    )
+}
+
+fn output_item_done_bytes(
+    response_id: &str,
+    output_index: u64,
+    item: &Value,
+    sequence: &mut u64,
+) -> Bytes {
+    sse_bytes(
+        "response.output_item.done",
+        json!({
+            "type": "response.output_item.done",
+            "response_id": response_id,
+            "output_index": output_index,
+            "item": item,
+            "sequence_number": next_sequence(sequence)
+        }),
+    )
 }
 
 fn custom_tool_input_delta_bytes(
