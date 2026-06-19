@@ -23,7 +23,5 @@
 
 .tool-card-description { color: var(--text-secondary); font-size: 12.5px; line-height: 1.5; transition: var(--theme-transition); }
 .tool-card-body { padding: 0 20px; background: var(--bg-panel); }
-.tool-card-body .setting-item { border-top: 1px solid var(--border-color); }
-.tool-card-body .setting-item:first-child { border-top: 0; }
 .tool-card-body .setting-item > span { white-space: nowrap; }
 .tool-card-body .segmented-control { flex: none; margin-left: auto; }

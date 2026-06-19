@@ -225,17 +225,9 @@
   font-weight: 700;
 }
 
-.usage-metric-value.usage-cache-strong {
-  color: #10b981;
-}
-
 .usage-cache-good {
   color: #84cc16;
   font-weight: 700;
-}
-
-.usage-metric-value.usage-cache-good {
-  color: #84cc16;
 }
 
 .usage-cache-mid {
@@ -243,26 +235,14 @@
   font-weight: 700;
 }
 
-.usage-metric-value.usage-cache-mid {
-  color: #f59e0b;
-}
-
 .usage-cache-low {
   color: #ef4444;
   font-weight: 700;
 }
 
-.usage-metric-value.usage-cache-low {
-  color: #ef4444;
-}
-
 .usage-cache-none {
   color: var(--text-main);
   font-weight: 650;
-}
-
-.usage-metric-value.usage-cache-none {
-  color: var(--text-main);
 }
 
 .usage-trace-pure-container {
