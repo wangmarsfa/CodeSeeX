@@ -88,6 +88,37 @@ pub(crate) fn summarize_tool_result(result: &Value) -> String {
     compact_line(&redact_inline_data_urls(&text), 2400)
 }
 
+pub(crate) fn tool_result_event_detail(
+    request_id: &str,
+    call: &ChatToolCall,
+    iteration: u32,
+    result: &Value,
+) -> Value {
+    let mut detail = json!({
+        "id": request_id,
+        "call_id": call.id,
+        "name": call.name,
+        "iteration": iteration,
+        "ok": result.get("ok").and_then(Value::as_bool),
+        "summary": summarize_tool_result_for_log(result),
+        "result_size": crate::diagnostics::tool_result_size_summary(result)
+    });
+    if crate::tools::ownership::is_web_search_tool(&call.name) {
+        if let Some(object) = detail.as_object_mut() {
+            object.insert(
+                "web_search".to_owned(),
+                json!({
+                    "sources_attempted": result.get("sources_attempted").cloned().unwrap_or(Value::Null),
+                    "sources_deprioritized": result.get("sources_deprioritized").cloned().unwrap_or(Value::Null),
+                    "source_diagnostics": compact_web_source_diagnostic_array(result.get("source_diagnostics")),
+                    "fallback_errors": compact_web_source_diagnostic_array(result.get("fallback_errors"))
+                }),
+            );
+        }
+    }
+    detail
+}
+
 pub(crate) fn model_replay_tool_result(call: &ChatToolCall, result: &Value) -> String {
     if crate::tools::ownership::is_web_search_tool(&call.name) {
         return compact_web_search_result_for_model(result).to_string();
@@ -115,10 +146,16 @@ fn compact_web_search_result_for_model(result: &Value) -> Value {
         "candidate_count": result.get("candidate_count").cloned().unwrap_or(Value::Null),
         "opened_count": result.get("opened_count").cloned().unwrap_or(Value::Null),
         "failure_count": result.get("failure_count").cloned().unwrap_or(Value::Null),
+        "low_confidence": result.get("low_confidence").cloned().unwrap_or(Value::Null),
+        "low_confidence_fallback": result.get("low_confidence_fallback").cloned().unwrap_or(Value::Null),
         "results": compact_web_result_array(result.get("results")),
         "candidates": compact_web_result_array(result.get("candidates")),
         "opened_results": compact_web_result_array(result.get("opened_results")),
         "failed_results": compact_web_diagnostic_array(result.get("failed_results")),
+        "sources_attempted": result.get("sources_attempted").cloned().unwrap_or(Value::Null),
+        "sources_deprioritized": result.get("sources_deprioritized").cloned().unwrap_or(Value::Null),
+        "source_diagnostics": compact_web_source_diagnostic_array(result.get("source_diagnostics")),
+        "fallback_errors": compact_web_source_diagnostic_array(result.get("fallback_errors")),
         "error": result.get("error").cloned().unwrap_or(Value::Null),
         "message": result.get("message").cloned().unwrap_or(Value::Null),
         "open_ids": result.get("open_ids").cloned().unwrap_or(Value::Null),
@@ -126,6 +163,29 @@ fn compact_web_search_result_for_model(result: &Value) -> Value {
         "truncated": result.get("truncated").cloned().unwrap_or(Value::Null),
         "codeseex_compacted_for_model": true
     })
+}
+
+fn compact_web_source_diagnostic_array(value: Option<&Value>) -> Value {
+    let Some(items) = value.and_then(Value::as_array) else {
+        return Value::Array(Vec::new());
+    };
+    Value::Array(
+        items
+            .iter()
+            .take(8)
+            .map(|item| {
+                json!({
+                    "source": item.get("source").cloned().unwrap_or(Value::Null),
+                    "ok": item.get("ok").cloned().unwrap_or(Value::Null),
+                    "status": item.get("status").cloned().unwrap_or(Value::Null),
+                    "error": item.get("error").cloned().unwrap_or(Value::Null),
+                    "result_count": item.get("result_count").cloned().unwrap_or(Value::Null),
+                    "usable_result_count": item.get("usable_result_count").cloned().unwrap_or(Value::Null),
+                    "max_score": item.get("max_score").cloned().unwrap_or(Value::Null)
+                })
+            })
+            .collect(),
+    )
 }
 
 fn compact_web_result_array(value: Option<&Value>) -> Value {
@@ -295,8 +355,13 @@ fn web_search_result_summary(result: &Value) -> String {
         .and_then(Value::as_array)
         .map(Vec::len)
         .unwrap_or(0);
+    let source_diagnostics = result
+        .get("source_diagnostics")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
     format!(
-        "web_search {stage} ok={ok} candidates={count} sources=[{sources}] deprioritized=[{deprioritized}] fallback_errors={fallback_errors}"
+        "web_search {stage} ok={ok} candidates={count} sources=[{sources}] deprioritized=[{deprioritized}] fallback_errors={fallback_errors} source_diagnostics={source_diagnostics}"
     )
 }
 
@@ -350,6 +415,45 @@ mod tests {
         assert!(replay.contains("https://example.com/weather"));
         assert!(replay.chars().count() <= 2_500);
         assert!(!replay.contains("WEB_SEARCH_BODY_WEB_SEARCH_BODY"));
+    }
+
+    #[test]
+    fn model_replay_web_search_failure_keeps_source_diagnostics() {
+        let replay = model_replay_tool_result(
+            &call("web_search"),
+            &json!({
+                "ok": false,
+                "stage": "search",
+                "mode": "search",
+                "candidate_count": 0,
+                "sources_attempted": ["bing_html", "duckduckgo_lite"],
+                "source_diagnostics": [{
+                    "source": "bing_html",
+                    "ok": true,
+                    "error": "filtered_low_confidence",
+                    "result_count": 2,
+                    "usable_result_count": 0,
+                    "max_score": 0.08
+                }],
+                "fallback_errors": [{
+                    "source": "duckduckgo_lite",
+                    "error": "request_failed",
+                    "message": "timeout"
+                }]
+            }),
+        );
+        let replay_json: Value = serde_json::from_str(&replay).expect("replay json");
+
+        assert_eq!(replay_json["sources_attempted"][0], "bing_html");
+        assert_eq!(
+            replay_json["source_diagnostics"][0]["error"],
+            "filtered_low_confidence"
+        );
+        assert_eq!(
+            replay_json["fallback_errors"][0]["source"],
+            "duckduckgo_lite"
+        );
+        assert!(replay.chars().count() <= 2_500);
     }
 
     #[test]
@@ -449,7 +553,7 @@ mod tests {
 
         assert_eq!(
             summary,
-            "web_search search ok=false candidates=0 sources=[bing_html] deprioritized=[duckduckgo_lite] fallback_errors=1"
+            "web_search search ok=false candidates=0 sources=[bing_html] deprioritized=[duckduckgo_lite] fallback_errors=1 source_diagnostics=0"
         );
     }
 }

@@ -1505,6 +1505,19 @@ fn compact_event_detail(event_type: &str, detail: &Value) -> Option<Value> {
                 "upstream_error",
             ],
         ),
+        "tool_loop_repeated_failure_stopped" | "tool_loop_web_search_budget_stopped" => {
+            copy_log_fields(
+                object,
+                &mut output,
+                &["id", "iteration", "error", "recover_with_final_response"],
+            )
+        }
+        "tool_loop_iteration_limit_stopped" => {
+            copy_log_fields(object, &mut output, &["id", "iteration", "limit", "error"])
+        }
+        "tool_loop_repeated_call" => {
+            copy_log_fields(object, &mut output, &["id", "call_id", "name", "iteration"])
+        }
         "tool_call" => copy_log_fields(object, &mut output, &["id", "name", "scope", "iteration"]),
         "tool_result" => {
             copy_log_fields(
@@ -1515,17 +1528,28 @@ fn compact_event_detail(event_type: &str, detail: &Value) -> Option<Value> {
             copy_safe_diagnostic_fields(
                 object,
                 &mut output,
-                &[(
-                    "result_size",
-                    &[
-                        "result_json_chars",
-                        "result_hash",
-                        "ok",
-                        "diagnostic_bytes",
-                        "diagnostic_opened_count",
-                        "diagnostic_failure_count",
-                    ][..],
-                )],
+                &[
+                    (
+                        "result_size",
+                        &[
+                            "result_json_chars",
+                            "result_hash",
+                            "ok",
+                            "diagnostic_bytes",
+                            "diagnostic_opened_count",
+                            "diagnostic_failure_count",
+                        ][..],
+                    ),
+                    (
+                        "web_search",
+                        &[
+                            "sources_attempted",
+                            "sources_deprioritized",
+                            "source_diagnostics",
+                            "fallback_errors",
+                        ][..],
+                    ),
+                ],
             );
             if let Some(summary) = object.get("summary") {
                 output.insert(
@@ -4081,6 +4105,55 @@ mod tests {
             .path();
         let bytes = std::fs::metadata(log_file).expect("log metadata").len();
         assert!(bytes < 1_000);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn web_search_tool_result_keeps_safe_source_diagnostics() {
+        let dir = temp_dir("web-search-tool-result-log");
+        let store = Store::open(&dir).await.expect("open store");
+        store
+            .record_event(
+                "info",
+                "tool_result",
+                "Tool result returned.",
+                Some(&json!({
+                    "id": "resp_web",
+                    "name": "web_search",
+                    "iteration": 1,
+                    "ok": false,
+                    "summary": "web_search search ok=false candidates=0",
+                    "web_search": {
+                        "sources_attempted": ["bing_html"],
+                        "source_diagnostics": [{
+                            "source": "bing_html",
+                            "error": "filtered_low_confidence",
+                            "result_count": 2,
+                            "usable_result_count": 0,
+                            "unsafe_body": "do not keep me"
+                        }],
+                        "fallback_errors": [{
+                            "source": "duckduckgo_lite",
+                            "error": "request_failed"
+                        }],
+                        "unsafe_html": "<html>secret</html>"
+                    }
+                })),
+            )
+            .await
+            .expect("record event");
+
+        let (events, _) = store.recent_events(10, None).await.expect("events");
+        let detail = events[0].detail.as_ref().expect("detail");
+        assert_eq!(detail["web_search"]["sources_attempted"][0], "bing_html");
+        assert_eq!(
+            detail["web_search"]["source_diagnostics"][0]["error"],
+            "filtered_low_confidence"
+        );
+        assert!(detail["web_search"].get("unsafe_html").is_none());
+        assert!(detail["web_search"]["source_diagnostics"][0]
+            .get("unsafe_body")
+            .is_none());
         let _ = std::fs::remove_dir_all(dir);
     }
 

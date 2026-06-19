@@ -159,7 +159,6 @@ impl CodexServiceRequestKind {
             Self::None => "none",
         }
     }
-
 }
 
 fn service_classification_source(

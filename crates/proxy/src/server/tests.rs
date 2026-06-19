@@ -738,9 +738,26 @@ async fn fake_repeated_failing_web_search_chat_completions(
     State(state): State<FakeUpstreamState>,
     Json(payload): Json<Value>,
 ) -> axum::response::Response {
+    let has_tools = payload
+        .get("tools")
+        .and_then(Value::as_array)
+        .map(|items| !items.is_empty())
+        .unwrap_or(false);
     {
         let mut requests = state.requests.lock().expect("fake upstream lock poisoned");
         requests.push(payload);
+    }
+    if !has_tools {
+        return Json(json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "I could not open the pages, so I am answering from the available search diagnostics."
+                }
+            }],
+            "usage": { "prompt_tokens": 9, "completion_tokens": 5, "total_tokens": 14 }
+        }))
+        .into_response();
     }
     Json(json!({
         "choices": [{
@@ -4658,7 +4675,7 @@ async fn repeated_failing_web_search_stops_after_two_failures() {
     let data_dir = temp_workspace("repeated-failing-web-search-stop");
     let config = test_config_with_upstream(data_dir.clone(), fake_addr);
     let store = Store::open(&config.data_dir).await.unwrap();
-    let proxy_state = ProxyState::for_test(config, store);
+    let proxy_state = ProxyState::for_test(config, store.clone());
     let proxy_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let proxy_addr = proxy_listener.local_addr().unwrap();
     let proxy_app = Router::new()
@@ -4684,17 +4701,36 @@ async fn repeated_failing_web_search_stops_after_two_failures() {
         .await
         .unwrap();
 
-    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(response.status(), StatusCode::OK);
     let body = response.text().await.unwrap();
-    assert!(body.contains("failed 2 consecutive times"), "{body}");
+    assert!(body.contains("available search diagnostics"), "{body}");
     assert_eq!(
         fake_state
             .requests
             .lock()
             .expect("fake upstream lock poisoned")
             .len(),
-        2
+        3
     );
+    let (events, _) = store.recent_events(80, None).await.unwrap();
+    assert!(events.iter().any(|event| {
+        event.event_type == "tool_loop_repeated_failure_stopped"
+            && event
+                .detail
+                .as_ref()
+                .and_then(|detail| detail.get("recover_with_final_response"))
+                .and_then(Value::as_bool)
+                == Some(true)
+    }));
+    assert!(!events
+        .iter()
+        .any(|event| event.event_type == "request_failed"
+            && event
+                .detail
+                .as_ref()
+                .and_then(|detail| detail.get("id"))
+                .and_then(Value::as_str)
+                == Some("resp_repeated_failing_web_search")));
 
     let _ = std::fs::remove_dir_all(data_dir);
 }

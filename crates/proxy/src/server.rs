@@ -42,7 +42,7 @@ use crate::tools::diagnostics::{
 };
 use crate::tools::hosted::{
     execute_code_tools_concurrently, is_code_tool_executable, model_replay_tool_result,
-    summarize_tool_result, summarize_tool_result_for_log, tool_fact_line,
+    summarize_tool_result, tool_fact_line, tool_result_event_detail,
 };
 use crate::tools::ownership::ChatToolCall;
 use crate::tools::ownership::{
@@ -318,9 +318,8 @@ fn web_search_source_probe_event_detail(
 }
 
 type WarmSearchSourcesFuture = Pin<Box<dyn Future<Output = Value> + Send>>;
-type WarmSearchSourcesFn = Arc<
-    dyn Fn(codeseex_core::NetworkProxyMode) -> WarmSearchSourcesFuture + Send + Sync + 'static,
->;
+type WarmSearchSourcesFn =
+    Arc<dyn Fn(codeseex_core::NetworkProxyMode) -> WarmSearchSourcesFuture + Send + Sync + 'static>;
 
 fn warm_search_sources_for_probe(
     proxy_mode: codeseex_core::NetworkProxyMode,
@@ -332,8 +331,10 @@ fn app_router(state: ProxyState, config: &AppConfig) -> Router {
     let manager_access = ManagerAccessPolicy {
         listener_host_is_local: authority_host_is_local(&config.host),
     };
-    let manager_router = crate::manager_api::router()
-        .route_layer(middleware::from_fn_with_state(manager_access, manager_local_request_guard));
+    let manager_router = crate::manager_api::router().route_layer(middleware::from_fn_with_state(
+        manager_access,
+        manager_local_request_guard,
+    ));
     let v1_router = Router::new()
         .route("/v1/models", get(models))
         .route("/v1/chat/completions", post(chat_completions))
@@ -3379,7 +3380,7 @@ fn response_stream_from_chat(params: StreamingResponseParams) -> axum::response:
                     return;
                 };
                 let mut tool_messages = Vec::new();
-                let mut repeated_failure_error = None;
+                let mut repeated_failure_stop = None;
                 for executed in executed_tools {
                     let call = executed.call;
                     let mut result = executed.result;
@@ -3417,17 +3418,14 @@ fn response_stream_from_chat(params: StreamingResponseParams) -> axum::response:
                         .store
                         .record_event(
                                 "info",
-                                "tool_result",
-                                "CodeSeeX streaming tool result returned.",
-                            Some(&json!({
-                                "id": response_id,
-                                "call_id": call.id,
-                                "name": call.name,
-                                "iteration": iteration + 1,
-                                "ok": result.get("ok").and_then(Value::as_bool),
-                                "summary": summarize_tool_result_for_log(&result),
-                                "result_size": crate::diagnostics::tool_result_size_summary(&result)
-                            })),
+                            "tool_result",
+                            "CodeSeeX streaming tool result returned.",
+                            Some(&tool_result_event_detail(
+                                &response_id,
+                                &call,
+                                iteration + 1,
+                                &result,
+                            )),
                         )
                         .await;
 
@@ -3450,8 +3448,8 @@ fn response_stream_from_chat(params: StreamingResponseParams) -> axum::response:
                         "content": result_text
                     });
                     tool_messages.push(tool_message.clone());
-                    if let Some(error) = repeated_error {
-                        repeated_failure_error = Some(error);
+                    if let Some(stop) = repeated_error {
+                        repeated_failure_stop = Some(stop);
                     }
                     if let Some(messages) = payload.get_mut("messages").and_then(Value::as_array_mut) {
                         messages.push(tool_message);
@@ -3478,7 +3476,8 @@ fn response_stream_from_chat(params: StreamingResponseParams) -> axum::response:
                     return;
                 }
                 stop_if_cancelled!("response cancelled after tool turn message persistence");
-                if let Some(error) = repeated_failure_error {
+                if let Some(stop) = repeated_failure_stop {
+                    let error = stop.message;
                     let failed_response = failed_billable_response(
                         &response_id,
                         &model,
@@ -3505,6 +3504,38 @@ fn response_stream_from_chat(params: StreamingResponseParams) -> axum::response:
                         )
                         .await;
                     yield stream_failed_event(&response_id, &model, created_at, &mut sequence, "tool_loop_repeated_failure", &error);
+                    yield Bytes::from_static(b"data: [DONE]\n\n");
+                    return;
+                }
+                if let Some(stop) = tool_loop_diagnostics.web_search_budget_stop() {
+                    let error = stop.message;
+                    let failed_response = failed_billable_response(
+                        &response_id,
+                        &model,
+                        "tool_loop_web_search_budget",
+                        &error,
+                        &usage,
+                    );
+                    let detail = json!({
+                        "error": error,
+                        "codeseex_lifecycle": "failed_billable"
+                    });
+                    let _ = state.store.finish_request(&response_id, RequestStatus::Failed, Some(&failed_response), Some(&detail)).await;
+                    let _ = state
+                        .store
+                        .record_event(
+                            "warn",
+                            "tool_loop_web_search_budget_stopped",
+                            "CodeSeeX stopped repeated streaming web_search calls.",
+                            Some(&json!({
+                                "id": response_id,
+                                "iteration": iteration + 1,
+                                "error": error,
+                                "recover_with_final_response": stop.recover_with_final_response
+                            })),
+                        )
+                        .await;
+                    yield stream_failed_event(&response_id, &model, created_at, &mut sequence, "tool_loop_web_search_budget", &error);
                     yield Bytes::from_static(b"data: [DONE]\n\n");
                     return;
                 }

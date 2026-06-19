@@ -1,5 +1,5 @@
 use crate::diagnostics::{
-    client_tool_handoff_diagnostic_event, retry_cache_diagnostic_event, tool_result_size_summary,
+    client_tool_handoff_diagnostic_event, retry_cache_diagnostic_event,
     upstream_call_usage_breakdown_event,
 };
 use crate::responses::usage::{merge_response_usage, response_usage_from_chat_usage};
@@ -8,11 +8,11 @@ use crate::tools::chat_protocol::{
     full_assistant_tool_message_from_chat, normalize_assistant_tool_message,
 };
 use crate::tools::diagnostics::{
-    attach_tool_loop_warning, ToolLoopDiagnostics, MAX_TOOL_LOOP_ITERATIONS,
+    attach_tool_loop_warning, ToolLoopDiagnostics, ToolLoopStop, MAX_TOOL_LOOP_ITERATIONS,
 };
 use crate::tools::hosted::{
     execute_code_tools_concurrently, is_code_tool_executable, model_replay_tool_result,
-    summarize_tool_result, summarize_tool_result_for_log, tool_fact_line,
+    summarize_tool_result, tool_fact_line, tool_result_event_detail,
 };
 use crate::tools::ownership::{
     is_web_search_tool, partition_tool_calls, proxy_executed_calls_in_order,
@@ -229,7 +229,7 @@ pub(crate) async fn complete_chat_with_tools(
         )
         .await;
         let mut tool_messages = Vec::new();
-        let mut repeated_failure_error = None;
+        let mut repeated_failure_stop = None;
         for executed in executed_tools {
             let call = executed.call;
             let mut result = executed.result;
@@ -253,7 +253,6 @@ pub(crate) async fn complete_chat_with_tools(
             }
             let repeated_error =
                 loop_diagnostics.record_tool_result_and_repeated_failure(&call, &result);
-            let result_log_summary = summarize_tool_result_for_log(&result);
             let result_summary = summarize_tool_result(&result);
             let result_text = model_replay_tool_result(&call, &result);
             let fact = tool_fact_line(&call, &result);
@@ -273,15 +272,12 @@ pub(crate) async fn complete_chat_with_tools(
                     "info",
                     "tool_result",
                     "CodeSeeX tool result returned.",
-                    Some(&json!({
-                        "id": context.request_id,
-                        "call_id": call.id,
-                        "name": call.name,
-                        "iteration": iteration + 1,
-                        "ok": result.get("ok").and_then(Value::as_bool),
-                        "summary": result_log_summary,
-                        "result_size": tool_result_size_summary(&result)
-                    })),
+                    Some(&tool_result_event_detail(
+                        context.request_id,
+                        &call,
+                        iteration + 1,
+                        &result,
+                    )),
                 )
                 .await;
             if is_web_search_tool(&call.name) {
@@ -294,8 +290,8 @@ pub(crate) async fn complete_chat_with_tools(
             });
             tool_messages.push(tool_message.clone());
             messages.push(tool_message);
-            if let Some(error) = repeated_error {
-                repeated_failure_error = Some(error);
+            if let Some(stop) = repeated_error {
+                repeated_failure_stop = Some(stop);
             }
         }
         let mut stored_messages = vec![stored_assistant];
@@ -310,7 +306,7 @@ pub(crate) async fn complete_chat_with_tools(
                     &cumulative_usage,
                 )
             })?;
-        if let Some(error) = repeated_failure_error {
+        if let Some(stop) = repeated_failure_stop {
             let _ = context
                 .store
                 .record_event(
@@ -320,11 +316,48 @@ pub(crate) async fn complete_chat_with_tools(
                     Some(&json!({
                         "id": context.request_id,
                         "iteration": iteration + 1,
-                        "error": error
+                        "error": stop.message,
+                        "recover_with_final_response": stop.recover_with_final_response
                     })),
                 )
                 .await;
-            return Err(ToolLoopError::new(error, &cumulative_usage));
+            if stop.recover_with_final_response {
+                return recover_final_response_after_tool_loop_stop(
+                    context,
+                    payload,
+                    cumulative_usage,
+                    stop,
+                    completed_tool_iterations + 1,
+                    response_items,
+                )
+                .await;
+            }
+            return Err(ToolLoopError::new(stop.message, &cumulative_usage));
+        }
+        if let Some(stop) = loop_diagnostics.web_search_budget_stop() {
+            let _ = context
+                .store
+                .record_event(
+                    "warn",
+                    "tool_loop_web_search_budget_stopped",
+                    "CodeSeeX stopped repeated web_search calls.",
+                    Some(&json!({
+                        "id": context.request_id,
+                        "iteration": iteration + 1,
+                        "error": stop.message,
+                        "recover_with_final_response": stop.recover_with_final_response
+                    })),
+                )
+                .await;
+            return recover_final_response_after_tool_loop_stop(
+                context,
+                payload,
+                cumulative_usage,
+                stop,
+                completed_tool_iterations + 1,
+                response_items,
+            )
+            .await;
         }
         if completed_tool_iterations + 1 >= MAX_TOOL_LOOP_ITERATIONS {
             let error = loop_diagnostics.iteration_limit_error();
@@ -453,4 +486,129 @@ pub(crate) async fn complete_chat_with_tools(
             )
             .await;
     }
+}
+
+async fn recover_final_response_after_tool_loop_stop(
+    context: ToolLoopContext<'_>,
+    mut payload: Value,
+    cumulative_usage: Value,
+    stop: ToolLoopStop,
+    iteration: u32,
+    response_items: Vec<Value>,
+) -> Result<ToolLoopResult, ToolLoopError> {
+    if let Some(object) = payload.as_object_mut() {
+        object.remove("tools");
+        object.remove("tool_choice");
+        object.remove("parallel_tool_calls");
+    }
+    let messages = payload
+        .get_mut("messages")
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| {
+            ToolLoopError::new(
+                "chat payload messages were not an array during tool loop recovery",
+                &cumulative_usage,
+            )
+        })?;
+    messages.push(json!({
+        "role": "user",
+        "content": format!(
+            "CodeSeeX stopped repeated unsuccessful web_search calls to avoid wasting tokens: {} Provide a final answer now using the available search results and tool diagnostics. If the evidence is insufficient, say so briefly.",
+            stop.message
+        )
+    }));
+
+    let response = match crate::upstream::post_chat_completions(
+        context.client,
+        &context.config.upstream,
+        context.auth,
+        Some(context.original_request),
+        payload.clone(),
+    )
+    .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            let _ = context
+                .store
+                .record_event(
+                    "info",
+                    "retry_cache_diagnostic",
+                    "CodeSeeX retry/cache diagnostic.",
+                    Some(&retry_cache_diagnostic_event(
+                        context.request_id,
+                        context.requested_model,
+                        Some(context.upstream_model),
+                        context.original_request,
+                        Some(&payload),
+                        "upstream_connection_failed_after_tool_loop_recovery",
+                    )),
+                )
+                .await;
+            return Err(ToolLoopError::new(error.to_string(), &cumulative_usage));
+        }
+    };
+    let status = response.status();
+    if !status.is_success() {
+        let _ = context
+            .store
+            .record_event(
+                "info",
+                "retry_cache_diagnostic",
+                "CodeSeeX retry/cache diagnostic.",
+                Some(&retry_cache_diagnostic_event(
+                    context.request_id,
+                    context.requested_model,
+                    Some(context.upstream_model),
+                    context.original_request,
+                    Some(&payload),
+                    "upstream_status_failed_after_tool_loop_recovery",
+                )),
+            )
+            .await;
+        let body = response
+            .text()
+            .await
+            .unwrap_or_else(|error| error.to_string());
+        return Err(ToolLoopError::new(
+            format!("upstream returned {status} during tool loop recovery: {body}"),
+            &cumulative_usage,
+        ));
+    }
+    let chat = response
+        .json::<Value>()
+        .await
+        .map_err(|error| ToolLoopError::new(error.to_string(), &cumulative_usage))?;
+    if !chat_tool_calls(&chat).is_empty() {
+        return Err(ToolLoopError::new(
+            "upstream returned tool calls during no-tool loop recovery",
+            &cumulative_usage,
+        ));
+    }
+    let usage = merge_response_usage(
+        &cumulative_usage,
+        &response_usage_from_chat_usage(chat.get("usage")),
+    );
+    let _ = context
+        .store
+        .record_event(
+            "info",
+            "upstream_call_usage_breakdown",
+            "CodeSeeX upstream call usage breakdown.",
+            Some(&upstream_call_usage_breakdown_event(
+                context.request_id,
+                "non_streaming_tool_loop_recovery",
+                iteration,
+                context.original_request,
+                &payload,
+                chat.get("usage"),
+                false,
+            )),
+        )
+        .await;
+    Ok(ToolLoopResult::FinalChat(ToolLoopResponse {
+        chat,
+        response_items,
+        usage,
+    }))
 }

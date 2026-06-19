@@ -1,6 +1,7 @@
+use futures_util::stream::{FuturesUnordered, StreamExt};
 use regex::Regex;
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
@@ -12,8 +13,11 @@ use super::extract::{
     clean_visible_text, decode_basic_html_entities, strip_html_tags, truncate_chars,
 };
 use super::net::{fetch_text, read_limited_response_bytes, request_error_message, user_agent};
+use super::safety::normalize_candidate_url;
 
-const SEARCH_SOURCE_HEALTH_TTL_SECS: u64 = 300;
+const SEARCH_SOURCE_RESULT_GRACE_MS: u64 = 1_200;
+const LOW_CONFIDENCE_FALLBACK_MIN_SCORE: f64 = 0.08;
+const LOW_CONFIDENCE_FALLBACK_MAX_RESULTS: usize = 3;
 
 static SEARCH_SOURCE_HEALTH: OnceLock<Mutex<BTreeMap<String, SearchHealthSnapshot>>> =
     OnceLock::new();
@@ -24,31 +28,25 @@ pub(super) async fn query(
     query: &str,
     max_results: usize,
 ) -> Value {
-    let plan = search_plan(client, proxy_mode).await;
+    let plan = search_plan(proxy_mode).await;
     let mut fallback_errors = Vec::new();
     let mut collected = Vec::new();
     let mut sources_attempted = Vec::new();
+    let mut source_diagnostics = Vec::new();
 
-    let primary_sources = plan.primary_sources();
-    let primary_results = run_search_sources(client, query, max_results, &primary_sources).await;
-    collect_source_results(
-        primary_results,
+    run_search_sources_progressive(
+        client,
+        query,
+        max_results,
+        &plan.ordered_sources,
         &mut collected,
         &mut fallback_errors,
         &mut sources_attempted,
-    );
+        &mut source_diagnostics,
+    )
+    .await;
 
-    if collected.is_empty() && !plan.deprioritized_sources().is_empty() {
-        let fallback_results =
-            run_search_sources(client, query, max_results, &plan.deprioritized_sources()).await;
-        collect_source_results(
-            fallback_results,
-            &mut collected,
-            &mut fallback_errors,
-            &mut sources_attempted,
-        );
-    }
-
+    let raw_collected = collected.clone();
     let mut results = dedupe_results(collected);
     retain_usable_results(&mut results);
     results.sort_by(|left, right| {
@@ -59,6 +57,12 @@ pub(super) async fn query(
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     results.truncate(max_results);
+    let low_confidence_fallback = if results.is_empty() {
+        results = low_confidence_fallback_results(raw_collected, max_results);
+        !results.is_empty()
+    } else {
+        false
+    };
     let quality = average_score(&results);
 
     json!({
@@ -71,11 +75,13 @@ pub(super) async fn query(
         "source_order": plan.source_order_names(),
         "sources_deprioritized": plan.deprioritized_source_names(),
         "source_health": plan.health_diagnostic(),
+        "source_diagnostics": source_diagnostics,
         "results": results.clone(),
         "candidates": results.clone(),
         "candidate_count": results.len(),
         "quality": quality,
         "low_confidence": results.is_empty() || quality < 0.24,
+        "low_confidence_fallback": low_confidence_fallback,
         "fallback_errors": fallback_errors
     })
 }
@@ -95,19 +101,53 @@ pub(super) async fn warm_sources(client: &reqwest::Client, proxy_mode: NetworkPr
     })
 }
 
-async fn run_search_sources(
+async fn run_search_sources_progressive(
     client: &reqwest::Client,
     query: &str,
     max_results: usize,
     sources: &[SearchSource],
-) -> Vec<Value> {
-    futures_util::future::join_all(
-        sources
-            .iter()
-            .copied()
-            .map(|source| source.search(client, query, max_results)),
-    )
-    .await
+    collected: &mut Vec<Value>,
+    fallback_errors: &mut Vec<Value>,
+    sources_attempted: &mut Vec<String>,
+    source_diagnostics: &mut Vec<Value>,
+) {
+    let mut pending = sources
+        .iter()
+        .copied()
+        .map(|source| source.search(client, query, max_results))
+        .collect::<FuturesUnordered<_>>();
+    let mut found_usable_results = false;
+
+    loop {
+        let next = if found_usable_results {
+            match tokio::time::timeout(
+                Duration::from_millis(SEARCH_SOURCE_RESULT_GRACE_MS),
+                pending.next(),
+            )
+            .await
+            {
+                Ok(next) => next,
+                Err(_) => break,
+            }
+        } else {
+            pending.next().await
+        };
+        let Some(result) = next else {
+            break;
+        };
+        collect_source_results(
+            vec![result],
+            collected,
+            fallback_errors,
+            sources_attempted,
+            source_diagnostics,
+        );
+        let usable_count = usable_result_count(collected);
+        if usable_count == 0 {
+            continue;
+        }
+        found_usable_results = true;
+    }
 }
 
 fn collect_source_results(
@@ -115,6 +155,7 @@ fn collect_source_results(
     collected: &mut Vec<Value>,
     fallback_errors: &mut Vec<Value>,
     sources_attempted: &mut Vec<String>,
+    source_diagnostics: &mut Vec<Value>,
 ) {
     for result in results_by_source {
         let source = result
@@ -122,18 +163,119 @@ fn collect_source_results(
             .and_then(Value::as_str)
             .unwrap_or("unknown");
         push_unique_source(sources_attempted, source);
+        let diagnostic = source_result_diagnostic(&result);
         if let Some(results) = result.get("results").and_then(Value::as_array) {
             collected.extend(results.iter().cloned());
         }
-        if result.get("ok").and_then(Value::as_bool) != Some(true) {
+        let result_count = result
+            .get("results")
+            .and_then(Value::as_array)
+            .map(Vec::len)
+            .unwrap_or(0);
+        let usable_result_count = diagnostic
+            .get("usable_result_count")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        source_diagnostics.push(diagnostic.clone());
+        if result.get("ok").and_then(Value::as_bool) != Some(true)
+            || result_count == 0
+            || usable_result_count == 0
+        {
             fallback_errors.push(json!({
                 "source": source,
-                "error": result.get("error").and_then(Value::as_str).unwrap_or("empty_results"),
+                "error": diagnostic.get("error").and_then(Value::as_str).unwrap_or("empty_results"),
                 "status": result.get("status").and_then(Value::as_u64),
+                "result_count": result_count,
+                "usable_result_count": usable_result_count,
+                "max_score": diagnostic.get("max_score").cloned().unwrap_or(Value::Null),
                 "message": result.get("message").and_then(Value::as_str).unwrap_or_default()
             }));
         }
     }
+}
+
+fn source_result_diagnostic(result: &Value) -> Value {
+    let source = result
+        .get("source")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let ok = result.get("ok").and_then(Value::as_bool).unwrap_or(false);
+    let results = result
+        .get("results")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let result_count = results.len();
+    let max_score = results
+        .iter()
+        .filter_map(|item| item.get("score").and_then(Value::as_f64))
+        .max_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal));
+    let mut usable_results = dedupe_results(results);
+    retain_usable_results(&mut usable_results);
+    let usable_result_count = usable_results.len();
+    let error = if ok && result_count > 0 && usable_result_count == 0 {
+        "filtered_low_confidence"
+    } else if ok && result_count == 0 {
+        "empty_results"
+    } else {
+        result
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("request_failed")
+    };
+    json!({
+        "source": source,
+        "ok": ok,
+        "status": result.get("status").cloned().unwrap_or(Value::Null),
+        "error": error,
+        "result_count": result_count,
+        "usable_result_count": usable_result_count,
+        "max_score": max_score,
+        "message": result.get("message")
+            .and_then(Value::as_str)
+            .map(|value| truncate_chars(value, 240))
+            .unwrap_or_default()
+    })
+}
+
+fn usable_result_count(results: &[Value]) -> usize {
+    let mut results = dedupe_results(results.to_vec());
+    retain_usable_results(&mut results);
+    results.len()
+}
+
+pub(super) fn low_confidence_fallback_results(
+    results: Vec<Value>,
+    max_results: usize,
+) -> Vec<Value> {
+    let mut seen = HashSet::new();
+    let mut results = results
+        .into_iter()
+        .filter_map(|mut item| {
+            let score = item.get("score").and_then(Value::as_f64)?;
+            if score < LOW_CONFIDENCE_FALLBACK_MIN_SCORE {
+                return None;
+            }
+            let url = item.get("url").and_then(Value::as_str)?;
+            let url = normalize_candidate_url(url)?;
+            if !seen.insert(url.to_ascii_lowercase()) {
+                return None;
+            }
+            if let Some(object) = item.as_object_mut() {
+                object.insert("url".to_owned(), Value::String(url));
+            }
+            Some(item)
+        })
+        .collect::<Vec<_>>();
+    results.sort_by(|left, right| {
+        let right_score = right.get("score").and_then(Value::as_f64).unwrap_or(0.0);
+        let left_score = left.get("score").and_then(Value::as_f64).unwrap_or(0.0);
+        right_score
+            .partial_cmp(&left_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    results.truncate(max_results.min(LOW_CONFIDENCE_FALLBACK_MAX_RESULTS));
+    results
 }
 
 fn push_unique_source(output: &mut Vec<String>, source: &str) {
@@ -142,29 +284,18 @@ fn push_unique_source(output: &mut Vec<String>, source: &str) {
     }
 }
 
-async fn search_plan(client: &reqwest::Client, proxy_mode: NetworkProxyMode) -> SearchPlan {
-    let snapshot = search_source_health(client, &crate::network::proxy_cache_key(proxy_mode)).await;
-    let ordered_sources = ranked_sources_from_health(&snapshot.sources);
-    SearchPlan {
-        cache_key: snapshot.cache_key,
-        checked_at_age_ms: snapshot.checked_at.elapsed().as_millis() as u64,
-        ordered_sources,
-        health: snapshot.sources,
+async fn search_plan(proxy_mode: NetworkProxyMode) -> SearchPlan {
+    let cache_key = crate::network::proxy_cache_key(proxy_mode);
+    if let Some(snapshot) = cached_search_source_health(&cache_key).await {
+        return SearchPlan::from_snapshot(snapshot);
     }
+    SearchPlan::unprobed(cache_key)
 }
 
-async fn search_source_health(client: &reqwest::Client, cache_key: &str) -> SearchHealthSnapshot {
+async fn cached_search_source_health(cache_key: &str) -> Option<SearchHealthSnapshot> {
     let cache = SEARCH_SOURCE_HEALTH.get_or_init(|| Mutex::new(BTreeMap::new()));
-    {
-        let guard = cache.lock().await;
-        if let Some(snapshot) = guard.get(cache_key) {
-            if snapshot.checked_at.elapsed() < Duration::from_secs(SEARCH_SOURCE_HEALTH_TTL_SECS) {
-                return snapshot.clone();
-            }
-        }
-    }
-
-    refresh_search_source_health(client, cache_key).await
+    let guard = cache.lock().await;
+    guard.get(cache_key).cloned()
 }
 
 async fn refresh_search_source_health(
@@ -591,17 +722,21 @@ struct SearchPlan {
 }
 
 impl SearchPlan {
-    fn primary_sources(&self) -> Vec<SearchSource> {
-        let primary = self
-            .ordered_sources
-            .iter()
-            .copied()
-            .filter(|source| self.source_reachable(*source).unwrap_or(true))
-            .collect::<Vec<_>>();
-        if primary.is_empty() {
-            self.ordered_sources.clone()
-        } else {
-            primary
+    fn from_snapshot(snapshot: SearchHealthSnapshot) -> Self {
+        Self {
+            cache_key: snapshot.cache_key,
+            checked_at_age_ms: snapshot.checked_at.elapsed().as_millis() as u64,
+            ordered_sources: ranked_sources_from_health(&snapshot.sources),
+            health: snapshot.sources,
+        }
+    }
+
+    fn unprobed(cache_key: String) -> Self {
+        Self {
+            cache_key,
+            checked_at_age_ms: 0,
+            ordered_sources: SearchSource::ALL.to_vec(),
+            health: Vec::new(),
         }
     }
 
@@ -1037,6 +1172,128 @@ mod tests {
                     .position(|source| *source == SearchSource::BraveHtml)
                     .unwrap()
         );
+    }
+
+    #[test]
+    fn unprobed_plan_uses_all_quality_sources() {
+        let plan = SearchPlan::unprobed("system".to_owned());
+        assert_eq!(
+            plan.source_order_names(),
+            vec![
+                "bing_html",
+                "brave_html",
+                "duckduckgo_lite",
+                "duckduckgo_html",
+                "duckduckgo_instant_answer"
+            ]
+        );
+        assert!(plan.health_diagnostic().is_empty());
+    }
+
+    #[test]
+    fn empty_success_is_kept_as_fallback_diagnostic() {
+        let mut collected = Vec::new();
+        let mut fallback_errors = Vec::new();
+        let mut sources_attempted = Vec::new();
+        collect_source_results(
+            vec![json!({
+                "ok": true,
+                "source": "bing_html",
+                "results": []
+            })],
+            &mut collected,
+            &mut fallback_errors,
+            &mut sources_attempted,
+            &mut Vec::new(),
+        );
+
+        assert_eq!(sources_attempted, vec!["bing_html"]);
+        assert!(collected.is_empty());
+        assert_eq!(fallback_errors.len(), 1);
+        assert_eq!(fallback_errors[0]["source"], "bing_html");
+        assert_eq!(fallback_errors[0]["error"], "empty_results");
+    }
+
+    #[test]
+    fn filtered_low_confidence_result_is_diagnosed() {
+        let mut collected = Vec::new();
+        let mut fallback_errors = Vec::new();
+        let mut sources_attempted = Vec::new();
+        let mut source_diagnostics = Vec::new();
+        collect_source_results(
+            vec![json!({
+                "ok": true,
+                "source": "bing_html",
+                "results": [{
+                    "url": "https://example.com/noise",
+                    "title": "Noise",
+                    "query": "中山天气",
+                    "source": "bing_html",
+                    "score": 0.08
+                }]
+            })],
+            &mut collected,
+            &mut fallback_errors,
+            &mut sources_attempted,
+            &mut source_diagnostics,
+        );
+
+        assert_eq!(collected.len(), 1);
+        assert_eq!(source_diagnostics[0]["error"], "filtered_low_confidence");
+        assert_eq!(source_diagnostics[0]["result_count"], 1);
+        assert_eq!(source_diagnostics[0]["usable_result_count"], 0);
+        assert_eq!(fallback_errors[0]["error"], "filtered_low_confidence");
+    }
+
+    #[test]
+    fn low_score_results_do_not_stop_fallback() {
+        let results = vec![json!({
+            "url": "https://example.com/unrelated",
+            "title": "Example",
+            "snippet": "",
+            "query": "中山天气",
+            "source": "bing_html",
+            "score": 0.08
+        })];
+
+        assert_eq!(usable_result_count(&results), 0);
+    }
+
+    #[test]
+    fn low_confidence_fallback_keeps_bounded_exhausted_results() {
+        let results = low_confidence_fallback_results(
+            vec![
+                json!({
+                    "url": "https://weak.example.com/weather",
+                    "title": "Weak",
+                    "snippet": "",
+                    "query": "中山天气",
+                    "source": "bing_html",
+                    "score": 0.08
+                }),
+                json!({
+                    "url": "https://noise.example.com/weather",
+                    "title": "Noise",
+                    "snippet": "",
+                    "query": "中山天气",
+                    "source": "bing_html",
+                    "score": 0.03
+                }),
+                json!({
+                    "url": "https://better.example.com/weather",
+                    "title": "Better",
+                    "snippet": "",
+                    "query": "中山天气",
+                    "source": "bing_html",
+                    "score": 0.12
+                }),
+            ],
+            5,
+        );
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0]["url"], "https://better.example.com/weather");
+        assert_eq!(results[1]["url"], "https://weak.example.com/weather");
     }
 
     #[test]
