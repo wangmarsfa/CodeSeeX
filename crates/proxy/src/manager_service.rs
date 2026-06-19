@@ -1,6 +1,7 @@
 use crate::app_state::ProxyState;
 use crate::config_payload::{model_override_to_ui, temperature_to_ui, user_config_from_payload};
 use crate::http_utils::{config_version, is_newer_version, normalize_version_label, now_seconds};
+use crate::runtime_config::{RuntimeConfigChangeSource, RuntimeConfigService};
 use crate::tools::registry::{enabled_tool_ids, tool_registry, tool_settings};
 use codeseex_core::catalog::{
     build_codeseex_catalog, catalog_file_is_compatible, codex_toml_snippet, write_catalog_atomic,
@@ -13,12 +14,10 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use std::env;
 use std::fs;
-use std::sync::Arc;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ManagerRuntime {
-    config: Arc<AppConfig>,
-    client: reqwest::Client,
+    runtime_config: RuntimeConfigService,
     store: Store,
 }
 
@@ -30,18 +29,15 @@ pub struct ManagerJsonResponse {
 
 impl ManagerRuntime {
     pub async fn open(config: AppConfig) -> anyhow::Result<Self> {
-        let timeout = std::time::Duration::from_millis(config.upstream.timeout_ms);
         Ok(Self {
             store: Store::open(&config.data_dir).await?,
-            client: crate::network::client(config.network_proxy, timeout)?,
-            config: Arc::new(config),
+            runtime_config: RuntimeConfigService::new(config),
         })
     }
 
     pub(crate) fn from_proxy_state(state: &ProxyState) -> Self {
         Self {
-            config: state.config.clone(),
-            client: state.client.clone(),
+            runtime_config: state.runtime_config.clone(),
             store: state.store.clone(),
         }
     }
@@ -58,6 +54,7 @@ impl ManagerRuntime {
             ("GET", "/health") => ok(json!({ "ok": true, "service": "codeseex" })),
             ("GET", "/api/status") => ok(self.status().await),
             ("GET", "/api/usage") => ok(self.usage().await),
+            ("POST", "/api/dev/seed-usage-template") => self.seed_usage_template_preview().await,
             ("GET", "/api/config") => ok(self.config_payload()),
             ("POST", "/api/config") => {
                 self.save_config(body.cloned().unwrap_or_else(|| json!({})))
@@ -88,11 +85,14 @@ impl ManagerRuntime {
     }
 
     pub(crate) fn active_config(&self) -> AppConfig {
-        let mut config = self.config.as_ref().clone();
-        if let Ok(user_config) = UserConfig::read_from(&config.config_path()) {
-            config.apply_user_config(user_config);
-        }
-        config
+        self.runtime_config.active_config()
+    }
+
+    fn client(&self) -> reqwest::Client {
+        let config = self.active_config();
+        let timeout = std::time::Duration::from_millis(config.upstream.timeout_ms);
+        crate::network::client(config.network_proxy, timeout)
+            .unwrap_or_else(|_| reqwest::Client::new())
     }
 
     pub async fn status(&self) -> Value {
@@ -120,12 +120,13 @@ impl ManagerRuntime {
                 "last_request_at": runtime.as_ref().and_then(|value| value.last_request_at.clone()),
                 "last_turn": runtime.as_ref().and_then(|value| value.last_turn.clone()),
                 "last_billable_request": runtime.as_ref().and_then(|value| value.last_billable_request.clone()),
-                "turn_history": [],
-                "billable_history": [],
-                "total_cached_input_tokens": 0,
-                "total_cache_miss_input_tokens": 0,
-                "total_output_tokens": 0,
-                "average_ms": 0
+                "turn_history": runtime.as_ref().map(|value| value.turn_history.clone()).unwrap_or_default(),
+                "billable_history": runtime.as_ref().map(|value| value.billable_history.clone()).unwrap_or_default(),
+                "usage_sessions": runtime.as_ref().map(|value| value.usage_sessions.clone()).unwrap_or_default(),
+                "total_cached_input_tokens": runtime.as_ref().map(|value| value.total_cached_input_tokens).unwrap_or(0),
+                "total_cache_miss_input_tokens": runtime.as_ref().map(|value| value.total_cache_miss_input_tokens).unwrap_or(0),
+                "total_output_tokens": runtime.as_ref().map(|value| value.total_output_tokens).unwrap_or(0),
+                "average_ms": runtime.as_ref().map(|value| value.average_ms).unwrap_or(0)
             },
             "upstream": {
                 "base_url": config.upstream.base_url,
@@ -148,12 +149,38 @@ impl ManagerRuntime {
                 "last_billable_request": runtime.as_ref().and_then(|value| value.last_billable_request.clone()),
                 "turn_history": runtime.as_ref().map(|value| value.turn_history.clone()).unwrap_or_default(),
                 "billable_history": runtime.as_ref().map(|value| value.billable_history.clone()).unwrap_or_default(),
+                "usage_sessions": runtime.as_ref().map(|value| value.usage_sessions.clone()).unwrap_or_default(),
                 "total_cached_input_tokens": runtime.as_ref().map(|value| value.total_cached_input_tokens).unwrap_or(0),
                 "total_cache_miss_input_tokens": runtime.as_ref().map(|value| value.total_cache_miss_input_tokens).unwrap_or(0),
                 "total_output_tokens": runtime.as_ref().map(|value| value.total_output_tokens).unwrap_or(0),
                 "average_ms": runtime.as_ref().map(|value| value.average_ms).unwrap_or(0)
             }
         })
+    }
+
+    pub async fn seed_usage_template_preview(&self) -> ManagerJsonResponse {
+        if !usage_template_preview_enabled() {
+            return status(
+                404,
+                json!({
+                    "ok": false,
+                    "error": "usage_template_preview_disabled"
+                }),
+            );
+        }
+        match self.store.seed_usage_template_preview().await {
+            Ok(records) => ok(json!({
+                "ok": true,
+                "records": records
+            })),
+            Err(error) => status(
+                500,
+                json!({
+                    "ok": false,
+                    "error": error.to_string()
+                }),
+            ),
+        }
     }
 
     pub fn config_payload(&self) -> Value {
@@ -225,6 +252,20 @@ impl ManagerRuntime {
         let user_config = user_config_from_payload(&payload, existing_config, &config);
         match user_config.write_atomic(&config.config_path()) {
             Ok(()) => {
+                if let Some(change) = self
+                    .runtime_config
+                    .refresh(RuntimeConfigChangeSource::ManagerSave)
+                {
+                    let _ = self
+                        .store
+                        .record_event(
+                            "info",
+                            "runtime_config_changed",
+                            "CodeSeeX runtime configuration changed.",
+                            Some(&change.diagnostic()),
+                        )
+                        .await;
+                }
                 let new_retention_days = user_config.log_retention_days();
                 let maintenance = if new_retention_days == existing_retention_days {
                     json!({
@@ -308,8 +349,8 @@ impl ManagerRuntime {
         let current_version = env!("CARGO_PKG_VERSION");
         let checked_at = now_seconds().to_string();
         let fallback_url = "https://github.com/TasteSteak/CodeSeeX/releases";
-        let result = self
-            .client
+        let client = self.client();
+        let result = client
             .get("https://api.github.com/repos/TasteSteak/CodeSeeX/releases/latest")
             .header(reqwest::header::USER_AGENT, "CodeSeeX")
             .header(reqwest::header::ACCEPT, "application/vnd.github+json")
@@ -381,8 +422,8 @@ impl ManagerRuntime {
             }
         };
 
-        match self
-            .client
+        let client = self.client();
+        match client
             .get(balance_url)
             .bearer_auth(api_key)
             .header(reqwest::header::ACCEPT, "application/json")
@@ -551,6 +592,18 @@ fn network_proxy_to_ui(value: codeseex_core::NetworkProxyMode) -> &'static str {
         codeseex_core::NetworkProxyMode::System => "system",
         codeseex_core::NetworkProxyMode::None => "none",
     }
+}
+
+fn usage_template_preview_enabled() -> bool {
+    env::var("CODESEEX_USAGE_TEMPLATE_PREVIEW")
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
 }
 
 fn canonical_enabled_tool_ids(ids: &[String]) -> Vec<String> {
@@ -772,6 +825,108 @@ mod tests {
             status.pointer("/runtime/status").and_then(Value::as_str),
             Some("running")
         );
+        let _ = std::fs::remove_dir_all(config.data_dir);
+    }
+
+    #[tokio::test]
+    async fn status_and_usage_share_runtime_totals() {
+        let config = temp_config("status-usage-runtime");
+        let runtime = ManagerRuntime::open(config.clone())
+            .await
+            .expect("open manager runtime");
+        runtime
+            .store
+            .checkpoint_request(
+                "resp_usage",
+                None,
+                Some("deepseek-v4-flash"),
+                &json!({ "model": "deepseek-v4-flash", "input": "hello" }),
+            )
+            .await
+            .expect("checkpoint request");
+        runtime
+            .store
+            .finish_request(
+                "resp_usage",
+                codeseex_store::RequestStatus::Completed,
+                Some(&json!({
+                    "model": "deepseek-v4-flash",
+                    "usage": {
+                        "input_tokens": 13,
+                        "cached_input_tokens": 5,
+                        "output_tokens": 2,
+                        "total_tokens": 15
+                    }
+                })),
+                None,
+            )
+            .await
+            .expect("finish request");
+
+        let status = runtime.status().await;
+        let usage = runtime.usage().await;
+
+        for key in [
+            "request_count",
+            "billable_request_count",
+            "total_cached_input_tokens",
+            "total_cache_miss_input_tokens",
+            "total_output_tokens",
+            "usage_sessions",
+        ] {
+            assert_eq!(
+                status.pointer(&format!("/runtime/{key}")),
+                usage.pointer(&format!("/runtime/{key}")),
+                "{key} should match between status and usage"
+            );
+        }
+        assert_eq!(
+            status
+                .pointer("/runtime/billable_history")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(1)
+        );
+        assert_eq!(
+            usage
+                .pointer("/runtime/usage_sessions/0/title")
+                .and_then(Value::as_str),
+            Some("hello")
+        );
+
+        let _ = std::fs::remove_dir_all(config.data_dir);
+    }
+
+    #[tokio::test]
+    async fn usage_template_preview_endpoint_is_env_gated() {
+        let config = temp_config("usage-template-preview-gated");
+        let runtime = ManagerRuntime::open(config.clone())
+            .await
+            .expect("open manager runtime");
+
+        std::env::remove_var("CODESEEX_USAGE_TEMPLATE_PREVIEW");
+        let disabled = runtime
+            .handle_json("POST", "/api/dev/seed-usage-template", None, None)
+            .await;
+        assert_eq!(disabled.status, 404);
+
+        std::env::set_var("CODESEEX_USAGE_TEMPLATE_PREVIEW", "1");
+        let enabled = runtime
+            .handle_json("POST", "/api/dev/seed-usage-template", None, None)
+            .await;
+        std::env::remove_var("CODESEEX_USAGE_TEMPLATE_PREVIEW");
+        assert_eq!(enabled.status, 200);
+        assert_eq!(enabled.body.get("records").and_then(Value::as_u64), Some(6));
+
+        let usage = runtime.usage().await;
+        assert_eq!(
+            usage
+                .pointer("/runtime/usage_sessions")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(4)
+        );
+
         let _ = std::fs::remove_dir_all(config.data_dir);
     }
 

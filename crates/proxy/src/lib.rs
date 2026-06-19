@@ -1,6 +1,7 @@
 mod app_state;
 mod community_tools;
 mod config_payload;
+mod diagnostics;
 mod http_response;
 mod http_utils;
 mod manager_api;
@@ -8,7 +9,9 @@ mod manager_service;
 mod network;
 mod response_sse;
 mod responses;
+mod runtime_config;
 mod server;
+mod telemetry;
 mod text;
 mod tool_passthrough;
 mod tools;

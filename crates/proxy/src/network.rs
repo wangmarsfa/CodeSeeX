@@ -34,6 +34,34 @@ pub(crate) fn apply_proxy_mode(
     }
 }
 
+pub(crate) fn proxy_cache_key(proxy_mode: NetworkProxyMode) -> String {
+    match proxy_mode {
+        NetworkProxyMode::System => {
+            format!(
+                "system:{}",
+                system_proxy_url()
+                    .as_deref()
+                    .map(redacted_proxy_url)
+                    .unwrap_or_else(|| "direct".to_owned())
+            )
+        }
+        NetworkProxyMode::None => "none".to_owned(),
+    }
+}
+
+fn redacted_proxy_url(value: &str) -> String {
+    let Ok(mut url) = reqwest::Url::parse(value) else {
+        return value.split('@').last().unwrap_or(value).to_owned();
+    };
+    if !url.username().is_empty() {
+        let _ = url.set_username("redacted");
+    }
+    if url.password().is_some() {
+        let _ = url.set_password(Some("redacted"));
+    }
+    url.to_string()
+}
+
 fn system_proxy_url() -> Option<String> {
     env_proxy_url().or_else(windows_internet_settings_proxy_url)
 }
@@ -189,5 +217,13 @@ mod tests {
     fn external_hosts_do_not_bypass_proxy() {
         let url = reqwest::Url::parse("https://api.openai.com/v1/responses").expect("url");
         assert!(!should_bypass_proxy(&url));
+    }
+
+    #[test]
+    fn proxy_cache_key_redacts_proxy_credentials() {
+        assert_eq!(
+            redacted_proxy_url("http://user:secret@127.0.0.1:7890/"),
+            "http://redacted:redacted@127.0.0.1:7890/"
+        );
     }
 }

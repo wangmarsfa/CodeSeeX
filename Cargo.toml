@@ -41,6 +41,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 url = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
 winreg = "0.55"
+notify = "8.2.0"
+windows-sys = "0.61.2"
 
 [profile.dev]
 debug = 1

@@ -14,7 +14,13 @@ pub const CODEX_FULL_CONTEXT_INPUT_ITEMS_THRESHOLD: usize = 80;
 pub struct ContextDiagnostic {
     pub input_items: u64,
     pub message_items: u64,
+    pub tool_result_items: u64,
     pub verified_fact_items: u64,
+    pub display_only_items: u64,
+    pub display_only_thinking_items: u64,
+    pub display_only_chars: u64,
+    pub tool_output_chars: u64,
+    pub truncated_tool_output_items: u64,
     pub unsupported_items: u64,
     pub truncated_items: u64,
     pub estimated_chars: u64,
@@ -80,6 +86,12 @@ pub fn compile_responses_input_with_tool_outputs(
 
             for item in items {
                 if response_item_is_display_only(item) {
+                    diagnostic.display_only_items += 1;
+                    let text = item.get("content").map(content_to_text).unwrap_or_default();
+                    diagnostic.display_only_chars += text.chars().count() as u64;
+                    if response_item_is_display_only_thinking(item) {
+                        diagnostic.display_only_thinking_items += 1;
+                    }
                     continue;
                 }
 
@@ -112,8 +124,13 @@ pub fn compile_responses_input_with_tool_outputs(
                     valid_tool_call_ids,
                 ) {
                     flush_pending_assistant(&mut messages, &mut pending_assistant);
+                    diagnostic.tool_result_items += 1;
                     diagnostic.message_items += 1;
                     diagnostic.estimated_chars += message.content.chars().count() as u64;
+                    diagnostic.tool_output_chars += message.content.chars().count() as u64;
+                    if message.content.contains("[truncated") {
+                        diagnostic.truncated_tool_output_items += 1;
+                    }
                     messages.push(message);
                     if let Some(fact) = semantic_fact {
                         diagnostic.verified_fact_items += 1;
@@ -578,11 +595,25 @@ fn response_item_is_display_only(item: &Value) -> bool {
             .pointer("/metadata/codeseex_display_only")
             .and_then(Value::as_bool)
             == Some(true)
-        || item
-            .get("content")
-            .map(content_to_text)
-            .map(|text| response_text_is_display_only(&text))
-            .unwrap_or(false)
+        || (response_item_role(item) == Some("assistant")
+            && item
+                .get("content")
+                .map(content_to_text)
+                .map(|text| response_text_is_display_only(&text))
+                .unwrap_or(false))
+}
+
+fn response_item_is_display_only_thinking(item: &Value) -> bool {
+    item.get("content")
+        .map(content_to_text)
+        .map(|text| text.trim_start().starts_with("**DeepSeek Thinking**"))
+        .unwrap_or(false)
+}
+
+fn response_item_role(item: &Value) -> Option<&str> {
+    item.get("role")
+        .or_else(|| item.pointer("/metadata/role"))
+        .and_then(Value::as_str)
 }
 
 fn response_text_is_display_only(text: &str) -> bool {
@@ -1079,6 +1110,9 @@ mod tests {
             "output":"x".repeat(MAX_TOOL_OUTPUT_CHARS + 32)
         }]);
         let compiled = compile_responses_input(&input);
+        assert_eq!(compiled.diagnostic.tool_result_items, 1);
+        assert!(compiled.diagnostic.tool_output_chars > MAX_TOOL_OUTPUT_CHARS as u64);
+        assert_eq!(compiled.diagnostic.truncated_tool_output_items, 1);
         assert!(compiled.messages[1].content.contains("[truncated"));
         assert!(compiled.messages[1].content.len() < MAX_TOOL_OUTPUT_CHARS + 512);
     }
@@ -1118,9 +1152,26 @@ mod tests {
         ]);
         let compiled = compile_responses_input(&input);
 
+        assert_eq!(compiled.diagnostic.display_only_items, 2);
+        assert_eq!(compiled.diagnostic.display_only_thinking_items, 1);
+        assert!(compiled.diagnostic.display_only_chars > 0);
         assert_eq!(compiled.messages.len(), 1);
         assert_eq!(compiled.messages[0].role, "user");
         assert_eq!(compiled.messages[0].content, "continue");
+    }
+
+    #[test]
+    fn ordinary_user_text_is_not_counted_as_display_only_thinking() {
+        let input = json!([{
+            "role": "user",
+            "content": [{ "type": "input_text", "text": "**DeepSeek Thinking** is visible user text" }]
+        }]);
+        let compiled = compile_responses_input(&input);
+
+        assert_eq!(compiled.diagnostic.display_only_items, 0);
+        assert_eq!(compiled.diagnostic.display_only_thinking_items, 0);
+        assert_eq!(compiled.messages.len(), 1);
+        assert!(compiled.messages[0].content.contains("visible user text"));
     }
 
     #[test]

@@ -5,6 +5,7 @@ use crate::text::compact_line;
 use crate::tools::response_items::normalize_patch_newlines;
 use codeseex_core::context::{
     compile_responses_input_with_tool_outputs, content_to_text, redact_inline_data_urls,
+    request_looks_like_codex_full_context,
 };
 use codeseex_core::models::{DEFAULT_CONTEXT_WINDOW, DEFAULT_EFFECTIVE_CONTEXT_PERCENT};
 use codeseex_core::protocol::ChatMessage;
@@ -19,6 +20,7 @@ const BYTES_PER_TOKEN_ESTIMATE: u64 = 4;
 const BUDGET_TOOL_CONTENT_CHARS: usize = 512 * 1024;
 const BUDGET_MESSAGE_CONTENT_CHARS: usize = 192 * 1024;
 const BUDGET_REASONING_CHARS: usize = 64 * 1024;
+const CODEX_FULL_CONTEXT_REPLAY_BUDGET_TOKENS: u64 = 96_000;
 const RECENT_TOOL_FACT_REQUEST_LIMIT: u32 = 200;
 
 pub(crate) struct BuiltResponseContext {
@@ -41,15 +43,21 @@ pub(crate) async fn response_history_messages(
     state: &ProxyState,
     previous_response_id: Option<&str>,
 ) -> Vec<ChatMessage> {
-    response_history_context(state, previous_response_id, &HashSet::new())
-        .await
-        .messages
+    response_history_context(
+        state,
+        previous_response_id,
+        &HashSet::new(),
+        &HashSet::new(),
+    )
+    .await
+    .messages
 }
 
 async fn response_history_context(
     state: &ProxyState,
     previous_response_id: Option<&str>,
     current_tool_output_ids: &HashSet<String>,
+    current_tool_call_ids: &HashSet<String>,
 ) -> ResponseHistoryContext {
     let Some(previous_response_id) = previous_response_id else {
         return ResponseHistoryContext::default();
@@ -111,8 +119,11 @@ async fn response_history_context(
             &record.turn_messages,
             record.status,
             &next_tool_output_ids,
+            current_tool_call_ids,
         );
-        if stored_turn_replay.messages.is_empty() {
+        if stored_turn_replay.messages.is_empty()
+            && !stored_input_is_codex_full_context(&record.input)
+        {
             messages.extend(
                 compile_responses_input_with_tool_outputs(
                     record.input.get("input").unwrap_or(&Value::Null),
@@ -135,7 +146,14 @@ async fn response_history_context(
                 &record.response,
                 &next_tool_output_ids,
                 &config,
-            );
+            )
+            .into_iter()
+            .filter(|message| {
+                tool_call_ids_from_message(message)
+                    .map(|ids| ids.is_disjoint(current_tool_call_ids))
+                    .unwrap_or(true)
+            })
+            .collect::<Vec<_>>();
             if !tool_messages.is_empty() {
                 messages.extend(tool_messages);
             } else if let Some(text) = response_output_text(&record.response) {
@@ -152,6 +170,13 @@ async fn response_history_context(
         messages,
         tool_facts,
     }
+}
+
+fn stored_input_is_codex_full_context(input: &Value) -> bool {
+    input
+        .pointer("/_codeseex_runtime/mode")
+        .and_then(Value::as_str)
+        == Some("codex_full_context_not_stored")
 }
 
 fn push_unique_facts(output: &mut Vec<String>, seen: &mut HashSet<String>, facts: &[String]) {
@@ -217,7 +242,15 @@ pub(crate) async fn build_response_context(
     let instruction_message_count = messages.len();
     let current_tool_output_ids =
         response_input_tool_output_ids(input.get("input").unwrap_or(&Value::Null));
-    let history_context = response_history_context(state, previous, &current_tool_output_ids).await;
+    let current_tool_call_ids =
+        response_input_tool_call_ids(input.get("input").unwrap_or(&Value::Null));
+    let history_context = response_history_context(
+        state,
+        previous,
+        &current_tool_output_ids,
+        &current_tool_call_ids,
+    )
+    .await;
     let history_message_count = history_context.messages.len();
     let mut tool_facts = history_context.tool_facts.clone();
     messages.extend(history_context.messages);
@@ -241,10 +274,22 @@ pub(crate) async fn build_response_context(
         collect_current_input_image_refs(input.get("input").unwrap_or(&Value::Null));
     let current_message_count = current_context.messages.len();
     let current_context_diagnostic = current_context.diagnostic.clone();
-    messages.extend(current_context.messages.clone());
+    let current_messages = current_context.messages.clone();
+    messages.extend(current_messages.clone());
     let pre_budget_message_count = messages.len();
     let current_start_index = instruction_message_count + history_message_count;
-    let budgeted = budget_messages_for_upstream(messages, current_start_index);
+    let budget_mode = if request_looks_like_codex_full_context(input) {
+        BudgetMode::CodexFullContextReplay
+    } else {
+        BudgetMode::Standard
+    };
+    let protected_start_index = match budget_mode {
+        BudgetMode::Standard => current_start_index,
+        BudgetMode::CodexFullContextReplay => {
+            current_start_index + codex_full_context_relevant_tail_start(&current_messages)
+        }
+    };
+    let budgeted = budget_messages_for_upstream(messages, protected_start_index, budget_mode);
     let message_count = budgeted.messages.len();
     let diagnostic = json!({
         "instruction_messages": instruction_message_count,
@@ -253,6 +298,8 @@ pub(crate) async fn build_response_context(
         "total_messages": message_count,
         "pre_budget_messages": pre_budget_message_count,
         "budget": budgeted.diagnostic,
+        "budget_mode": budget_mode.label(),
+        "protected_start_index": protected_start_index,
         "current_input": current_context_diagnostic,
         "current_input_images": current_image_refs.len(),
         "recovered_tool_facts": recovered_tool_facts.len()
@@ -265,6 +312,40 @@ pub(crate) async fn build_response_context(
         tool_facts,
         diagnostic,
         history_message_count,
+    }
+}
+
+fn codex_full_context_relevant_tail_start(messages: &[ChatMessage]) -> usize {
+    if messages.is_empty() {
+        return 0;
+    }
+
+    let last_user = messages.iter().rposition(|message| message.role == "user");
+    let last_tool_group_start = messages
+        .iter()
+        .rposition(|message| message.role == "tool")
+        .and_then(|tool_index| {
+            let tool_call_id = messages
+                .get(tool_index)
+                .and_then(|message| message.tool_call_id.as_deref())?;
+            messages[..tool_index].iter().rposition(|message| {
+                message
+                    .tool_calls
+                    .as_ref()
+                    .map(|calls| {
+                        calls.iter().any(|call| {
+                            call.get("id").and_then(Value::as_str) == Some(tool_call_id)
+                        })
+                    })
+                    .unwrap_or(false)
+            })
+        });
+
+    match (last_user, last_tool_group_start) {
+        (Some(user), Some(tool)) => user.min(tool),
+        (Some(user), None) => user,
+        (None, Some(tool)) => tool,
+        (None, None) => messages.len().saturating_sub(1),
     }
 }
 
@@ -585,13 +666,18 @@ fn stored_turn_messages_for_replay(
     messages: &[Value],
     status: RequestStatus,
     next_tool_output_ids: &HashSet<String>,
+    current_tool_call_ids: &HashSet<String>,
 ) -> StoredTurnReplay {
     let parsed = messages
         .iter()
         .filter_map(|message| serde_json::from_value::<ChatMessage>(message.clone()).ok())
         .collect::<Vec<_>>();
     if status == RequestStatus::Completed {
-        return sanitize_completed_turn_messages(parsed, next_tool_output_ids);
+        return sanitize_completed_turn_messages(
+            parsed,
+            next_tool_output_ids,
+            current_tool_call_ids,
+        );
     }
     StoredTurnReplay {
         messages: parsed
@@ -605,6 +691,7 @@ fn stored_turn_messages_for_replay(
 fn sanitize_completed_turn_messages(
     messages: Vec<ChatMessage>,
     next_tool_output_ids: &HashSet<String>,
+    current_tool_call_ids: &HashSet<String>,
 ) -> StoredTurnReplay {
     let mut replay = StoredTurnReplay::default();
     let mut index = 0;
@@ -619,6 +706,10 @@ fn sanitize_completed_turn_messages(
             index += 1;
             continue;
         };
+        if !expected.is_disjoint(current_tool_call_ids) {
+            index += 1;
+            continue;
+        }
 
         let mut group = vec![message];
         let mut seen = HashSet::new();
@@ -711,6 +802,18 @@ fn response_input_tool_output_ids(input: &Value) -> HashSet<String> {
                     | Some("tool_search_output")
             )
         })
+        .filter_map(response_item_call_id)
+        .map(str::to_owned)
+        .collect()
+}
+
+fn response_input_tool_call_ids(input: &Value) -> HashSet<String> {
+    let Value::Array(items) = input else {
+        return HashSet::new();
+    };
+    items
+        .iter()
+        .filter(|item| response_item_is_tool_call(item))
         .filter_map(response_item_call_id)
         .map(str::to_owned)
         .collect()
@@ -979,17 +1082,34 @@ struct BudgetedContextMessages {
     diagnostic: Value,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BudgetMode {
+    Standard,
+    CodexFullContextReplay,
+}
+
+impl BudgetMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Standard => "standard",
+            Self::CodexFullContextReplay => "codex_full_context_replay",
+        }
+    }
+}
+
 fn budget_messages_for_upstream(
     messages: Vec<ChatMessage>,
-    current_start_index: usize,
+    protected_start_index: usize,
+    mode: BudgetMode,
 ) -> BudgetedContextMessages {
-    let max_bytes = upstream_context_budget_bytes();
+    let max_bytes = upstream_context_budget_bytes(mode);
     let initial_bytes = messages_json_bytes(&messages);
     if initial_bytes <= max_bytes {
         return BudgetedContextMessages {
             messages,
             diagnostic: json!({
                 "triggered": false,
+                "mode": mode.label(),
                 "max_bytes": max_bytes,
                 "initial_bytes": initial_bytes,
                 "final_bytes": initial_bytes,
@@ -1010,6 +1130,7 @@ fn budget_messages_for_upstream(
             messages: compacted,
             diagnostic: json!({
                 "triggered": true,
+                "mode": mode.label(),
                 "max_bytes": max_bytes,
                 "initial_bytes": initial_bytes,
                 "final_bytes": compacted_bytes,
@@ -1019,13 +1140,14 @@ fn budget_messages_for_upstream(
         };
     }
 
-    let selected = select_budgeted_message_blocks(compacted, current_start_index, max_bytes);
+    let selected = select_budgeted_message_blocks(compacted, protected_start_index, max_bytes);
     let final_bytes = messages_json_bytes(&selected.messages);
     let compacted_messages = count_changed_messages(&messages, &selected.messages);
     BudgetedContextMessages {
         messages: selected.messages,
         diagnostic: json!({
             "triggered": true,
+            "mode": mode.label(),
             "max_bytes": max_bytes,
             "initial_bytes": initial_bytes,
             "compacted_bytes": compacted_bytes,
@@ -1043,12 +1165,15 @@ struct SelectedMessages {
 
 fn select_budgeted_message_blocks(
     messages: Vec<ChatMessage>,
-    current_start_index: usize,
+    protected_start_index: usize,
     max_bytes: u64,
 ) -> SelectedMessages {
     let mut selected_indexes = BTreeSet::new();
     for (index, message) in messages.iter().enumerate() {
-        if index >= current_start_index || is_protected_context_message(message) {
+        if message.role == "system"
+            || index >= protected_start_index
+            || is_protected_context_message(message)
+        {
             selected_indexes.insert(index);
         }
     }
@@ -1208,13 +1333,19 @@ fn truncate_for_budget(text: &str, max_chars: usize) -> String {
     )
 }
 
-fn upstream_context_budget_bytes() -> u64 {
-    let effective_tokens =
-        DEFAULT_CONTEXT_WINDOW.saturating_mul(u64::from(DEFAULT_EFFECTIVE_CONTEXT_PERCENT)) / 100;
+fn upstream_context_budget_bytes(mode: BudgetMode) -> u64 {
+    let effective_tokens = match mode {
+        BudgetMode::Standard => {
+            DEFAULT_CONTEXT_WINDOW.saturating_mul(u64::from(DEFAULT_EFFECTIVE_CONTEXT_PERCENT))
+                / 100
+        }
+        BudgetMode::CodexFullContextReplay => CODEX_FULL_CONTEXT_REPLAY_BUDGET_TOKENS,
+    };
     effective_tokens
         .saturating_sub(RESERVED_OUTPUT_TOKENS)
         .saturating_sub(RESERVED_TOOL_DEFINITION_TOKENS)
         .saturating_mul(BYTES_PER_TOKEN_ESTIMATE)
+        .max(64 * 1024)
 }
 
 fn messages_json_bytes(messages: &[ChatMessage]) -> u64 {
@@ -1258,7 +1389,6 @@ mod tests {
     use codeseex_core::AppConfig;
     use codeseex_store::{RequestStatus, Store};
     use serde_json::json;
-    use std::sync::Arc;
     use uuid::Uuid;
 
     #[test]
@@ -1276,14 +1406,13 @@ mod tests {
         let dir =
             std::env::temp_dir().join(format!("codeseex-context-{}", Uuid::new_v4().simple()));
         let store = Store::open(&dir).await.expect("open store");
-        let state = ProxyState {
-            config: Arc::new(AppConfig {
+        let state = ProxyState::for_test(
+            AppConfig {
                 data_dir: dir.clone(),
                 ..Default::default()
-            }),
-            client: reqwest::Client::new(),
+            },
             store,
-        };
+        );
         let input = json!({
             "input": [{
                 "role": "user",
@@ -1330,7 +1459,7 @@ mod tests {
             ChatMessage::text("user", "current task"),
         ];
 
-        let budgeted = budget_messages_for_upstream(messages, 3);
+        let budgeted = budget_messages_for_upstream(messages, 3, BudgetMode::Standard);
         let has_call = budgeted.messages.iter().any(|message| {
             message
                 .tool_calls
@@ -1363,7 +1492,7 @@ mod tests {
             ChatMessage::text("user", "continue after tool"),
         ];
 
-        let budgeted = budget_messages_for_upstream(messages, 1);
+        let budgeted = budget_messages_for_upstream(messages, 1, BudgetMode::Standard);
 
         assert!(budgeted.messages.iter().any(|message| {
             message
@@ -1399,7 +1528,7 @@ mod tests {
             ChatMessage::text("user", "continue after current result"),
         ];
 
-        let budgeted = budget_messages_for_upstream(messages, 2);
+        let budgeted = budget_messages_for_upstream(messages, 2, BudgetMode::Standard);
         let ids = budgeted
             .messages
             .iter()
@@ -1420,19 +1549,103 @@ mod tests {
         assert!(ids.contains("call_b"), "{ids:?}");
     }
 
+    #[test]
+    fn codex_full_context_budget_drops_old_current_input_history() {
+        let mut messages = vec![ChatMessage::text("system", "instructions")];
+        for index in 0..120 {
+            messages.push(ChatMessage::text(
+                "user",
+                format!("old full context item {index} {}", "x".repeat(8_000)),
+            ));
+        }
+        let tail_start = messages.len();
+        messages.push(ChatMessage::text("user", "latest task"));
+
+        let budgeted =
+            budget_messages_for_upstream(messages, tail_start, BudgetMode::CodexFullContextReplay);
+
+        assert_eq!(budgeted.diagnostic["mode"], "codex_full_context_replay");
+        assert_eq!(budgeted.diagnostic["triggered"], true);
+        assert!(budgeted
+            .messages
+            .iter()
+            .any(|message| message.role == "system" && message.content == "instructions"));
+        assert!(budgeted
+            .messages
+            .iter()
+            .any(|message| message.content == "latest task"));
+        assert!(
+            !budgeted
+                .messages
+                .iter()
+                .any(|message| message.content.contains("old full context item 0")),
+            "{:?}",
+            budgeted
+                .messages
+                .iter()
+                .map(|message| message.content.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            messages_json_bytes(&budgeted.messages)
+                <= upstream_context_budget_bytes(BudgetMode::CodexFullContextReplay)
+        );
+    }
+
+    #[test]
+    fn codex_full_context_tail_start_includes_current_tool_result_group() {
+        let mut messages = Vec::new();
+        for index in 0..40 {
+            messages.push(ChatMessage::text(
+                "user",
+                format!("old item {index} {}", "x".repeat(8_000)),
+            ));
+        }
+        let tool_calls = vec![json!({
+            "id": "call_current",
+            "type": "function",
+            "function": { "name": "shell_command", "arguments": "{\"command\":\"dir\"}" }
+        })];
+        messages.push(ChatMessage::assistant_tool_calls(tool_calls, ""));
+        messages.push(ChatMessage::tool_result(
+            "call_current",
+            format!("current shell output {}", "y".repeat(16_000)),
+        ));
+        messages.push(ChatMessage::text("user", "summarize the result"));
+
+        let tail_start = codex_full_context_relevant_tail_start(&messages);
+        let budgeted =
+            budget_messages_for_upstream(messages, tail_start, BudgetMode::CodexFullContextReplay);
+
+        assert!(budgeted.messages.iter().any(|message| {
+            message
+                .tool_calls
+                .as_ref()
+                .map(|calls| calls.iter().any(|call| call["id"] == "call_current"))
+                .unwrap_or(false)
+        }));
+        assert!(budgeted
+            .messages
+            .iter()
+            .any(|message| message.tool_call_id.as_deref() == Some("call_current")));
+        assert!(budgeted
+            .messages
+            .iter()
+            .any(|message| message.content == "summarize the result"));
+    }
+
     #[tokio::test]
     async fn history_drops_unresolved_client_tool_call_for_normal_followup() {
         let dir =
             std::env::temp_dir().join(format!("codeseex-context-{}", Uuid::new_v4().simple()));
         let store = Store::open(&dir).await.expect("open store");
-        let state = ProxyState {
-            config: Arc::new(AppConfig {
+        let state = ProxyState::for_test(
+            AppConfig {
                 data_dir: dir.clone(),
                 ..Default::default()
-            }),
-            client: reqwest::Client::new(),
+            },
             store,
-        };
+        );
 
         state
             .store
@@ -1509,14 +1722,13 @@ mod tests {
         let dir =
             std::env::temp_dir().join(format!("codeseex-context-{}", Uuid::new_v4().simple()));
         let store = Store::open(&dir).await.expect("open store");
-        let state = ProxyState {
-            config: Arc::new(AppConfig {
+        let state = ProxyState::for_test(
+            AppConfig {
                 data_dir: dir.clone(),
                 ..Default::default()
-            }),
-            client: reqwest::Client::new(),
+            },
             store,
-        };
+        );
 
         state
             .store
@@ -1604,14 +1816,13 @@ mod tests {
         let dir =
             std::env::temp_dir().join(format!("codeseex-context-{}", Uuid::new_v4().simple()));
         let store = Store::open(&dir).await.expect("open store");
-        let state = ProxyState {
-            config: Arc::new(AppConfig {
+        let state = ProxyState::for_test(
+            AppConfig {
                 data_dir: dir.clone(),
                 ..Default::default()
-            }),
-            client: reqwest::Client::new(),
+            },
             store,
-        };
+        );
 
         state
             .store
@@ -1702,14 +1913,13 @@ mod tests {
         let dir =
             std::env::temp_dir().join(format!("codeseex-context-{}", Uuid::new_v4().simple()));
         let store = Store::open(&dir).await.expect("open store");
-        let state = ProxyState {
-            config: Arc::new(AppConfig {
+        let state = ProxyState::for_test(
+            AppConfig {
                 data_dir: dir.clone(),
                 ..Default::default()
-            }),
-            client: reqwest::Client::new(),
+            },
             store,
-        };
+        );
 
         state
             .store
@@ -1780,14 +1990,13 @@ mod tests {
         let dir =
             std::env::temp_dir().join(format!("codeseex-context-{}", Uuid::new_v4().simple()));
         let store = Store::open(&dir).await.expect("open store");
-        let state = ProxyState {
-            config: Arc::new(AppConfig {
+        let state = ProxyState::for_test(
+            AppConfig {
                 data_dir: dir.clone(),
                 ..Default::default()
-            }),
-            client: reqwest::Client::new(),
+            },
             store,
-        };
+        );
 
         state
             .store
@@ -1906,11 +2115,7 @@ mod tests {
             data_dir: dir.clone(),
             ..Default::default()
         };
-        let state = ProxyState {
-            config: Arc::new(config.clone()),
-            client: reqwest::Client::new(),
-            store,
-        };
+        let state = ProxyState::for_test(config.clone(), store);
 
         state
             .store

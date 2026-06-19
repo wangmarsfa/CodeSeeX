@@ -7,7 +7,28 @@
   <link rel="icon" href="/assets/icons/app.png" type="image/png">
   <script>
     window.CODESEEX_ASSET_VERSION = Date.now().toString(36);
-    document.write('<link rel="stylesheet" href="/styles.css?v=' + window.CODESEEX_ASSET_VERSION + '">');
+    [
+      "/styles/foundation/theme.css",
+      "/styles/foundation/base.css",
+      "/styles/layout/app-shell.css",
+      "/styles/layout/sidebar.css",
+      "/styles/components/buttons.css",
+      "/styles/components/panels.css",
+      "/styles/components/forms.css",
+      "/styles/components/lists.css",
+      "/styles/components/menus.css",
+      "/styles/components/overlays.css",
+      "/styles/components/toml.css",
+      "/styles/features/config/billing.css",
+      "/styles/features/config/tools.css",
+      "/styles/pages/dashboard.css",
+      "/styles/pages/config.css",
+      "/styles/pages/logs.css",
+      "/styles/pages/about.css",
+      "/styles/pages/usage.css",
+    ].forEach((href) => {
+      document.write('<link rel="stylesheet" href="' + href + '?v=' + window.CODESEEX_ASSET_VERSION + '">');
+    });
   </script>
 </head>
 <body>
@@ -35,7 +56,7 @@
       </nav>
 
       <div class="sidebar-footer" data-i18n="sidebarFooter">
-        Powered by TasteSteak / 牛排吖
+        Powered by TasteSteak / 牛排吖 <br> LICENSE AGPL-3.0-only
       </div>
     </aside>
 
@@ -102,7 +123,7 @@
                   <div class="readiness-block">
                     <div class="readiness-heading-row">
                       <span class="metric-label section-kicker" data-i18n="dashboardReadinessTitle">Proxy state</span>
-                      <button class="btn btn-secondary btn-icon-label dashboard-troubleshoot-btn" type="button" id="troubleshootButton" disabled>
+                      <button class="btn btn-secondary btn-icon-label dashboard-troubleshoot-btn" type="button" id="troubleshootButton">
                         <span class="btn-icon btn-icon-heartbeat" aria-hidden="true"></span>
                         <span data-i18n="troubleshoot">Troubleshoot</span>
                       </button>
@@ -161,20 +182,28 @@
 
         </div>
 
-        <div class="usage-page page-stack">
+        <div class="usage-page">
           <section class="usage-summary-grid">
-            <div class="metric-card"><span class="metric-label" data-i18n="usageTotalTurns">Total records</span><span class="metric-value selectable" id="usageTotalTurns">0</span></div>
-            <div class="metric-card"><span class="metric-label" data-i18n="usageCacheHitRate">Overall cache hit rate</span><span class="metric-value selectable" id="usageCacheHitRate">-</span></div>
-            <div class="metric-card"><span class="metric-label" data-i18n="averageMs">Average latency</span><span class="metric-value selectable" id="usageAverageMs">-</span></div>
-            <div class="metric-card"><span class="metric-label" data-i18n="totalCost">Estimated total cost</span><span class="metric-value selectable" id="usageTotalCost">CNY 0.0000</span></div>
+            <div class="usage-metric-card"><span class="usage-metric-label" data-i18n="usageTotalTurns">Total records</span><span class="usage-metric-value selectable" id="usageTotalTurns">0</span></div>
+            <div class="usage-metric-card"><span class="usage-metric-label" data-i18n="usageCacheHitRate">Overall cache hit rate</span><span class="usage-metric-value selectable" id="usageCacheHitRate">-</span></div>
+            <div class="usage-metric-card"><span class="usage-metric-label" data-i18n="averageMs">Average latency</span><span class="usage-metric-value selectable" id="usageAverageMs">-</span></div>
+            <div class="usage-metric-card"><span class="usage-metric-label" data-i18n="totalCost">Estimated total cost</span><span class="usage-metric-value selectable" id="usageTotalCost">CNY 0.0000</span></div>
           </section>
 
-          <section class="panel usage-detail-panel">
+          <section class="usage-detail-panel">
             <div class="panel-header">
               <div>
                 <h2 data-i18n="usageConversationRecords">Conversation records</h2>
                 <p data-i18n="usageFoldedHint">Current data is shown as folded records; backend conversation grouping can refine this later.</p>
               </div>
+            </div>
+            <div class="usage-grid-spec usage-list-header">
+              <div data-i18n="usageTriggerAndSummary">Summary / time</div>
+              <div class="text-right" data-i18n="elapsed">Elapsed</div>
+              <div class="text-right" data-i18n="usageInputTotal">Input total</div>
+              <div class="text-right" data-i18n="usageOutputTotal">Output total</div>
+              <div class="text-right" data-i18n="usageCacheHitRateShort">Cache hit rate</div>
+              <div class="text-right" data-i18n="cost">Cost</div>
             </div>
             <div class="panel-body usage-record-wrap">
               <div class="usage-record-list selectable" id="usageRows"></div>
@@ -451,11 +480,17 @@
           <section class="panel about-native-panel">
             <div class="panel-body about-native-layout">
               <aside class="about-product-card">
-                <div class="about-product-icon app-icon" aria-hidden="true"></div>
-                <h2 class="about-product-name" data-product-name>CodeSeeX</h2>
-                <p class="about-product-subtitle" data-i18n="aboutProductSubtitle">Codex Bridge</p>
-                <p class="about-product-description" id="appDescription" data-i18n="aboutProductDescription">Local Codex bridge with a desktop manager, proxy, catalog, and tool controls.</p>
-                <span class="about-version-chip tabular-nums" id="appVersion">v-</span>
+                <div class="about-product-main">
+                  <div class="about-product-icon app-icon" aria-hidden="true"></div>
+                  <h2 class="about-product-name" data-product-name>CodeSeeX</h2>
+                  <p class="about-product-subtitle" data-i18n="aboutProductSubtitle">Codex Bridge</p>
+                  <p class="about-product-description" id="appDescription" data-i18n="aboutProductDescription">Local Codex bridge with a desktop manager, proxy, catalog, and tool controls.</p>
+                  <span class="about-version-chip tabular-nums" id="appVersion">v-</span>
+                </div>
+                <button class="about-action-button about-product-action" type="button" disabled>
+                  <span class="btn-icon btn-icon-link" aria-hidden="true"></span>
+                  <span data-i18n="officialWebsite">Official website</span>
+                </button>
                 <span id="appProductName" data-product-name hidden>CodeSeeX</span>
               </aside>
 
@@ -502,11 +537,11 @@
                 <section class="about-group">
                   <h3 class="about-group-title" data-i18n="projectSupport">Project &amp; support</h3>
                   <div class="about-resource-actions">
-                    <button class="about-resource-button" type="button" data-about-action="source">
+                    <button class="about-action-button" type="button" data-about-action="source">
                       <span class="btn-icon btn-icon-github" aria-hidden="true"></span>
                       <span data-i18n="source">View source</span>
                     </button>
-                    <button class="about-resource-button" type="button" data-about-action="feedback">
+                    <button class="about-action-button" type="button" data-about-action="feedback">
                       <span class="btn-icon btn-icon-link" aria-hidden="true"></span>
                       <span data-i18n="feedback">Feedback</span>
                     </button>
@@ -543,10 +578,25 @@
         <h2 id="ccsKeyTitle" data-i18n="ccsApiKeyTitle">CCS import API key</h2>
         <p data-i18n="ccsApiKeyHint">Enter the real API key required by CCS for this import. CodeSeeX uses it only to build this one deep link and does not save it.</p>
       </div>
-      <input class="inline-control modal-input" type="password" id="ccsApiKeyInput" spellcheck="false" autocomplete="new-password" data-i18n-placeholder="ccsApiKeyPlaceholder" placeholder="API key">
+      <input class="inline-control modal-input" type="password" id="ccsApiKeyInput" spellcheck="false" autocomplete="new-password" data-i18n-placeholder="ccsApiKeyPlaceholder" placeholder="sk-">
       <div class="modal-actions">
         <button class="btn btn-secondary" type="button" id="ccsKeyCancel" data-i18n="cancel">Cancel</button>
         <button class="btn btn-primary" type="button" id="ccsKeyConfirm" data-i18n="importToCcs">Import to CCS</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="overlay-layer" id="troubleshootModal" hidden>
+    <div class="overlay-card modal-card troubleshoot-card" role="dialog" aria-modal="true" aria-labelledby="troubleshootTitle">
+      <div class="modal-header">
+        <h2 id="troubleshootTitle" data-i18n="troubleshootTitle">Proxy troubleshooting</h2>
+        <p data-i18n="troubleshootHint">Check the local proxy state and the next safe action.</p>
+      </div>
+      <div class="troubleshoot-summary" id="troubleshootSummary"></div>
+      <div class="troubleshoot-action-list" id="troubleshootActions"></div>
+      <div class="modal-actions">
+        <button class="btn btn-secondary" type="button" id="troubleshootRefresh" data-i18n="refresh">Refresh</button>
+        <button class="btn btn-primary" type="button" id="troubleshootClose" data-i18n="close">Close</button>
       </div>
     </div>
   </div>

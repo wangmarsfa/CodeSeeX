@@ -57,7 +57,6 @@ $env:TMP = $env:TEMP
 if (-not $env:CODESEEX_DATA_DIR) {
   $env:CODESEEX_DATA_DIR = $DataDir
 }
-
 New-Item -ItemType Directory -Force -Path $env:CARGO_HOME, $env:CARGO_TARGET_DIR, $env:TEMP, $env:CODESEEX_DATA_DIR, $LogDir | Out-Null
 
 function Resolve-VsDevCmd {
@@ -180,27 +179,37 @@ function Write-DesktopBuildStamp {
   [System.IO.File]::WriteAllText($stampPath, $json, [System.Text.UTF8Encoding]::new($false))
 }
 
+function Get-CodeSeeXDesktopProcesses {
+  return @(
+    Get-Process -Name "codeseex-desktop" -ErrorAction SilentlyContinue |
+      Where-Object {
+        try {
+          $_.Path
+        } catch {
+          $true
+        }
+      }
+  )
+}
+
 function Stop-ExistingDesktopProcesses {
   param([string]$DesktopExe)
 
   $resolvedDesktopExe = [System.IO.Path]::GetFullPath($DesktopExe)
   $matches = @(
-    Get-Process -Name "codeseex-desktop" -ErrorAction SilentlyContinue |
-      Where-Object {
-        try {
-          $_.Path -and ([System.IO.Path]::GetFullPath($_.Path) -ieq $resolvedDesktopExe)
-        } catch {
-          $false
-        }
-      }
+    Get-CodeSeeXDesktopProcesses
   )
   if ($matches.Count -eq 0) {
     return
   }
 
-  Write-Host "Stopping existing CodeSeeX desktop process before dev launch ..."
+  Write-Host "Stopping existing CodeSeeX desktop process(es) before dev launch ..."
   foreach ($process in $matches) {
     try {
+      $processPath = try { [System.IO.Path]::GetFullPath($process.Path) } catch { "<unknown>" }
+      if ($processPath -ine $resolvedDesktopExe) {
+        Write-Host "Stopping another CodeSeeX instance: pid=$($process.Id) path=$processPath"
+      }
       if (-not $process.HasExited) {
         [void]$process.CloseMainWindow()
         [void]$process.WaitForExit(1500)
@@ -261,6 +270,10 @@ try {
   $desktopProcess = Start-Process -FilePath $desktopExe -WorkingDirectory $RepoRoot -PassThru
   Start-Sleep -Milliseconds 800
   if ($desktopProcess.HasExited) {
+    if ($KeepExisting -and $desktopProcess.ExitCode -eq 0 -and (Get-CodeSeeXDesktopProcesses).Count -gt 0) {
+      Write-Host "CodeSeeX desktop is already running; the dev process exited normally after single-instance handoff."
+      exit 0
+    }
     throw "CodeSeeX desktop exited immediately with code $($desktopProcess.ExitCode)."
   }
 

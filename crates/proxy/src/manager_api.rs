@@ -28,6 +28,7 @@ pub(crate) fn router() -> Router<ProxyState> {
         .route("/api/update-check", get(api_update_check))
         .route("/api/deepseek/balance", get(api_balance))
         .route("/api/events", get(api_events))
+        .route("/api/dev/seed-usage-template", post(seed_usage_template))
         .route("/api/start", post(api_start))
         .route("/api/restart", post(api_restart))
         .route("/api/stop", post(api_stop))
@@ -136,6 +137,14 @@ async fn api_events(
     manager_json_response(
         ManagerRuntime::from_proxy_state(&state)
             .handle_json("GET", "/api/events", Some(&query), None)
+            .await,
+    )
+}
+
+async fn seed_usage_template(State(state): State<ProxyState>) -> impl IntoResponse {
+    manager_json_response(
+        ManagerRuntime::from_proxy_state(&state)
+            .handle_json("POST", "/api/dev/seed-usage-template", None, None)
             .await,
     )
 }

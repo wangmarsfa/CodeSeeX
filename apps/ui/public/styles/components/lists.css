@@ -1,0 +1,4 @@
+.info-row { display: flex; justify-content: space-between; gap: 18px; padding: 12px 0; border-bottom: 1px solid var(--border-color); color: var(--text-secondary); font-size: 13px; transition: var(--theme-transition); }
+.info-row:last-child { border-bottom: none; }
+.info-row strong { color: var(--text-main); font-size: 13px; font-weight: 600; text-align: right; word-break: break-all; font-variant-numeric: tabular-nums; transition: var(--theme-transition); }
+.compact-row { padding: 9px 0; }

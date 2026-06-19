@@ -159,9 +159,13 @@ impl Default for UpstreamConfig {
 }
 
 impl AppConfig {
-    pub fn load() -> Self {
+    pub fn load_base() -> Self {
         load_dotenv_once();
-        let mut config = Self::default();
+        Self::default()
+    }
+
+    pub fn load() -> Self {
+        let mut config = Self::load_base();
         let path = config.config_path();
         let Ok(user_config) = UserConfig::read_from(&path) else {
             return config;

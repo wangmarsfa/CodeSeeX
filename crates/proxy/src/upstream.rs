@@ -10,6 +10,7 @@ pub async fn post_chat_completions(
     client: &reqwest::Client,
     upstream: &UpstreamConfig,
     inbound_auth: Option<&str>,
+    auth_context_payload: Option<&Value>,
     payload: Value,
 ) -> Result<reqwest::Response, reqwest::Error> {
     let url = chat_completions_url(&upstream.base_url, upstream.official_v1_compat);
@@ -20,7 +21,8 @@ pub async fn post_chat_completions(
         HeaderValue::from_static("application/json, text/event-stream"),
     );
 
-    if let Some(auth) = resolve_authorization_header(upstream, inbound_auth, &payload) {
+    let auth_payload = auth_context_payload.unwrap_or(&payload);
+    if let Some(auth) = resolve_authorization_header(upstream, inbound_auth, auth_payload) {
         if let Ok(value) = HeaderValue::from_str(&auth) {
             headers.insert(AUTHORIZATION, value);
         }
@@ -61,9 +63,7 @@ where
             return Some(auth);
         }
     }
-    direct_key()
-        .and_then(|value| format_bearer_header(&value))
-        .or(configured_auth)
+    configured_auth.or_else(|| direct_key().and_then(|value| format_bearer_header(&value)))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -194,7 +194,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_codex_auth_key_precedes_configured_fallback_for_codex_app_payloads() {
+    fn configured_key_precedes_direct_codex_auth_for_codex_app_payloads() {
         assert_eq!(
             resolve_authorization_header_with_direct_key(
                 &upstream_with_key(Some("configured-key")),
@@ -207,7 +207,7 @@ mod tests {
                 || Some("direct-key".to_owned())
             )
             .as_deref(),
-            Some("Bearer direct-key")
+            Some("Bearer configured-key")
         );
     }
 

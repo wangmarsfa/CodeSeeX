@@ -62,6 +62,43 @@ fn write_vision_analyze_config(config: &AppConfig, endpoint: &str) {
     .expect("write vision config");
 }
 
+fn write_enabled_tools_config(config: &AppConfig, enabled: Vec<String>) {
+    std::fs::create_dir_all(&config.data_dir).expect("create test data dir");
+    codeseex_core::UserConfig {
+        tools: Some(codeseex_core::UserToolsConfig {
+            enabled: Some(enabled),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+    .write_atomic(&config.config_path())
+    .expect("write tools config");
+}
+
+fn upstream_function_tool_names(request: &Value) -> Vec<&str> {
+    request
+        .get("tools")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|tool| tool.pointer("/function/name").and_then(Value::as_str))
+        .collect()
+}
+
+fn assert_default_codeseex_tools_present(names: &[&str]) {
+    for name in [
+        "apply_patch",
+        "web_search",
+        "list_directory",
+        "read_file_range",
+        "workspace_search",
+        "vision_analyze",
+        "image_gen",
+    ] {
+        assert!(names.contains(&name), "missing {name}: {names:?}");
+    }
+}
+
 #[test]
 fn streaming_cancellation_registry_marks_active_response() {
     let response_id = format!("resp_cancel_registry_{}", Uuid::new_v4().simple());
@@ -87,11 +124,7 @@ async fn cancel_response_marks_active_request_interrupted() {
         .await
         .unwrap();
     let cancelled = register_streaming_response(&response_id);
-    let proxy_state = ProxyState {
-        config: Arc::new(config),
-        client: reqwest::Client::new(),
-        store: store.clone(),
-    };
+    let proxy_state = ProxyState::for_test(config, store.clone());
     let proxy_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let proxy_addr = proxy_listener.local_addr().unwrap();
     let proxy_app = Router::new()
@@ -210,7 +243,7 @@ async fn fake_mixed_streaming_chat_completions(
                 "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"need directory first\"}}]}\n\n",
                 "data: {\"choices\":[{\"delta\":{\"tool_calls\":[",
                 "{\"index\":0,\"id\":\"call_ls\",\"type\":\"function\",\"function\":{\"name\":\"list_directory\",\"arguments\":\"{\\\"path\\\":\\\".\\\"}\"}},",
-                "{\"index\":1,\"id\":\"call_js\",\"type\":\"function\",\"function\":{\"name\":\"js\",\"arguments\":\"{\\\"code\\\":\\\"1+1\\\"}\"}}",
+                "{\"index\":1,\"id\":\"call_client_tool\",\"type\":\"function\",\"function\":{\"name\":\"plain_external_tool\",\"arguments\":\"{\\\"code\\\":\\\"1+1\\\"}\"}}",
                 "]}}]}\n\n",
                 "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":8,\"completion_tokens\":2,\"total_tokens\":10}}\n\n",
                 "data: [DONE]\n\n"
@@ -218,7 +251,7 @@ async fn fake_mixed_streaming_chat_completions(
             .to_owned()
     } else {
         concat!(
-                "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_js_2\",\"type\":\"function\",\"function\":{\"name\":\"js\",\"arguments\":\"{\\\"code\\\":\\\"1+1\\\"}\"}}]}}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_client_tool_2\",\"type\":\"function\",\"function\":{\"name\":\"plain_external_tool\",\"arguments\":\"{\\\"code\\\":\\\"1+1\\\"}\"}}]}}]}\n\n",
                 "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":8,\"completion_tokens\":2,\"total_tokens\":10}}\n\n",
                 "data: [DONE]\n\n"
             )
@@ -319,6 +352,124 @@ async fn fake_web_search_chat_completions(
     .into_response()
 }
 
+async fn fake_repeated_failing_web_search_chat_completions(
+    State(state): State<FakeUpstreamState>,
+    Json(payload): Json<Value>,
+) -> axum::response::Response {
+    {
+        let mut requests = state.requests.lock().expect("fake upstream lock poisoned");
+        requests.push(payload);
+    }
+    Json(json!({
+        "choices": [{
+            "finish_reason": "tool_calls",
+            "message": {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": format!("call_web_{}", Uuid::new_v4().simple()),
+                    "type": "function",
+                    "function": {
+                        "name": "web_search",
+                        "arguments": "{\"mode\":\"open\"}"
+                    }
+                }]
+            }
+        }],
+        "usage": { "prompt_tokens": 8, "completion_tokens": 2, "total_tokens": 10 }
+    }))
+    .into_response()
+}
+
+async fn fake_repeated_failing_list_directory_chat_completions(
+    State(state): State<FakeUpstreamState>,
+    Json(payload): Json<Value>,
+) -> axum::response::Response {
+    {
+        let mut requests = state.requests.lock().expect("fake upstream lock poisoned");
+        requests.push(payload);
+    }
+    Json(json!({
+        "choices": [{
+            "finish_reason": "tool_calls",
+            "message": {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": format!("call_list_{}", Uuid::new_v4().simple()),
+                    "type": "function",
+                    "function": {
+                        "name": "list_directory",
+                        "arguments": "{\"path\":\"..\"}"
+                    }
+                }]
+            }
+        }],
+        "usage": { "prompt_tokens": 8, "completion_tokens": 2, "total_tokens": 10 }
+    }))
+    .into_response()
+}
+
+async fn fake_repeated_failing_list_directory_changing_args_chat_completions(
+    State(state): State<FakeUpstreamState>,
+    Json(payload): Json<Value>,
+) -> axum::response::Response {
+    let call_index = {
+        let mut requests = state.requests.lock().expect("fake upstream lock poisoned");
+        requests.push(payload);
+        requests.len()
+    };
+    Json(json!({
+        "choices": [{
+            "finish_reason": "tool_calls",
+            "message": {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": format!("call_list_{}", Uuid::new_v4().simple()),
+                    "type": "function",
+                    "function": {
+                        "name": "list_directory",
+                        "arguments": format!("{{\"path\":\"../{}\"}}", call_index)
+                    }
+                }]
+            }
+        }],
+        "usage": { "prompt_tokens": 8, "completion_tokens": 2, "total_tokens": 10 }
+    }))
+    .into_response()
+}
+
+async fn fake_successful_list_directory_forever_chat_completions(
+    State(state): State<FakeUpstreamState>,
+    Json(payload): Json<Value>,
+) -> axum::response::Response {
+    let call_index = {
+        let mut requests = state.requests.lock().expect("fake upstream lock poisoned");
+        requests.push(payload);
+        requests.len()
+    };
+    Json(json!({
+        "choices": [{
+            "finish_reason": "tool_calls",
+            "message": {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": format!("call_web_{}", Uuid::new_v4().simple()),
+                    "type": "function",
+                    "function": {
+                        "name": "list_directory",
+                        "arguments": format!("{{\"path\":\".\",\"depth\":0,\"include_files\":true,\"include_dirs\":true,\"nonce\":{call_index}}}")
+                    }
+                }]
+            }
+        }],
+        "usage": { "prompt_tokens": 8, "completion_tokens": 2, "total_tokens": 10 }
+    }))
+    .into_response()
+}
+
 async fn fake_apply_patch_streaming_chat_completions(
     State(state): State<FakeUpstreamState>,
     Json(payload): Json<Value>,
@@ -410,6 +561,64 @@ async fn fake_tool_search_bridge_streaming_chat_completions(
         .expect("fake upstream response should build")
 }
 
+async fn fake_codex_handoff_then_final_chat_completions(
+    State(state): State<FakeUpstreamState>,
+    Json(payload): Json<Value>,
+) -> axum::response::Response {
+    let has_tool_result = payload
+        .get("messages")
+        .and_then(Value::as_array)
+        .map(|messages| {
+            messages.iter().any(|message| {
+                message.get("role").and_then(Value::as_str) == Some("tool")
+                    && message.get("tool_call_id").and_then(Value::as_str) == Some("call_shell")
+            })
+        })
+        .unwrap_or(false);
+    {
+        let mut requests = state.requests.lock().expect("fake upstream lock poisoned");
+        requests.push(payload);
+    }
+    if has_tool_result {
+        return Json(json!({
+            "choices": [{
+                "message": { "role": "assistant", "content": "shell output handled" }
+            }],
+            "usage": {
+                "prompt_tokens": 1240,
+                "prompt_cache_hit_tokens": 1000,
+                "completion_tokens": 5,
+                "total_tokens": 1245
+            }
+        }))
+        .into_response();
+    }
+    Json(json!({
+        "choices": [{
+            "finish_reason": "tool_calls",
+            "message": {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call_shell",
+                    "type": "function",
+                    "function": {
+                        "name": "shell_command",
+                        "arguments": "{\"command\":\"Get-ChildItem\"}"
+                    }
+                }]
+            }
+        }],
+        "usage": {
+            "prompt_tokens": 420,
+            "prompt_cache_hit_tokens": 300,
+            "completion_tokens": 12,
+            "total_tokens": 432
+        }
+    }))
+    .into_response()
+}
+
 async fn fake_reasoning_then_content_streaming_chat_completions(
     State(state): State<FakeUpstreamState>,
     Json(payload): Json<Value>,
@@ -421,6 +630,26 @@ async fn fake_reasoning_then_content_streaming_chat_completions(
     let body = concat!(
         "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"think before answering\"}}]}\n\n",
         "data: {\"choices\":[{\"delta\":{\"content\":\"final answer\"}}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .body(Body::from(body))
+        .expect("fake upstream response should build")
+}
+
+async fn fake_service_streaming_chat_completions(
+    State(state): State<FakeUpstreamState>,
+    Json(payload): Json<Value>,
+) -> axum::response::Response {
+    {
+        let mut requests = state.requests.lock().expect("fake upstream lock poisoned");
+        requests.push(payload);
+    }
+    let body = concat!(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n",
+        "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"prompt_cache_hit_tokens\":4,\"completion_tokens\":3,\"total_tokens\":13}}\n\n",
         "data: [DONE]\n\n"
     );
     Response::builder()
@@ -445,6 +674,142 @@ async fn fake_final_chat_completions(
         "usage": { "prompt_tokens": 10, "completion_tokens": 3, "total_tokens": 13 }
     }))
     .into_response()
+}
+
+async fn fake_failed_chat_completions(
+    State(state): State<FakeUpstreamState>,
+    Json(payload): Json<Value>,
+) -> axum::response::Response {
+    {
+        let mut requests = state.requests.lock().expect("fake upstream lock poisoned");
+        requests.push(payload);
+    }
+    Response::builder()
+        .status(StatusCode::INTERNAL_SERVER_ERROR)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(r#"{"error":{"message":"simulated failure"}}"#))
+        .expect("fake upstream response should build")
+}
+
+fn thread_title_service_request(id: &str) -> Value {
+    json!({
+        "id": id,
+        "model": "gpt-5.4",
+        "stream": false,
+        "store": false,
+        "client_metadata": {
+            "x-codex-installation-id": "codex-install"
+        },
+        "input": [{
+            "type": "message",
+            "role": "user",
+            "content": [{ "type": "input_text", "text": "Generate a short conversation title." }]
+        }],
+        "reasoning": { "effort": "medium" },
+        "max_output_tokens": 32,
+        "text": {
+            "format": {
+                "type": "json_schema",
+                "name": "thread_title",
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "title": { "type": "string", "minLength": 1, "maxLength": 36 }
+                    },
+                    "required": ["title"],
+                    "additionalProperties": false
+                }
+            }
+        }
+    })
+}
+
+fn ambient_suggestions_service_request(id: &str) -> Value {
+    let context = "Large workspace context. ".repeat(1_000);
+    json!({
+        "id": id,
+        "model": "gpt-5.4",
+        "stream": false,
+        "store": false,
+        "input": [{
+            "type": "message",
+            "role": "user",
+            "content": [{
+                "type": "input_text",
+                "text": context
+            }]
+        }],
+        "reasoning": { "effort": "low" },
+        "max_output_tokens": 512,
+        "text": {
+            "format": {
+                "type": "json_schema",
+                "name": "ambient_suggestions",
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "suggestions": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "title": { "type": "string" },
+                                    "description": { "type": "string" },
+                                    "prompt": { "type": "string" },
+                                    "appId": { "type": "string" }
+                                },
+                                "required": ["title", "description", "prompt", "appId"],
+                                "additionalProperties": false
+                            }
+                        }
+                    },
+                    "required": ["suggestions"],
+                    "additionalProperties": false
+                }
+            }
+        }
+    })
+}
+
+fn ambient_suggestion_safety_service_request(id: &str) -> Value {
+    json!({
+        "id": id,
+        "model": "gpt-5.4-mini",
+        "stream": false,
+        "store": false,
+        "input": [{
+            "type": "message",
+            "role": "user",
+            "content": [{ "type": "input_text", "text": "Classify ambient suggestion candidates." }]
+        }],
+        "reasoning": { "effort": "none" },
+        "max_output_tokens": 256,
+        "text": {
+            "format": {
+                "type": "json_schema",
+                "name": "ambient_suggestion_safety",
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "exclude": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "id": { "type": "string" },
+                                    "reason": { "type": "string" }
+                                },
+                                "required": ["id", "reason"],
+                                "additionalProperties": false
+                            }
+                        }
+                    },
+                    "required": ["exclude"],
+                    "additionalProperties": false
+                }
+            }
+        }
+    })
 }
 
 async fn fake_vision_instruction_chat_completions(
@@ -951,6 +1316,9 @@ fn synthetic_tool_search_bridge_diagnostic_records_decision() {
         &context,
         &upstream_tools,
         &decision,
+        &crate::tools::default_enabled_tool_ids(),
+        true,
+        crate::upstream::payload::CodexServiceRequestKind::None,
     );
 
     assert_eq!(
@@ -969,7 +1337,7 @@ fn synthetic_tool_search_bridge_diagnostic_records_decision() {
 }
 
 #[test]
-fn lightweight_auxiliary_suppresses_synthetic_tool_search_bridge() {
+fn service_request_suppresses_synthetic_tool_search_bridge() {
     let context = ToolContext::from_request_tools(Some(&json!([{
         "type": "function",
         "function": {
@@ -978,14 +1346,11 @@ fn lightweight_auxiliary_suppresses_synthetic_tool_search_bridge() {
             "parameters": { "type": "object", "properties": {} }
         }
     }])));
-    let request = json!({
-        "client_metadata": {},
-        "tools": []
-    });
+    let request = thread_title_service_request("resp_service_bridge");
     let decision = codex_tool_search_bridge_decision(&request, true, &context);
 
     assert!(!decision.injected);
-    assert_eq!(decision.reason, "suppressed_lightweight_auxiliary");
+    assert_eq!(decision.reason, "suppressed_service_request");
 }
 
 #[test]
@@ -1323,11 +1688,7 @@ async fn streaming_closes_thinking_before_final_content() {
     ));
     let config = test_config_with_upstream(data_dir, fake_addr);
     let store = Store::open(&config.data_dir).await.unwrap();
-    let proxy_state = ProxyState {
-        config: Arc::new(config),
-        client: reqwest::Client::new(),
-        store,
-    };
+    let proxy_state = ProxyState::for_test(config, store);
     let proxy_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let proxy_addr = proxy_listener.local_addr().unwrap();
     let proxy_app = Router::new()
@@ -1387,11 +1748,8 @@ async fn streaming_internal_tools_execute_inside_proxy_without_client_function_c
     ));
     let config = test_config_with_upstream(data_dir, fake_addr);
     let store = Store::open(&config.data_dir).await.unwrap();
-    let proxy_state = ProxyState {
-        config: Arc::new(config),
-        client: reqwest::Client::new(),
-        store,
-    };
+    let inspection_store = store.clone();
+    let proxy_state = ProxyState::for_test(config, store);
     let proxy_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let proxy_addr = proxy_listener.local_addr().unwrap();
     let proxy_app = Router::new()
@@ -1478,6 +1836,33 @@ async fn streaming_internal_tools_execute_inside_proxy_without_client_function_c
         message.get("role").and_then(Value::as_str) == Some("tool")
             && message.get("tool_call_id").and_then(Value::as_str) == Some("call_ls")
     }));
+
+    let (events, _) = inspection_store.recent_events(50, None).await.unwrap();
+    assert!(events
+        .iter()
+        .any(|event| event.event_type == "context_compile_diagnostic"
+            && event.audience.as_deref() == Some("safe_diagnostic")));
+    let usage_events = events
+        .iter()
+        .filter(|event| event.event_type == "upstream_call_usage_breakdown")
+        .collect::<Vec<_>>();
+    assert_eq!(usage_events.len(), 2);
+    assert!(usage_events.iter().all(|event| {
+        event.audience.as_deref() == Some("safe_diagnostic")
+            && event
+                .detail
+                .as_ref()
+                .and_then(|detail| detail.pointer("/payload/payload_hash"))
+                .is_some()
+    }));
+    assert!(usage_events.iter().any(|event| {
+        event
+            .detail
+            .as_ref()
+            .and_then(|detail| detail.pointer("/usage/input_tokens"))
+            .and_then(Value::as_u64)
+            == Some(10)
+    }));
 }
 
 #[tokio::test]
@@ -1495,11 +1880,7 @@ async fn responses_missing_previous_response_id_is_ignored_without_local_replay(
     let data_dir = temp_workspace("missing-previous-conflict");
     let config = test_config_with_upstream(data_dir.clone(), fake_addr);
     let store = Store::open(&config.data_dir).await.unwrap();
-    let proxy_state = ProxyState {
-        config: Arc::new(config),
-        client: reqwest::Client::new(),
-        store: store.clone(),
-    };
+    let proxy_state = ProxyState::for_test(config, store.clone());
     let proxy_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let proxy_addr = proxy_listener.local_addr().unwrap();
     let proxy_app = Router::new()
@@ -1573,11 +1954,7 @@ async fn responses_missing_previous_response_id_allows_codex_full_context() {
     let data_dir = temp_workspace("missing-previous-full-context");
     let config = test_config_with_upstream(data_dir.clone(), fake_addr);
     let store = Store::open(&config.data_dir).await.unwrap();
-    let proxy_state = ProxyState {
-        config: Arc::new(config),
-        client: reqwest::Client::new(),
-        store: store.clone(),
-    };
+    let proxy_state = ProxyState::for_test(config, store.clone());
     let proxy_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let proxy_addr = proxy_listener.local_addr().unwrap();
     let proxy_app = Router::new()
@@ -1639,6 +2016,105 @@ async fn responses_missing_previous_response_id_allows_codex_full_context() {
             .pointer("/runtime_context_storage/current/mode")
             .and_then(Value::as_str),
         Some("codex_full_context_not_stored")
+    );
+
+    let _ = std::fs::remove_dir_all(data_dir);
+}
+
+#[tokio::test]
+async fn codex_full_context_request_is_budgeted_before_upstream() {
+    let fake_state = FakeUpstreamState::default();
+    let fake_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let fake_addr = fake_listener.local_addr().unwrap();
+    let fake_app = Router::new()
+        .route("/chat/completions", post(fake_final_chat_completions))
+        .with_state(fake_state.clone());
+    tokio::spawn(async move {
+        axum::serve(fake_listener, fake_app).await.unwrap();
+    });
+
+    let data_dir = temp_workspace("full-context-budget-upstream");
+    let config = test_config_with_upstream(data_dir.clone(), fake_addr);
+    let store = Store::open(&config.data_dir).await.unwrap();
+    let proxy_state = ProxyState::for_test(config, store.clone());
+    let proxy_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    let proxy_app = Router::new()
+        .route("/v1/responses", post(responses))
+        .with_state(proxy_state);
+    tokio::spawn(async move {
+        axum::serve(proxy_listener, proxy_app).await.unwrap();
+    });
+
+    let mut input_items = (0..110)
+        .map(|index| {
+            json!({
+                "type": "message",
+                "role": "user",
+                "content": [{
+                    "type": "input_text",
+                    "text": format!("old full context item {index} {}", "x".repeat(8_000))
+                }]
+            })
+        })
+        .collect::<Vec<_>>();
+    input_items.push(json!({
+        "type": "message",
+        "role": "user",
+        "content": [{ "type": "input_text", "text": "latest full-context task" }]
+    }));
+
+    let response = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/responses"))
+        .json(&json!({
+            "id": "resp_full_context_budgeted",
+            "model": "deepseek-v4-pro",
+            "prompt_cache_key": "thread-full-context",
+            "instructions": "answer briefly",
+            "tools": [],
+            "input": input_items
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let requests = fake_state
+        .requests
+        .lock()
+        .expect("fake upstream lock poisoned")
+        .clone();
+    assert_eq!(requests.len(), 1);
+    let messages = requests[0]["messages"]
+        .as_array()
+        .expect("upstream messages");
+    let serialized_messages = serde_json::to_string(messages).unwrap();
+    assert!(serialized_messages.contains("answer briefly"));
+    assert!(serialized_messages.contains("latest full-context task"));
+    assert!(!serialized_messages.contains("old full context item 0"));
+    assert!(
+        serialized_messages.len() < 160_000,
+        "messages too large: {}",
+        serialized_messages.len()
+    );
+
+    let (events, _) = store.recent_events(40, None).await.unwrap();
+    let diagnostic = events
+        .iter()
+        .find(|event| event.event_type == "context_compile_diagnostic")
+        .and_then(|event| event.detail.as_ref())
+        .expect("context diagnostic");
+    assert_eq!(
+        diagnostic
+            .pointer("/context/budget_mode")
+            .and_then(Value::as_str),
+        Some("codex_full_context_replay")
+    );
+    assert_eq!(
+        diagnostic
+            .pointer("/context/budget/triggered")
+            .and_then(Value::as_bool),
+        Some(true)
     );
 
     let _ = std::fs::remove_dir_all(data_dir);
@@ -1707,11 +2183,7 @@ async fn non_full_context_continuation_warns_when_parent_input_was_not_stored() 
         )
         .await
         .unwrap();
-    let proxy_state = ProxyState {
-        config: Arc::new(config),
-        client: reqwest::Client::new(),
-        store: store.clone(),
-    };
+    let proxy_state = ProxyState::for_test(config, store.clone());
     let proxy_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let proxy_addr = proxy_listener.local_addr().unwrap();
     let proxy_app = Router::new()
@@ -1802,11 +2274,7 @@ async fn responses_interrupted_previous_is_ignored_without_local_replay() {
         .await
         .unwrap();
     let inspection_store = store.clone();
-    let proxy_state = ProxyState {
-        config: Arc::new(config),
-        client: reqwest::Client::new(),
-        store,
-    };
+    let proxy_state = ProxyState::for_test(config, store);
     let proxy_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let proxy_addr = proxy_listener.local_addr().unwrap();
     let proxy_app = Router::new()
@@ -1893,11 +2361,7 @@ async fn responses_failed_previous_is_ignored_without_local_replay() {
         )
         .await
         .unwrap();
-    let proxy_state = ProxyState {
-        config: Arc::new(config),
-        client: reqwest::Client::new(),
-        store,
-    };
+    let proxy_state = ProxyState::for_test(config, store);
     let proxy_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let proxy_addr = proxy_listener.local_addr().unwrap();
     let proxy_app = Router::new()
@@ -1965,11 +2429,7 @@ async fn responses_interrupted_previous_allows_codex_full_context() {
         .interrupt_request_if_in_progress("resp_interrupted_parent_full", "client cancelled")
         .await
         .unwrap();
-    let proxy_state = ProxyState {
-        config: Arc::new(config),
-        client: reqwest::Client::new(),
-        store: store.clone(),
-    };
+    let proxy_state = ProxyState::for_test(config, store.clone());
     let proxy_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let proxy_addr = proxy_listener.local_addr().unwrap();
     let proxy_app = Router::new()
@@ -2039,11 +2499,7 @@ async fn current_input_tool_outputs_replay_as_chat_tool_protocol() {
     ));
     let config = test_config_with_upstream(data_dir, fake_addr);
     let store = Store::open(&config.data_dir).await.unwrap();
-    let proxy_state = ProxyState {
-        config: Arc::new(config),
-        client: reqwest::Client::new(),
-        store,
-    };
+    let proxy_state = ProxyState::for_test(config, store);
     let proxy_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let proxy_addr = proxy_listener.local_addr().unwrap();
     let proxy_app = Router::new()
@@ -2131,25 +2587,21 @@ async fn current_input_tool_outputs_replay_as_chat_tool_protocol() {
 }
 
 #[tokio::test]
-async fn lightweight_auxiliary_responses_request_suppresses_proxy_tools() {
+async fn upstream_failure_records_retry_cache_diagnostic_without_prompt_text() {
     let fake_state = FakeUpstreamState::default();
     let fake_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let fake_addr = fake_listener.local_addr().unwrap();
     let fake_app = Router::new()
-        .route("/chat/completions", post(fake_final_chat_completions))
+        .route("/chat/completions", post(fake_failed_chat_completions))
         .with_state(fake_state.clone());
     tokio::spawn(async move {
         axum::serve(fake_listener, fake_app).await.unwrap();
     });
 
-    let data_dir = temp_workspace("auxiliary-no-tools");
+    let data_dir = temp_workspace("retry-cache-diagnostic");
     let config = test_config_with_upstream(data_dir.clone(), fake_addr);
     let store = Store::open(&config.data_dir).await.unwrap();
-    let proxy_state = ProxyState {
-        config: Arc::new(config),
-        client: reqwest::Client::new(),
-        store,
-    };
+    let proxy_state = ProxyState::for_test(config, store.clone());
     let proxy_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let proxy_addr = proxy_listener.local_addr().unwrap();
     let proxy_app = Router::new()
@@ -2162,16 +2614,327 @@ async fn lightweight_auxiliary_responses_request_suppresses_proxy_tools() {
     let response = reqwest::Client::new()
         .post(format!("http://{proxy_addr}/v1/responses"))
         .json(&json!({
-            "id": "resp_auxiliary_suggestions",
-            "model": "gpt-5.4",
-            "stream": false,
-            "instructions": "Generate suggested starter prompts for a new project workspace conversation.",
+            "id": "resp_retry_cache_failure",
+            "model": "deepseek-v4-pro",
+            "prompt_cache_key": "thread-cache-key",
             "input": [{
                 "type": "message",
                 "role": "user",
-                "content": [{ "type": "input_text", "text": "The user opened a new project workspace topic." }]
+                "content": [{ "type": "input_text", "text": "secret prompt should not be logged" }]
+            }]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let (events, _) = store.recent_events(50, None).await.expect("events");
+    let retry = events
+        .iter()
+        .find(|event| event.event_type == "retry_cache_diagnostic")
+        .expect("retry/cache diagnostic should be recorded");
+    assert_eq!(retry.audience.as_deref(), Some("safe_diagnostic"));
+    let detail = retry.detail.as_ref().expect("detail");
+    assert_eq!(detail["error_kind"], "upstream_status_failed_initial");
+    assert!(detail.pointer("/request/request_hash").is_some());
+    assert!(detail.pointer("/request/input_hash").is_some());
+    assert!(detail.pointer("/payload/payload_hash").is_some());
+    let detail_text = serde_json::to_string(detail).unwrap();
+    assert!(!detail_text.contains("secret prompt should not be logged"));
+
+    let _ = std::fs::remove_dir_all(data_dir);
+}
+
+#[tokio::test]
+async fn codex_service_responses_requests_route_flash_disable_thinking_and_suppress_tools() {
+    let fake_state = FakeUpstreamState::default();
+    let fake_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let fake_addr = fake_listener.local_addr().unwrap();
+    let fake_app = Router::new()
+        .route("/chat/completions", post(fake_final_chat_completions))
+        .with_state(fake_state.clone());
+    tokio::spawn(async move {
+        axum::serve(fake_listener, fake_app).await.unwrap();
+    });
+
+    let data_dir = temp_workspace("service-no-tools");
+    let config = test_config_with_upstream(data_dir.clone(), fake_addr);
+    let store = Store::open(&config.data_dir).await.unwrap();
+    let inspection_store = store.clone();
+    let proxy_state = ProxyState::for_test(config, store);
+    let proxy_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    let proxy_app = Router::new()
+        .route("/v1/responses", post(responses))
+        .with_state(proxy_state);
+    tokio::spawn(async move {
+        axum::serve(proxy_listener, proxy_app).await.unwrap();
+    });
+
+    let client = reqwest::Client::new();
+    for request in [
+        thread_title_service_request("resp_service_title"),
+        ambient_suggestions_service_request("resp_service_suggestions"),
+        ambient_suggestion_safety_service_request("resp_service_safety"),
+    ] {
+        let response = client
+            .post(format!("http://{proxy_addr}/v1/responses"))
+            .json(&request)
+            .send()
+            .await
+            .unwrap();
+        assert!(response.status().is_success());
+    }
+
+    let requests = fake_state
+        .requests
+        .lock()
+        .expect("fake upstream lock poisoned")
+        .clone();
+    assert_eq!(requests.len(), 3);
+    for request in &requests {
+        assert_eq!(request["model"], MODEL_FLASH);
+        assert_eq!(request["thinking"], json!({ "type": "disabled" }));
+        assert!(
+            request.get("tools").is_none(),
+            "service requests should not receive proxy tools: {request}"
+        );
+        assert!(
+            request.get("tool_choice").is_none(),
+            "service requests should not receive tool_choice: {request}"
+        );
+        let messages = request["messages"]
+            .as_array()
+            .expect("service payload messages");
+        assert!(
+            messages.iter().any(|message| {
+                message.get("role").and_then(Value::as_str) == Some("system")
+                    && message
+                        .get("content")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_ascii_lowercase()
+                        .contains("json")
+            }),
+            "service structured payload should include a JSON instruction: {request}"
+        );
+    }
+
+    let summary = inspection_store.runtime_summary(10).await.unwrap();
+    assert_eq!(summary.request_count, 0);
+    assert!(summary.turn_history.is_empty());
+    assert!(summary.last_turn.is_none());
+    assert_eq!(summary.billable_request_count, 3);
+    assert_eq!(summary.billable_history.len(), 3);
+    assert!(summary
+        .billable_history
+        .iter()
+        .all(|item| item.lifecycle == "service_ephemeral" && !item.conversation_turn));
+
+    let (events, _) = inspection_store
+        .recent_visible_events(20, None)
+        .await
+        .expect("visible events");
+    let service_diagnostics = events
+        .iter()
+        .filter(|event| event.event_type == "service_request_diagnostic")
+        .collect::<Vec<_>>();
+    assert_eq!(service_diagnostics.len(), 3, "{events:?}");
+    let diagnostics_text = serde_json::to_string(&service_diagnostics).unwrap();
+    assert!(
+        !diagnostics_text.contains("Large workspace context"),
+        "default service diagnostics should not persist prompt text: {diagnostics_text}"
+    );
+
+    let _ = std::fs::remove_dir_all(data_dir);
+}
+
+#[tokio::test]
+async fn codex_service_responses_request_suppresses_previous_history_replay() {
+    let fake_state = FakeUpstreamState::default();
+    let fake_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let fake_addr = fake_listener.local_addr().unwrap();
+    let fake_app = Router::new()
+        .route("/chat/completions", post(fake_final_chat_completions))
+        .with_state(fake_state.clone());
+    tokio::spawn(async move {
+        axum::serve(fake_listener, fake_app).await.unwrap();
+    });
+
+    let data_dir = temp_workspace("service-suppresses-previous");
+    let config = test_config_with_upstream(data_dir.clone(), fake_addr);
+    let store = Store::open(&config.data_dir).await.unwrap();
+    store
+        .checkpoint_request(
+            "resp_service_parent",
+            None,
+            Some("deepseek-v4-pro"),
+            &json!({
+                "model": "deepseek-v4-pro",
+                "input": [{
+                    "type": "message",
+                    "role": "user",
+                    "content": [{ "type": "input_text", "text": "PARENT_SECRET_SHOULD_NOT_REPLAY" }]
+                }]
+            }),
+        )
+        .await
+        .unwrap();
+    store
+        .finish_request(
+            "resp_service_parent",
+            RequestStatus::Completed,
+            Some(&json!({
+                "model": "deepseek-v4-pro",
+                "output": [{
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{ "type": "output_text", "text": "PARENT_ASSISTANT_SECRET" }]
+                }],
+                "usage": { "input_tokens": 5, "output_tokens": 2, "total_tokens": 7 }
+            })),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let proxy_state = ProxyState::for_test(config, store.clone());
+    let proxy_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    let proxy_app = Router::new()
+        .route("/v1/responses", post(responses))
+        .with_state(proxy_state);
+    tokio::spawn(async move {
+        axum::serve(proxy_listener, proxy_app).await.unwrap();
+    });
+
+    let mut request = thread_title_service_request("resp_service_child");
+    request["previous_response_id"] = json!("resp_service_parent");
+    request["feature"] = json!("thread_title");
+    let response = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/responses"))
+        .json(&request)
+        .send()
+        .await
+        .unwrap();
+
+    assert!(response.status().is_success());
+    let requests = fake_state
+        .requests
+        .lock()
+        .expect("fake upstream lock poisoned")
+        .clone();
+    assert_eq!(requests.len(), 1);
+    let upstream_payload = serde_json::to_string(&requests[0]).unwrap();
+    assert!(!upstream_payload.contains("PARENT_SECRET_SHOULD_NOT_REPLAY"));
+    assert!(!upstream_payload.contains("PARENT_ASSISTANT_SECRET"));
+
+    let chain = store
+        .response_context_chain("resp_service_child", 1)
+        .await
+        .unwrap();
+    assert_eq!(chain[0].previous_response_id, None);
+    let (events, _) = store.recent_events(80, None).await.unwrap();
+    let context_event = events
+        .iter()
+        .find(|event| {
+            event.event_type == "context_compile_diagnostic"
+                && event
+                    .detail
+                    .as_ref()
+                    .and_then(|detail| detail.get("id"))
+                    .and_then(Value::as_str)
+                    == Some("resp_service_child")
+        })
+        .expect("context diagnostic");
+    assert_eq!(
+        context_event
+            .detail
+            .as_ref()
+            .and_then(|detail| detail.pointer("/context/history_messages"))
+            .and_then(Value::as_u64),
+        Some(0)
+    );
+    let started_event = events
+        .iter()
+        .find(|event| {
+            event.event_type == "request_started"
+                && event
+                    .detail
+                    .as_ref()
+                    .and_then(|detail| detail.get("id"))
+                    .and_then(Value::as_str)
+                    == Some("resp_service_child")
+        })
+        .expect("request started");
+    assert_eq!(
+        started_event
+            .detail
+            .as_ref()
+            .and_then(|detail| detail.pointer("/previous_response_resolution/kind"))
+            .and_then(Value::as_str),
+        Some("suppressed_service")
+    );
+
+    let _ = std::fs::remove_dir_all(data_dir);
+}
+
+#[tokio::test]
+async fn codex_service_chat_completion_suppresses_incoming_tools() {
+    let fake_state = FakeUpstreamState::default();
+    let fake_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let fake_addr = fake_listener.local_addr().unwrap();
+    let fake_app = Router::new()
+        .route("/chat/completions", post(fake_final_chat_completions))
+        .with_state(fake_state.clone());
+    tokio::spawn(async move {
+        axum::serve(fake_listener, fake_app).await.unwrap();
+    });
+
+    let data_dir = temp_workspace("service-chat-no-tools");
+    let config = test_config_with_upstream(data_dir.clone(), fake_addr);
+    let store = Store::open(&config.data_dir).await.unwrap();
+    let proxy_state = ProxyState::for_test(config, store.clone());
+    let proxy_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    let proxy_app = Router::new()
+        .route("/v1/chat/completions", post(chat_completions))
+        .with_state(proxy_state);
+    tokio::spawn(async move {
+        axum::serve(proxy_listener, proxy_app).await.unwrap();
+    });
+
+    let response = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/chat/completions"))
+        .json(&json!({
+            "model": "gpt-5.4",
+            "feature": "thread_title",
+            "store": false,
+            "messages": [{ "role": "user", "content": "Generate title." }],
+            "reasoning": { "effort": "medium" },
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "plain_external_tool",
+                    "description": "External client tool.",
+                    "parameters": { "type": "object", "properties": {} }
+                }
             }],
-            "max_output_tokens": 128
+            "tool_choice": { "type": "function", "function": { "name": "plain_external_tool" } },
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "name": "thread_title",
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "title": { "type": "string" }
+                        },
+                        "required": ["title"],
+                        "additionalProperties": false
+                    }
+                }
+            }
         }))
         .send()
         .await
@@ -2185,11 +2948,99 @@ async fn lightweight_auxiliary_responses_request_suppresses_proxy_tools() {
         .clone();
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0]["model"], MODEL_FLASH);
-    assert!(
-        requests[0].get("tools").is_none(),
-        "auxiliary requests should not receive proxy tools: {}",
-        requests[0]
+    assert_eq!(requests[0]["thinking"], json!({ "type": "disabled" }));
+    assert!(requests[0].get("tools").is_none(), "{}", requests[0]);
+    assert!(requests[0].get("tool_choice").is_none(), "{}", requests[0]);
+
+    let summary = store.runtime_summary(10).await.unwrap();
+    assert_eq!(summary.request_count, 0);
+    assert_eq!(summary.billable_request_count, 1);
+    assert_eq!(summary.billable_history[0].lifecycle, "service_ephemeral");
+
+    let _ = std::fs::remove_dir_all(data_dir);
+}
+
+#[tokio::test]
+async fn streaming_codex_service_chat_completion_keeps_billable_usage() {
+    let fake_state = FakeUpstreamState::default();
+    let fake_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let fake_addr = fake_listener.local_addr().unwrap();
+    let fake_app = Router::new()
+        .route(
+            "/chat/completions",
+            post(fake_service_streaming_chat_completions),
+        )
+        .with_state(fake_state.clone());
+    tokio::spawn(async move {
+        axum::serve(fake_listener, fake_app).await.unwrap();
+    });
+
+    let data_dir = temp_workspace("service-chat-stream-usage");
+    let config = test_config_with_upstream(data_dir.clone(), fake_addr);
+    let store = Store::open(&config.data_dir).await.unwrap();
+    let proxy_state = ProxyState::for_test(config, store.clone());
+    let proxy_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    let proxy_app = Router::new()
+        .route("/v1/chat/completions", post(chat_completions))
+        .with_state(proxy_state);
+    tokio::spawn(async move {
+        axum::serve(proxy_listener, proxy_app).await.unwrap();
+    });
+
+    let body = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/chat/completions"))
+        .json(&json!({
+            "model": "gpt-5.4",
+            "feature": "thread_title",
+            "stream": true,
+            "store": false,
+            "messages": [{ "role": "user", "content": "Generate title." }],
+            "reasoning": { "effort": "medium" },
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "name": "thread_title",
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "title": { "type": "string" }
+                        },
+                        "required": ["title"],
+                        "additionalProperties": false
+                    }
+                }
+            }
+        }))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+
+    assert!(body.contains("data: [DONE]"), "{body}");
+    let requests = fake_state
+        .requests
+        .lock()
+        .expect("fake upstream lock poisoned")
+        .clone();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0]["model"], MODEL_FLASH);
+    assert_eq!(requests[0]["thinking"], json!({ "type": "disabled" }));
+    assert_eq!(
+        requests[0]["stream_options"],
+        json!({ "include_usage": true })
     );
+
+    let summary = store.runtime_summary(10).await.unwrap();
+    assert_eq!(summary.request_count, 0);
+    assert_eq!(summary.billable_request_count, 1);
+    assert_eq!(summary.billable_history[0].lifecycle, "service_ephemeral");
+    assert_eq!(summary.billable_history[0].total_tokens, 13);
+    assert_eq!(summary.total_cached_input_tokens, 4);
+    assert_eq!(summary.total_cache_miss_input_tokens, 6);
+    assert_eq!(summary.total_output_tokens, 3);
 
     let _ = std::fs::remove_dir_all(data_dir);
 }
@@ -2209,11 +3060,7 @@ async fn codex_marker_responses_request_injects_synthetic_tool_search_upstream()
     let data_dir = temp_workspace("codex-marker-tool-search");
     let config = test_config_with_upstream(data_dir.clone(), fake_addr);
     let store = Store::open(&config.data_dir).await.unwrap();
-    let proxy_state = ProxyState {
-        config: Arc::new(config),
-        client: reqwest::Client::new(),
-        store,
-    };
+    let proxy_state = ProxyState::for_test(config, store);
     let proxy_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let proxy_addr = proxy_listener.local_addr().unwrap();
     let proxy_app = Router::new()
@@ -2257,12 +3104,8 @@ async fn codex_marker_responses_request_injects_synthetic_tool_search_upstream()
         .expect("fake upstream lock poisoned")
         .clone();
     assert_eq!(requests.len(), 1);
-    let upstream_tool_names = requests[0]["tools"]
-        .as_array()
-        .expect("upstream request should include tools")
-        .iter()
-        .filter_map(|tool| tool.pointer("/function/name").and_then(Value::as_str))
-        .collect::<Vec<_>>();
+    let upstream_tool_names = upstream_function_tool_names(&requests[0]);
+    assert_default_codeseex_tools_present(&upstream_tool_names);
     assert!(
         upstream_tool_names.contains(&"plain_external_tool"),
         "{upstream_tool_names:?}"
@@ -2271,6 +3114,141 @@ async fn codex_marker_responses_request_injects_synthetic_tool_search_upstream()
         upstream_tool_names.contains(&"tool_search_tool"),
         "{upstream_tool_names:?}"
     );
+
+    let _ = std::fs::remove_dir_all(data_dir);
+}
+
+#[tokio::test]
+async fn codex_marker_without_request_tools_keeps_codeseex_tools_and_tool_search_bridge() {
+    let fake_state = FakeUpstreamState::default();
+    let fake_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let fake_addr = fake_listener.local_addr().unwrap();
+    let fake_app = Router::new()
+        .route("/chat/completions", post(fake_final_chat_completions))
+        .with_state(fake_state.clone());
+    tokio::spawn(async move {
+        axum::serve(fake_listener, fake_app).await.unwrap();
+    });
+
+    let data_dir = temp_workspace("codex-marker-no-proxy-tools");
+    let config = test_config_with_upstream(data_dir.clone(), fake_addr);
+    let store = Store::open(&config.data_dir).await.unwrap();
+    let proxy_state = ProxyState::for_test(config, store);
+    let proxy_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    let proxy_app = Router::new()
+        .route("/v1/responses", post(responses))
+        .with_state(proxy_state);
+    tokio::spawn(async move {
+        axum::serve(proxy_listener, proxy_app).await.unwrap();
+    });
+
+    let response = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/responses"))
+        .json(&json!({
+            "id": "resp_codex_marker_no_proxy_tools",
+            "model": "deepseek-v4-pro",
+            "stream": false,
+            "client_metadata": {
+                "x-codex-installation-id": "codex-install"
+            },
+            "prompt_cache_key": "thread-cache-key",
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "Reply OK." }]
+            }]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert!(response.status().is_success());
+    let requests = fake_state
+        .requests
+        .lock()
+        .expect("fake upstream lock poisoned")
+        .clone();
+    assert_eq!(requests.len(), 1);
+    let upstream_tool_names = upstream_function_tool_names(&requests[0]);
+    assert_default_codeseex_tools_present(&upstream_tool_names);
+    assert!(
+        upstream_tool_names.contains(&"tool_search_tool"),
+        "{upstream_tool_names:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(data_dir);
+}
+
+#[tokio::test]
+async fn ordinary_mini_responses_request_keeps_tools_and_final_turn_lifecycle() {
+    let fake_state = FakeUpstreamState::default();
+    let fake_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let fake_addr = fake_listener.local_addr().unwrap();
+    let fake_app = Router::new()
+        .route("/chat/completions", post(fake_final_chat_completions))
+        .with_state(fake_state.clone());
+    tokio::spawn(async move {
+        axum::serve(fake_listener, fake_app).await.unwrap();
+    });
+
+    let data_dir = temp_workspace("ordinary-mini-tools");
+    let config = test_config_with_upstream(data_dir.clone(), fake_addr);
+    let store = Store::open(&config.data_dir).await.unwrap();
+    let proxy_state = ProxyState::for_test(config, store.clone());
+    let proxy_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    let proxy_app = Router::new()
+        .route("/v1/responses", post(responses))
+        .with_state(proxy_state);
+    tokio::spawn(async move {
+        axum::serve(proxy_listener, proxy_app).await.unwrap();
+    });
+
+    let response = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/responses"))
+        .json(&json!({
+            "id": "resp_ordinary_mini",
+            "model": "gpt-5.4-mini",
+            "stream": false,
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "Use the external tool if needed." }]
+            }],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "plain_external_tool",
+                    "description": "External client tool.",
+                    "parameters": { "type": "object", "properties": {} }
+                }
+            }]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert!(response.status().is_success());
+    let requests = fake_state
+        .requests
+        .lock()
+        .expect("fake upstream lock poisoned")
+        .clone();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0]["model"], "deepseek-v4-pro");
+    let upstream_tool_names = upstream_function_tool_names(&requests[0]);
+    assert_default_codeseex_tools_present(&upstream_tool_names);
+    assert!(
+        upstream_tool_names.contains(&"plain_external_tool"),
+        "{upstream_tool_names:?}"
+    );
+
+    let summary = store.runtime_summary(10).await.unwrap();
+    assert_eq!(summary.request_count, 1);
+    assert_eq!(summary.billable_request_count, 1);
+    assert_eq!(summary.billable_history[0].lifecycle, "final_turn");
+    assert!(summary.billable_history[0].conversation_turn);
 
     let _ = std::fs::remove_dir_all(data_dir);
 }
@@ -2290,11 +3268,7 @@ async fn plain_external_responses_request_does_not_inject_synthetic_tool_search_
     let data_dir = temp_workspace("plain-external-no-tool-search");
     let config = test_config_with_upstream(data_dir.clone(), fake_addr);
     let store = Store::open(&config.data_dir).await.unwrap();
-    let proxy_state = ProxyState {
-        config: Arc::new(config),
-        client: reqwest::Client::new(),
-        store,
-    };
+    let proxy_state = ProxyState::for_test(config, store);
     let proxy_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let proxy_addr = proxy_listener.local_addr().unwrap();
     let proxy_app = Router::new()
@@ -2335,12 +3309,8 @@ async fn plain_external_responses_request_does_not_inject_synthetic_tool_search_
         .expect("fake upstream lock poisoned")
         .clone();
     assert_eq!(requests.len(), 1);
-    let upstream_tool_names = requests[0]["tools"]
-        .as_array()
-        .expect("upstream request should include tools")
-        .iter()
-        .filter_map(|tool| tool.pointer("/function/name").and_then(Value::as_str))
-        .collect::<Vec<_>>();
+    let upstream_tool_names = upstream_function_tool_names(&requests[0]);
+    assert_default_codeseex_tools_present(&upstream_tool_names);
     assert!(
         upstream_tool_names.contains(&"plain_external_tool"),
         "{upstream_tool_names:?}"
@@ -2354,6 +3324,96 @@ async fn plain_external_responses_request_does_not_inject_synthetic_tool_search_
 }
 
 #[tokio::test]
+async fn explicit_empty_enabled_tools_keeps_system_tools_and_diagnoses_disabled_configurables() {
+    let fake_state = FakeUpstreamState::default();
+    let fake_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let fake_addr = fake_listener.local_addr().unwrap();
+    let fake_app = Router::new()
+        .route("/chat/completions", post(fake_final_chat_completions))
+        .with_state(fake_state.clone());
+    tokio::spawn(async move {
+        axum::serve(fake_listener, fake_app).await.unwrap();
+    });
+
+    let data_dir = temp_workspace("empty-enabled-tools");
+    let config = test_config_with_upstream(data_dir.clone(), fake_addr);
+    write_enabled_tools_config(&config, Vec::new());
+    let store = Store::open(&config.data_dir).await.unwrap();
+    let proxy_state = ProxyState::for_test(config, store.clone());
+    let proxy_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    let proxy_app = Router::new()
+        .route("/v1/responses", post(responses))
+        .with_state(proxy_state);
+    tokio::spawn(async move {
+        axum::serve(proxy_listener, proxy_app).await.unwrap();
+    });
+
+    let response = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/responses"))
+        .json(&json!({
+            "id": "resp_empty_enabled_tools",
+            "model": "deepseek-v4-pro",
+            "stream": false,
+            "client_metadata": {
+                "x-codex-installation-id": "codex-install"
+            },
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "List files if tools are available." }]
+            }]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert!(response.status().is_success());
+    let requests = fake_state
+        .requests
+        .lock()
+        .expect("fake upstream lock poisoned")
+        .clone();
+    assert_eq!(requests.len(), 1);
+    let upstream_tool_names = upstream_function_tool_names(&requests[0]);
+    assert!(
+        upstream_tool_names.contains(&"apply_patch"),
+        "{upstream_tool_names:?}"
+    );
+    assert!(
+        upstream_tool_names.contains(&"web_search"),
+        "{upstream_tool_names:?}"
+    );
+    assert!(
+        upstream_tool_names.contains(&"tool_search_tool"),
+        "{upstream_tool_names:?}"
+    );
+    for name in [
+        "list_directory",
+        "read_file_range",
+        "workspace_search",
+        "vision_analyze",
+        "image_gen",
+    ] {
+        assert!(
+            !upstream_tool_names.contains(&name),
+            "{upstream_tool_names:?}"
+        );
+    }
+
+    let (events, _) = store.recent_events(10, None).await.unwrap();
+    let diagnostic = events
+        .iter()
+        .find(|event| event.event_type == "tool_exposure_diagnostic")
+        .and_then(|event| event.detail.as_ref())
+        .expect("tool exposure diagnostic");
+    assert_eq!(diagnostic["configurable_tools_disabled_by_config"], true);
+    assert_eq!(diagnostic["codeseex_enabled_tools"]["count"], 0);
+
+    let _ = std::fs::remove_dir_all(data_dir);
+}
+
+#[tokio::test]
 async fn previous_response_history_pairs_tool_outputs_with_parent_calls() {
     let data_dir = std::env::temp_dir().join(format!(
         "codeseex-history-tool-pair-test-{}",
@@ -2361,11 +3421,7 @@ async fn previous_response_history_pairs_tool_outputs_with_parent_calls() {
     ));
     let config = test_config(data_dir);
     let store = Store::open(&config.data_dir).await.unwrap();
-    let state = ProxyState {
-        config: Arc::new(config),
-        client: reqwest::Client::new(),
-        store,
-    };
+    let state = ProxyState::for_test(config, store);
 
     state
         .store
@@ -2464,11 +3520,7 @@ async fn previous_response_history_prefers_persisted_turn_messages() {
     ));
     let config = test_config(data_dir);
     let store = Store::open(&config.data_dir).await.unwrap();
-    let state = ProxyState {
-        config: Arc::new(config),
-        client: reqwest::Client::new(),
-        store,
-    };
+    let state = ProxyState::for_test(config, store);
 
     state
         .store
@@ -2551,11 +3603,7 @@ async fn streaming_mixed_internal_and_external_tools_runs_internal_first() {
     let config = test_config_with_upstream(data_dir, fake_addr);
     let store = Store::open(&config.data_dir).await.unwrap();
     let inspection_store = store.clone();
-    let proxy_state = ProxyState {
-        config: Arc::new(config),
-        client: reqwest::Client::new(),
-        store,
-    };
+    let proxy_state = ProxyState::for_test(config, store);
     let proxy_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let proxy_addr = proxy_listener.local_addr().unwrap();
     let proxy_app = Router::new()
@@ -2582,8 +3630,8 @@ async fn streaming_mixed_internal_and_external_tools_runs_internal_first() {
                 {
                     "type": "function",
                     "function": {
-                        "name": "js",
-                        "description": "External JavaScript tool.",
+                        "name": "plain_external_tool",
+                        "description": "External client tool.",
                         "parameters": { "type": "object", "properties": {} }
                     }
                 }
@@ -2600,7 +3648,7 @@ async fn streaming_mixed_internal_and_external_tools_runs_internal_first() {
         body.contains("response.function_call_arguments.delta"),
         "{body}"
     );
-    assert!(body.contains("\"name\":\"js\""), "{body}");
+    assert!(body.contains("\"name\":\"plain_external_tool\""), "{body}");
     assert!(!body.contains("已使用工具 `list_directory`"), "{body}");
     assert!(body.contains("\"type\":\"proxy_tool_call\""), "{body}");
     assert!(
@@ -2663,11 +3711,7 @@ async fn non_streaming_web_search_emits_replayable_output_item() {
     ));
     let config = test_config_with_upstream(data_dir, fake_addr);
     let store = Store::open(&config.data_dir).await.unwrap();
-    let proxy_state = ProxyState {
-        config: Arc::new(config),
-        client: reqwest::Client::new(),
-        store,
-    };
+    let proxy_state = ProxyState::for_test(config, store);
     let proxy_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let proxy_addr = proxy_listener.local_addr().unwrap();
     let proxy_app = Router::new()
@@ -2754,11 +3798,7 @@ async fn streaming_web_search_emits_replayable_output_item() {
     ));
     let config = test_config_with_upstream(data_dir, fake_addr);
     let store = Store::open(&config.data_dir).await.unwrap();
-    let proxy_state = ProxyState {
-        config: Arc::new(config),
-        client: reqwest::Client::new(),
-        store,
-    };
+    let proxy_state = ProxyState::for_test(config, store);
     let proxy_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let proxy_addr = proxy_listener.local_addr().unwrap();
     let proxy_app = Router::new()
@@ -2853,11 +3893,7 @@ async fn non_streaming_vision_result_uses_tool_schema_without_system_instruction
     let config = test_config_with_upstream(data_dir.clone(), chat_addr);
     write_vision_analyze_config(&config, &format!("http://{vision_addr}/v1/responses"));
     let store = Store::open(&config.data_dir).await.unwrap();
-    let proxy_state = ProxyState {
-        config: Arc::new(config),
-        client: reqwest::Client::new(),
-        store,
-    };
+    let proxy_state = ProxyState::for_test(config, store);
     let proxy_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let proxy_addr = proxy_listener.local_addr().unwrap();
     let proxy_app = Router::new()
@@ -2927,11 +3963,7 @@ async fn responses_accepts_large_client_image_output_and_stores_redacted_input()
     let data_dir = temp_workspace("large-client-image-output");
     let config = test_config_with_upstream(data_dir.clone(), fake_addr);
     let store = Store::open(&config.data_dir).await.unwrap();
-    let proxy_state = ProxyState {
-        config: Arc::new(config),
-        client: reqwest::Client::new(),
-        store: store.clone(),
-    };
+    let proxy_state = ProxyState::for_test(config, store.clone());
     let proxy_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let proxy_addr = proxy_listener.local_addr().unwrap();
     let proxy_app = Router::new()
@@ -3005,11 +4037,7 @@ async fn non_streaming_proxy_tools_execute_parallel_batch_and_preserve_order() {
     let config = test_config_with_upstream(data_dir.clone(), chat_addr);
     write_vision_analyze_config(&config, &format!("http://{vision_addr}/v1/responses"));
     let store = Store::open(&config.data_dir).await.unwrap();
-    let proxy_state = ProxyState {
-        config: Arc::new(config),
-        client: reqwest::Client::new(),
-        store,
-    };
+    let proxy_state = ProxyState::for_test(config, store);
     let proxy_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let proxy_addr = proxy_listener.local_addr().unwrap();
     let proxy_app = Router::new()
@@ -3079,6 +4107,284 @@ async fn non_streaming_proxy_tools_execute_parallel_batch_and_preserve_order() {
 }
 
 #[tokio::test]
+async fn repeated_failing_proxy_tool_calls_stop_before_unbounded_retry() {
+    let fake_state = FakeUpstreamState::default();
+    let fake_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let fake_addr = fake_listener.local_addr().unwrap();
+    let fake_app = Router::new()
+        .route(
+            "/chat/completions",
+            post(fake_repeated_failing_list_directory_chat_completions),
+        )
+        .with_state(fake_state.clone());
+    tokio::spawn(async move {
+        axum::serve(fake_listener, fake_app).await.unwrap();
+    });
+
+    let data_dir = temp_workspace("repeated-failing-tool-stop");
+    let config = test_config_with_upstream(data_dir.clone(), fake_addr);
+    let store = Store::open(&config.data_dir).await.unwrap();
+    let proxy_state = ProxyState::for_test(config, store.clone());
+    let proxy_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    let proxy_app = Router::new()
+        .route("/v1/responses", post(responses))
+        .with_state(proxy_state);
+    tokio::spawn(async move {
+        axum::serve(proxy_listener, proxy_app).await.unwrap();
+    });
+
+    let response = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/responses"))
+        .json(&json!({
+            "id": "resp_repeated_failing_tool",
+            "model": "deepseek-v4-pro",
+            "stream": false,
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "list parent repeatedly" }]
+            }]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let body = response.text().await.unwrap();
+    assert!(body.contains("repeated failing tool retries"), "{body}");
+
+    let requests = fake_state
+        .requests
+        .lock()
+        .expect("fake upstream lock poisoned")
+        .clone();
+    assert_eq!(
+        requests.len(),
+        3,
+        "proxy should stop after the third repeated failing tool result"
+    );
+
+    let (events, _) = store.recent_events(80, None).await.unwrap();
+    assert!(events
+        .iter()
+        .any(|event| event.event_type == "tool_loop_repeated_failure_stopped"));
+    assert!(events.iter().any(|event| {
+        event.event_type == "request_failed"
+            && event
+                .detail
+                .as_ref()
+                .and_then(|detail| detail.get("id"))
+                .and_then(Value::as_str)
+                == Some("resp_repeated_failing_tool")
+    }));
+
+    let _ = std::fs::remove_dir_all(data_dir);
+}
+
+#[tokio::test]
+async fn repeated_failing_web_search_stops_after_two_failures() {
+    let fake_state = FakeUpstreamState::default();
+    let fake_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let fake_addr = fake_listener.local_addr().unwrap();
+    let fake_app = Router::new()
+        .route(
+            "/chat/completions",
+            post(fake_repeated_failing_web_search_chat_completions),
+        )
+        .with_state(fake_state.clone());
+    tokio::spawn(async move {
+        axum::serve(fake_listener, fake_app).await.unwrap();
+    });
+
+    let data_dir = temp_workspace("repeated-failing-web-search-stop");
+    let config = test_config_with_upstream(data_dir.clone(), fake_addr);
+    let store = Store::open(&config.data_dir).await.unwrap();
+    let proxy_state = ProxyState::for_test(config, store);
+    let proxy_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    let proxy_app = Router::new()
+        .route("/v1/responses", post(responses))
+        .with_state(proxy_state);
+    tokio::spawn(async move {
+        axum::serve(proxy_listener, proxy_app).await.unwrap();
+    });
+
+    let response = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/responses"))
+        .json(&json!({
+            "id": "resp_repeated_failing_web_search",
+            "model": "deepseek-v4-pro",
+            "stream": false,
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "keep searching without url" }]
+            }]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let body = response.text().await.unwrap();
+    assert!(body.contains("failed 2 consecutive times"), "{body}");
+    assert_eq!(
+        fake_state
+            .requests
+            .lock()
+            .expect("fake upstream lock poisoned")
+            .len(),
+        2
+    );
+
+    let _ = std::fs::remove_dir_all(data_dir);
+}
+
+#[tokio::test]
+async fn consecutive_failing_proxy_tool_calls_stop_even_when_arguments_change() {
+    let fake_state = FakeUpstreamState::default();
+    let fake_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let fake_addr = fake_listener.local_addr().unwrap();
+    let fake_app = Router::new()
+        .route(
+            "/chat/completions",
+            post(fake_repeated_failing_list_directory_changing_args_chat_completions),
+        )
+        .with_state(fake_state.clone());
+    tokio::spawn(async move {
+        axum::serve(fake_listener, fake_app).await.unwrap();
+    });
+
+    let data_dir = temp_workspace("consecutive-failing-tool-stop");
+    let config = test_config_with_upstream(data_dir.clone(), fake_addr);
+    let store = Store::open(&config.data_dir).await.unwrap();
+    let proxy_state = ProxyState::for_test(config, store);
+    let proxy_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    let proxy_app = Router::new()
+        .route("/v1/responses", post(responses))
+        .with_state(proxy_state);
+    tokio::spawn(async move {
+        axum::serve(proxy_listener, proxy_app).await.unwrap();
+    });
+
+    let response = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/responses"))
+        .json(&json!({
+            "id": "resp_consecutive_failing_tool",
+            "model": "deepseek-v4-pro",
+            "stream": false,
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "keep trying bad paths" }]
+            }]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let body = response.text().await.unwrap();
+    assert!(body.contains("failed 3 consecutive times"), "{body}");
+    assert_eq!(
+        fake_state
+            .requests
+            .lock()
+            .expect("fake upstream lock poisoned")
+            .len(),
+        3
+    );
+
+    let _ = std::fs::remove_dir_all(data_dir);
+}
+
+#[tokio::test]
+async fn successful_tool_loop_stops_at_hard_iteration_limit_and_remains_billable() {
+    let fake_state = FakeUpstreamState::default();
+    let fake_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let fake_addr = fake_listener.local_addr().unwrap();
+    let fake_app = Router::new()
+        .route(
+            "/chat/completions",
+            post(fake_successful_list_directory_forever_chat_completions),
+        )
+        .with_state(fake_state.clone());
+    tokio::spawn(async move {
+        axum::serve(fake_listener, fake_app).await.unwrap();
+    });
+
+    let data_dir = temp_workspace("successful-tool-loop-limit");
+    let workspace_root = data_dir.join("workspace");
+    std::fs::create_dir_all(workspace_root.join("src")).expect("create workspace");
+    std::fs::write(workspace_root.join("README.md"), "loop test").expect("write workspace file");
+    let config = test_config_with_upstream(data_dir.clone(), fake_addr);
+    let store = Store::open(&config.data_dir).await.unwrap();
+    let proxy_state = ProxyState::for_test(config, store.clone());
+    let proxy_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    let proxy_app = Router::new()
+        .route("/v1/responses", post(responses))
+        .with_state(proxy_state);
+    tokio::spawn(async move {
+        axum::serve(proxy_listener, proxy_app).await.unwrap();
+    });
+
+    let response = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/responses"))
+        .json(&json!({
+            "id": "resp_successful_tool_loop_limit",
+            "model": "deepseek-v4-pro",
+            "stream": false,
+            "input": [{
+                "type": "environment_context",
+                "content": format!(
+                    "<environment_context>\n  <cwd>{}</cwd>\n  <filesystem><workspace_roots><root>{}</root></workspace_roots></filesystem>\n</environment_context>",
+                    workspace_root.display(),
+                    workspace_root.display()
+                )
+            }, {
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "keep listing the workspace forever" }]
+            }]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let body = response.text().await.unwrap();
+    assert!(body.contains("Tool loop exceeded"), "{body}");
+    assert_eq!(
+        fake_state
+            .requests
+            .lock()
+            .expect("fake upstream lock poisoned")
+            .len(),
+        usize::try_from(MAX_TOOL_LOOP_ITERATIONS).unwrap()
+    );
+
+    let (events, _) = store.recent_events(120, None).await.unwrap();
+    assert!(events
+        .iter()
+        .any(|event| event.event_type == "tool_loop_iteration_limit_stopped"));
+    let summary = store.runtime_summary(10).await.unwrap();
+    assert_eq!(summary.request_count, 0);
+    assert_eq!(summary.failed_request_count, 1);
+    assert_eq!(summary.billable_request_count, 1);
+    assert_eq!(
+        summary.total_output_tokens,
+        u64::from(MAX_TOOL_LOOP_ITERATIONS) * 2
+    );
+    assert!(summary.last_turn.is_none());
+    assert_eq!(summary.billable_history[0].lifecycle, "failed_billable");
+
+    let _ = std::fs::remove_dir_all(data_dir);
+}
+
+#[tokio::test]
 async fn streaming_vision_result_uses_tool_schema_without_system_instruction() {
     let chat_state = FakeUpstreamState::default();
     let chat_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
@@ -3107,11 +4413,7 @@ async fn streaming_vision_result_uses_tool_schema_without_system_instruction() {
     let config = test_config_with_upstream(data_dir.clone(), chat_addr);
     write_vision_analyze_config(&config, &format!("http://{vision_addr}/v1/responses"));
     let store = Store::open(&config.data_dir).await.unwrap();
-    let proxy_state = ProxyState {
-        config: Arc::new(config),
-        client: reqwest::Client::new(),
-        store,
-    };
+    let proxy_state = ProxyState::for_test(config, store);
     let proxy_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let proxy_addr = proxy_listener.local_addr().unwrap();
     let proxy_app = Router::new()
@@ -3222,11 +4524,7 @@ async fn responses_do_not_recover_global_web_search_facts_when_client_returns_ca
         .await
         .unwrap();
 
-    let proxy_state = ProxyState {
-        config: Arc::new(config),
-        client: reqwest::Client::new(),
-        store,
-    };
+    let proxy_state = ProxyState::for_test(config, store);
     let proxy_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let proxy_addr = proxy_listener.local_addr().unwrap();
     let proxy_app = Router::new()
@@ -3348,11 +4646,7 @@ async fn responses_do_not_recover_global_empty_web_search_fact_when_prior_final_
         .await
         .unwrap();
 
-    let proxy_state = ProxyState {
-        config: Arc::new(config),
-        client: reqwest::Client::new(),
-        store,
-    };
+    let proxy_state = ProxyState::for_test(config, store);
     let proxy_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let proxy_addr = proxy_listener.local_addr().unwrap();
     let proxy_app = Router::new()
@@ -3438,11 +4732,7 @@ async fn streaming_apply_patch_returns_native_custom_tool_call() {
     let _ = std::fs::remove_file(&patch_file);
     let config = test_config_with_upstream(data_dir.clone(), fake_addr);
     let store = Store::open(&config.data_dir).await.unwrap();
-    let proxy_state = ProxyState {
-        config: Arc::new(config),
-        client: reqwest::Client::new(),
-        store,
-    };
+    let proxy_state = ProxyState::for_test(config, store);
     let proxy_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let proxy_addr = proxy_listener.local_addr().unwrap();
     let proxy_app = Router::new()
@@ -3548,11 +4838,7 @@ async fn nonstreaming_client_tool_handoff_is_not_user_completed_turn() {
     let _ = std::fs::remove_file(&patch_file);
     let config = test_config_with_upstream(data_dir.clone(), fake_addr);
     let store = Store::open(&config.data_dir).await.unwrap();
-    let proxy_state = ProxyState {
-        config: Arc::new(config),
-        client: reqwest::Client::new(),
-        store: store.clone(),
-    };
+    let proxy_state = ProxyState::for_test(config, store.clone());
     let proxy_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let proxy_addr = proxy_listener.local_addr().unwrap();
     let proxy_app = Router::new()
@@ -3609,9 +4895,321 @@ async fn nonstreaming_client_tool_handoff_is_not_user_completed_turn() {
             .and_then(|value| value.get("lifecycle")),
         Some(&json!("client_tool_handoff"))
     );
+    let (all_events, _) = store.recent_events(50, None).await.expect("all events");
+    let handoff_diagnostic = all_events
+        .iter()
+        .find(|event| event.event_type == "client_tool_handoff_diagnostic")
+        .expect("client handoff diagnostic should be recorded");
+    assert_eq!(
+        handoff_diagnostic.audience.as_deref(),
+        Some("safe_diagnostic")
+    );
+    assert_eq!(
+        handoff_diagnostic
+            .detail
+            .as_ref()
+            .and_then(|detail| detail.pointer("/tools/counts/native"))
+            .and_then(Value::as_u64),
+        Some(1)
+    );
+    assert!(handoff_diagnostic
+        .detail
+        .as_ref()
+        .and_then(|detail| detail.pointer("/usage/total_tokens"))
+        .and_then(Value::as_u64)
+        .is_some());
+    assert!(all_events
+        .iter()
+        .any(|event| event.event_type == "upstream_call_usage_breakdown"
+            && event.audience.as_deref() == Some("safe_diagnostic")));
 
     let _ = std::fs::remove_file(&patch_file);
     let _ = std::fs::remove_dir_all(patch_dir);
+    let _ = std::fs::remove_dir_all(data_dir);
+}
+
+#[tokio::test]
+async fn codex_shaped_client_handoff_avoids_proxy_tool_and_context_pollution() {
+    let fake_state = FakeUpstreamState::default();
+    let fake_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let fake_addr = fake_listener.local_addr().unwrap();
+    let fake_app = Router::new()
+        .route(
+            "/chat/completions",
+            post(fake_codex_handoff_then_final_chat_completions),
+        )
+        .with_state(fake_state.clone());
+    tokio::spawn(async move {
+        axum::serve(fake_listener, fake_app).await.unwrap();
+    });
+
+    let data_dir = temp_workspace("codex-shaped-handoff-no-pollution");
+    let config = test_config_with_upstream(data_dir.clone(), fake_addr);
+    let store = Store::open(&config.data_dir).await.unwrap();
+    let proxy_state = ProxyState::for_test(config, store.clone());
+    let proxy_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    let proxy_app = Router::new()
+        .route("/v1/responses", post(responses))
+        .with_state(proxy_state);
+    tokio::spawn(async move {
+        axum::serve(proxy_listener, proxy_app).await.unwrap();
+    });
+
+    let full_context_items = (0..95)
+        .map(|index| {
+            json!({
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": format!("prior compact context item {index}") }]
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let client = reqwest::Client::new();
+    let first_response = client
+        .post(format!("http://{proxy_addr}/v1/responses"))
+        .json(&json!({
+            "id": "resp_codex_handoff_no_pollution",
+            "model": "deepseek-v4-pro",
+            "instructions": "Use client tools when necessary.",
+            "client_metadata": {
+                "x-codex-installation-id": "codex-install"
+            },
+            "prompt_cache_key": "thread-cache-key",
+            "input": full_context_items,
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "shell_command",
+                    "description": "Run a shell command.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "command": { "type": "string" }
+                        },
+                        "required": ["command"]
+                    }
+                }
+            }]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert!(first_response.status().is_success());
+    let first_body = first_response.json::<Value>().await.unwrap();
+    assert_eq!(first_body["status"], "completed");
+    assert!(first_body["output"].as_array().unwrap().iter().any(|item| {
+        item.get("type").and_then(Value::as_str) == Some("function_call")
+            && item.get("name").and_then(Value::as_str) == Some("shell_command")
+    }));
+    let first_summary = store.runtime_summary(10).await.expect("first summary");
+    assert_eq!(first_summary.request_count, 0);
+    assert_eq!(first_summary.billable_request_count, 1);
+    assert_eq!(
+        first_summary.billable_history[0].lifecycle,
+        "client_tool_handoff"
+    );
+
+    let first_requests = fake_state
+        .requests
+        .lock()
+        .expect("fake upstream lock poisoned")
+        .clone();
+    assert_eq!(first_requests.len(), 1);
+    let first_tool_names = first_requests[0]
+        .get("tools")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|tool| tool.pointer("/function/name").and_then(Value::as_str))
+        .collect::<Vec<_>>();
+    assert_default_codeseex_tools_present(&first_tool_names);
+    assert!(
+        first_tool_names.contains(&"shell_command"),
+        "{first_tool_names:?}"
+    );
+    assert!(
+        first_tool_names.contains(&"tool_search_tool"),
+        "{first_tool_names:?}"
+    );
+    assert_eq!(
+        first_requests[0]
+            .get("messages")
+            .and_then(Value::as_array)
+            .map(Vec::len),
+        Some(96),
+        "{}",
+        first_requests[0]
+    );
+    assert!(first_requests[0]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|message| message.get("role").and_then(Value::as_str) != Some("tool")));
+    let parent_chain = store
+        .response_context_chain("resp_codex_handoff_no_pollution", 1)
+        .await
+        .expect("parent context chain");
+    assert_eq!(
+        parent_chain[0].turn_messages.len(),
+        1,
+        "full-context parent should retain only appended assistant tool calls"
+    );
+
+    let tool_call = first_body["output"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item.get("type").and_then(Value::as_str) == Some("function_call"))
+        .expect("handoff tool call")
+        .clone();
+    let second_response = client
+        .post(format!("http://{proxy_addr}/v1/responses"))
+        .json(&json!({
+            "id": "resp_codex_handoff_no_pollution_followup",
+            "previous_response_id": "resp_codex_handoff_no_pollution",
+            "model": "deepseek-v4-pro",
+            "instructions": "Use client tools when necessary.",
+            "client_metadata": {
+                "x-codex-installation-id": "codex-install"
+            },
+            "prompt_cache_key": "thread-cache-key",
+            "input": [
+                tool_call,
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_shell",
+                    "output": "TOOL_OUTPUT_BODY_".repeat(4_000)
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{ "type": "input_text", "text": "finish after shell output" }]
+                }
+            ],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "shell_command",
+                    "description": "Run a shell command.",
+                    "parameters": { "type": "object", "properties": {} }
+                }
+            }]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(second_response.status().is_success());
+    let second_body = second_response.json::<Value>().await.unwrap();
+    assert_eq!(second_body["status"], "completed");
+
+    let requests = fake_state
+        .requests
+        .lock()
+        .expect("fake upstream lock poisoned")
+        .clone();
+    assert_eq!(requests.len(), 2);
+    let second_tool_names = requests[1]
+        .get("tools")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|tool| tool.pointer("/function/name").and_then(Value::as_str))
+        .collect::<Vec<_>>();
+    assert_default_codeseex_tools_present(&second_tool_names);
+    assert!(
+        second_tool_names.contains(&"shell_command"),
+        "{second_tool_names:?}"
+    );
+    assert!(
+        second_tool_names.contains(&"tool_search_tool"),
+        "{second_tool_names:?}"
+    );
+    let serialized_second_request = serde_json::to_string(&requests[1]).unwrap();
+    assert!(
+        serialized_second_request
+            .matches("TOOL_OUTPUT_BODY_")
+            .count()
+            < 800,
+        "tool output should be truncated before replay, occurrences={}",
+        serialized_second_request
+            .matches("TOOL_OUTPUT_BODY_")
+            .count()
+    );
+    let second_messages = requests[1]["messages"].as_array().expect("messages");
+    assert_eq!(second_messages.len(), 4, "{}", requests[1]);
+    assert!(!serde_json::to_string(&requests[1])
+        .unwrap()
+        .contains("prior compact context item 0"));
+    let tool_message = second_messages
+        .iter()
+        .find(|message| {
+            message.get("role").and_then(Value::as_str) == Some("tool")
+                && message.get("tool_call_id").and_then(Value::as_str) == Some("call_shell")
+        })
+        .expect("tool message should be replayed compactly");
+    let tool_content = tool_message["content"].as_str().expect("tool content");
+    assert!(tool_content.contains("[truncated"), "{tool_content}");
+    assert!(tool_content.len() < 13_000, "{}", tool_content.len());
+
+    let summary = store.runtime_summary(10).await.expect("runtime summary");
+    assert_eq!(summary.request_count, 1);
+    assert_eq!(summary.billable_request_count, 2);
+    assert_eq!(summary.billable_history[0].lifecycle, "client_tool_handoff");
+    assert_eq!(summary.billable_history[1].lifecycle, "final_turn");
+    assert_eq!(summary.total_cached_input_tokens, 1_300);
+    assert_eq!(summary.total_cache_miss_input_tokens, 360);
+
+    let (all_events, _) = store.recent_events(80, None).await.expect("events");
+    assert!(all_events.iter().any(|event| {
+        event.event_type == "context_compile_diagnostic"
+            && event
+                .detail
+                .as_ref()
+                .and_then(|detail| detail.pointer("/runtime_context_storage/current/mode"))
+                .and_then(Value::as_str)
+                == Some("codex_full_context_not_stored")
+    }));
+    assert!(all_events.iter().any(|event| {
+        event.event_type == "context_compile_diagnostic"
+            && event
+                .detail
+                .as_ref()
+                .and_then(|detail| detail.pointer("/request/has_previous_response_id"))
+                .and_then(Value::as_bool)
+                == Some(true)
+    }));
+    assert!(all_events.iter().any(|event| {
+        event.event_type == "context_compile_diagnostic"
+            && event
+                .detail
+                .as_ref()
+                .and_then(|detail| {
+                    detail.pointer("/context/current_input/truncated_tool_output_items")
+                })
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+                >= 1
+    }));
+    assert!(all_events.iter().any(|event| {
+        event.event_type == "upstream_call_usage_breakdown"
+            && event
+                .detail
+                .as_ref()
+                .and_then(|detail| detail.pointer("/payload/tools_count"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+                >= 9
+            && event
+                .detail
+                .as_ref()
+                .and_then(|detail| detail.pointer("/usage/cache_miss_input_tokens"))
+                .and_then(Value::as_u64)
+                == Some(240)
+    }));
+
     let _ = std::fs::remove_dir_all(data_dir);
 }
 
@@ -3636,11 +5234,7 @@ async fn streaming_synthetic_tool_search_bridge_returns_codex_tool_search_call()
     ));
     let config = test_config_with_upstream(data_dir, fake_addr);
     let store = Store::open(&config.data_dir).await.unwrap();
-    let proxy_state = ProxyState {
-        config: Arc::new(config),
-        client: reqwest::Client::new(),
-        store,
-    };
+    let proxy_state = ProxyState::for_test(config, store);
     let proxy_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let proxy_addr = proxy_listener.local_addr().unwrap();
     let proxy_app = Router::new()

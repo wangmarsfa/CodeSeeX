@@ -9,15 +9,46 @@ mod search;
 use codeseex_core::NetworkProxyMode;
 use futures_util::future::join_all;
 use serde_json::{json, Value};
+use std::time::Duration;
 
 const MAX_BYTES: u64 = 524_288;
 const MAX_TEXT_CHARS: usize = 12_000;
 const MAX_RESULTS: usize = 8;
 const MAX_QUERIES: usize = 3;
 const MAX_OPEN_TARGETS: usize = 6;
+const WEB_SEARCH_TOTAL_TIMEOUT_SECS: u64 = 15;
+
+pub(crate) async fn warm_search_sources(proxy_mode: NetworkProxyMode) -> Value {
+    let web_client = net::web_client(proxy_mode);
+    search::warm_sources(&web_client, proxy_mode).await
+}
 
 pub(crate) async fn execute(
     _client: &reqwest::Client,
+    proxy_mode: NetworkProxyMode,
+    arguments: &Value,
+    messages: &[Value],
+) -> Value {
+    let action_mode = action_mode(arguments);
+    match tokio::time::timeout(
+        Duration::from_secs(WEB_SEARCH_TOTAL_TIMEOUT_SECS),
+        execute_inner(proxy_mode, arguments, messages),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => json!({
+            "ok": false,
+            "stage": action_mode,
+            "mode": action_mode,
+            "error": "web_search_timeout",
+            "message": "web_search exceeded the bounded execution time. Try a narrower query, fewer URLs, or retry when network connectivity is stable.",
+            "timeout_seconds": WEB_SEARCH_TOTAL_TIMEOUT_SECS
+        }),
+    }
+}
+
+async fn execute_inner(
     proxy_mode: NetworkProxyMode,
     arguments: &Value,
     messages: &[Value],
@@ -50,15 +81,23 @@ pub(crate) async fn execute(
         queries
             .iter()
             .take(MAX_QUERIES)
-            .map(|query| search::query(&web_client, query, max_results)),
+            .map(|query| search::query(&web_client, proxy_mode, query, max_results)),
     )
     .await;
+    let mut sources_attempted = Vec::new();
     for result in query_results {
         if let Some(results) = result.get("results").and_then(Value::as_array) {
             all_results.extend(results.iter().cloned());
         }
         if let Some(errors) = result.get("fallback_errors").and_then(Value::as_array) {
             fallback_errors.extend(errors.iter().cloned());
+        }
+        if let Some(sources) = result.get("sources_attempted").and_then(Value::as_array) {
+            for source in sources.iter().filter_map(Value::as_str) {
+                if !sources_attempted.iter().any(|value| value == source) {
+                    sources_attempted.push(source.to_owned());
+                }
+            }
         }
         per_query.push(query_diagnostic(&result));
     }
@@ -81,7 +120,7 @@ pub(crate) async fn execute(
         "mode": "search",
         "queries": queries,
         "source": if ok { "multi_source_html" } else { "none" },
-        "sources_attempted": ["bing_html", "brave_html", "duckduckgo_lite", "duckduckgo_html", "duckduckgo_instant_answer"],
+        "sources_attempted": sources_attempted,
         "quality": quality,
         "low_confidence": !ok || quality < 0.24,
         "results": all_results.clone(),
@@ -92,6 +131,18 @@ pub(crate) async fn execute(
         "next_action": "When page content is needed, call web_search again with mode=open and selected open_urls. open_ids are also accepted for candidate lookup.",
         "truncated": queries.len() > MAX_QUERIES
     })
+}
+
+fn action_mode(arguments: &Value) -> &'static str {
+    let mode = input::mode(arguments);
+    if mode == "open"
+        || !input::open_targets(arguments).is_empty()
+        || !input::open_ids(arguments).is_empty()
+    {
+        "open"
+    } else {
+        "search"
+    }
 }
 
 fn query_diagnostic(result: &Value) -> Value {
@@ -151,5 +202,20 @@ mod tests {
         assert_eq!(diagnostic["fallback_error_count"], 1);
         assert!(diagnostic.get("results").is_none());
         assert!(diagnostic.get("fallback_errors").is_none());
+    }
+
+    #[test]
+    fn web_search_total_timeout_stays_bounded() {
+        assert!(WEB_SEARCH_TOTAL_TIMEOUT_SECS <= 15);
+    }
+
+    #[test]
+    fn action_mode_treats_urls_as_open_requests() {
+        assert_eq!(
+            action_mode(&json!({ "query": "https://example.com" })),
+            "open"
+        );
+        assert_eq!(action_mode(&json!({ "query": "weather today" })), "search");
+        assert_eq!(action_mode(&json!({ "open_ids": ["cand_123"] })), "open");
     }
 }

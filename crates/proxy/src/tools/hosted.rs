@@ -1,7 +1,9 @@
 use crate::text::compact_line;
 use crate::tools::ownership::ChatToolCall;
 use codeseex_core::context::redact_inline_data_urls;
-use serde_json::Value;
+use serde_json::{json, Value};
+
+const MAX_TOOL_RESULT_REPLAY_CHARS: usize = 12_000;
 
 pub(crate) struct ExecutedCodeTool {
     pub(crate) call: ChatToolCall,
@@ -86,6 +88,92 @@ pub(crate) fn summarize_tool_result(result: &Value) -> String {
     compact_line(&redact_inline_data_urls(&text), 2400)
 }
 
+pub(crate) fn model_replay_tool_result(call: &ChatToolCall, result: &Value) -> String {
+    if crate::tools::ownership::is_web_search_tool(&call.name) {
+        return compact_web_search_result_for_model(result).to_string();
+    }
+    let text = serde_json::to_string(result).unwrap_or_else(|_| "{}".to_owned());
+    let text = redact_inline_data_urls(&text);
+    if text.chars().count() <= MAX_TOOL_RESULT_REPLAY_CHARS {
+        return text;
+    }
+    json!({
+        "ok": result.get("ok").cloned().unwrap_or(Value::Null),
+        "tool": call.name,
+        "codeseex_truncated_for_model": true,
+        "original_chars": text.chars().count(),
+        "summary": summarize_tool_result(result)
+    })
+    .to_string()
+}
+
+fn compact_web_search_result_for_model(result: &Value) -> Value {
+    json!({
+        "ok": result.get("ok").cloned().unwrap_or(Value::Null),
+        "stage": result.get("stage").cloned().unwrap_or(Value::Null),
+        "mode": result.get("mode").cloned().unwrap_or(Value::Null),
+        "candidate_count": result.get("candidate_count").cloned().unwrap_or(Value::Null),
+        "opened_count": result.get("opened_count").cloned().unwrap_or(Value::Null),
+        "failure_count": result.get("failure_count").cloned().unwrap_or(Value::Null),
+        "results": compact_web_result_array(result.get("results")),
+        "candidates": compact_web_result_array(result.get("candidates")),
+        "opened_results": compact_web_result_array(result.get("opened_results")),
+        "failed_results": compact_web_diagnostic_array(result.get("failed_results")),
+        "error": result.get("error").cloned().unwrap_or(Value::Null),
+        "message": result.get("message").cloned().unwrap_or(Value::Null),
+        "open_ids": result.get("open_ids").cloned().unwrap_or(Value::Null),
+        "unresolved_ids": result.get("unresolved_ids").cloned().unwrap_or(Value::Null),
+        "truncated": result.get("truncated").cloned().unwrap_or(Value::Null),
+        "codeseex_compacted_for_model": true
+    })
+}
+
+fn compact_web_result_array(value: Option<&Value>) -> Value {
+    let Some(items) = value.and_then(Value::as_array) else {
+        return Value::Array(Vec::new());
+    };
+    Value::Array(items.iter().take(8).map(compact_web_result_item).collect())
+}
+
+fn compact_web_diagnostic_array(value: Option<&Value>) -> Value {
+    let Some(items) = value.and_then(Value::as_array) else {
+        return Value::Array(Vec::new());
+    };
+    Value::Array(
+        items
+            .iter()
+            .take(8)
+            .map(|item| {
+                json!({
+                    "url": item.get("url").cloned().unwrap_or(Value::Null),
+                    "status": item.get("status").cloned().unwrap_or(Value::Null),
+                    "error": item.get("error").cloned().unwrap_or(Value::Null),
+                    "message": item.get("message").cloned().unwrap_or(Value::Null)
+                })
+            })
+            .collect(),
+    )
+}
+
+fn compact_web_result_item(item: &Value) -> Value {
+    let content_chars = item
+        .get("content")
+        .or_else(|| item.get("text"))
+        .and_then(Value::as_str)
+        .map(|text| text.chars().count())
+        .unwrap_or(0);
+    json!({
+        "id": item.get("id").cloned().unwrap_or(Value::Null),
+        "title": item.get("title").cloned().unwrap_or(Value::Null),
+        "url": item.get("url").cloned().unwrap_or(Value::Null),
+        "snippet": item.get("snippet").cloned().unwrap_or(Value::Null),
+        "source": item.get("source").cloned().unwrap_or(Value::Null),
+        "status": item.get("status").cloned().unwrap_or(Value::Null),
+        "opened": item.get("opened").cloned().unwrap_or(Value::Null),
+        "content_chars": content_chars
+    })
+}
+
 pub(crate) fn summarize_tool_result_for_log(result: &Value) -> String {
     if let Some(summary) = semantic_tool_result_summary(result) {
         return summary;
@@ -95,6 +183,11 @@ pub(crate) fn summarize_tool_result_for_log(result: &Value) -> String {
 }
 
 fn semantic_tool_result_summary(result: &Value) -> Option<String> {
+    if result.get("stage").and_then(Value::as_str).is_some()
+        && result.get("mode").and_then(Value::as_str) == Some("search")
+    {
+        return Some(web_search_result_summary(result));
+    }
     if result.get("ok").and_then(Value::as_bool) == Some(false) {
         return Some(failed_tool_summary(result));
     }
@@ -174,13 +267,9 @@ fn generic_success_summary(result: &Value) -> Option<String> {
             ));
         }
     }
-    if let Some(stage) = result.get("stage").and_then(Value::as_str) {
+    if result.get("stage").and_then(Value::as_str).is_some() {
         if result.get("mode").and_then(Value::as_str) == Some("search") {
-            let count = result
-                .get("candidate_count")
-                .and_then(Value::as_u64)
-                .unwrap_or(0);
-            return Some(format!("web_search {stage} ok: {count} candidates"));
+            return Some(web_search_result_summary(result));
         }
     }
     result
@@ -189,10 +278,109 @@ fn generic_success_summary(result: &Value) -> Option<String> {
         .map(|value| compact_line(value, 240))
 }
 
+fn web_search_result_summary(result: &Value) -> String {
+    let ok = result.get("ok").and_then(Value::as_bool).unwrap_or(false);
+    let stage = result
+        .get("stage")
+        .and_then(Value::as_str)
+        .unwrap_or("search");
+    let count = result
+        .get("candidate_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let sources = joined_string_array(result.get("sources_attempted"));
+    let deprioritized = joined_string_array(result.get("sources_deprioritized"));
+    let fallback_errors = result
+        .get("fallback_errors")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
+    format!(
+        "web_search {stage} ok={ok} candidates={count} sources=[{sources}] deprioritized=[{deprioritized}] fallback_errors={fallback_errors}"
+    )
+}
+
+fn joined_string_array(value: Option<&Value>) -> String {
+    value
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .take(8)
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn call(name: &str) -> ChatToolCall {
+        ChatToolCall {
+            id: format!("call_{name}"),
+            name: name.to_owned(),
+            arguments: "{}".to_owned(),
+        }
+    }
+
+    #[test]
+    fn model_replay_web_search_uses_compact_summary() {
+        let huge = "WEB_SEARCH_BODY_".repeat(2_000);
+        let replay = model_replay_tool_result(
+            &call("web_search"),
+            &json!({
+                "ok": true,
+                "stage": "open",
+                "mode": "open",
+                "results": [{
+                    "id": "cand_weather",
+                    "title": "Weather",
+                    "url": "https://example.com/weather",
+                    "snippet": "Rain later",
+                    "content": huge
+                }]
+            }),
+        );
+
+        assert!(replay.contains("cand_weather"));
+        assert!(replay.contains("https://example.com/weather"));
+        assert!(replay.chars().count() <= 2_500);
+        assert!(!replay.contains("WEB_SEARCH_BODY_WEB_SEARCH_BODY"));
+    }
+
+    #[test]
+    fn model_replay_large_non_web_tool_is_bounded() {
+        let replay = model_replay_tool_result(
+            &call("large_tool"),
+            &json!({
+                "ok": true,
+                "payload": "x".repeat(MAX_TOOL_RESULT_REPLAY_CHARS + 8_000)
+            }),
+        );
+        let replay_json: Value = serde_json::from_str(&replay).expect("replay json");
+
+        assert_eq!(replay_json["codeseex_truncated_for_model"], true);
+        assert_eq!(replay_json["tool"], "large_tool");
+        assert!(replay.chars().count() <= 3_000);
+    }
+
+    #[test]
+    fn model_replay_small_non_web_tool_keeps_json() {
+        let replay = model_replay_tool_result(
+            &call("read_file_range"),
+            &json!({
+                "ok": true,
+                "text": "important exact content"
+            }),
+        );
+
+        assert!(replay.contains("important exact content"));
+        assert!(!replay.contains("codeseex_truncated_for_model"));
+    }
 
     #[test]
     fn log_summary_for_vision_is_user_level() {
@@ -245,5 +433,23 @@ mod tests {
         }));
 
         assert_eq!(summary, "image_gen failed: upstream_error");
+    }
+
+    #[test]
+    fn log_summary_for_web_search_failure_keeps_source_diagnostics() {
+        let summary = summarize_tool_result_for_log(&json!({
+            "ok": false,
+            "stage": "search",
+            "mode": "search",
+            "candidate_count": 0,
+            "sources_attempted": ["bing_html"],
+            "sources_deprioritized": ["duckduckgo_lite"],
+            "fallback_errors": [{ "source": "bing_html", "error": "empty_results" }]
+        }));
+
+        assert_eq!(
+            summary,
+            "web_search search ok=false candidates=0 sources=[bing_html] deprioritized=[duckduckgo_lite] fallback_errors=1"
+        );
     }
 }

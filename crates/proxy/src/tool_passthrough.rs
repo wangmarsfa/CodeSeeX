@@ -6,6 +6,11 @@ use crate::tools::ownership::ChatToolCall;
 
 const CODEX_TOOL_SEARCH_NAMES: &[&str] = &["tool_search_tool", "tool_search"];
 const MAX_MALFORMED_ARGUMENTS_CHARS: usize = 2_048;
+const MAX_EXTERNAL_TOOL_DECLARATIONS: usize = 128;
+const MAX_EXTERNAL_TOOL_DESCRIPTION_CHARS: usize = 2_000;
+const MAX_EXTERNAL_TOOL_SCHEMA_CHARS: usize = 24_000;
+const MAX_EXTERNAL_TOOLS_PAYLOAD_CHARS: usize = 160_000;
+const MAX_TOOL_BUDGET_DIAGNOSTIC_NAMES: usize = 20;
 
 #[derive(Debug, Clone, Default)]
 pub struct ToolContext {
@@ -14,6 +19,21 @@ pub struct ToolContext {
     request_tool_items: usize,
     source_names: Vec<String>,
     discovered_tool_items: usize,
+    budget: ToolBudgetStats,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ToolBudgetStats {
+    attempted_declarations: usize,
+    accepted_declarations: usize,
+    budgeted_declarations: usize,
+    exempt_declarations: usize,
+    payload_chars: usize,
+    truncated_descriptions: usize,
+    dropped_by_count: usize,
+    dropped_by_schema_size: usize,
+    dropped_by_payload_size: usize,
+    dropped_names: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -42,7 +62,7 @@ impl ToolContext {
                 if is_conflicting_visual_tool(&declaration.response_name) {
                     continue;
                 }
-                context.push_declaration(declaration);
+                context.push_external_declaration(declaration);
             }
         }
 
@@ -74,7 +94,7 @@ impl ToolContext {
                     continue;
                 }
                 self.discovered_tool_items = self.discovered_tool_items.saturating_add(1);
-                self.push_declaration(declaration);
+                self.push_external_declaration(declaration);
             }
         }
     }
@@ -110,6 +130,29 @@ impl ToolContext {
         self.discovered_tool_items
     }
 
+    pub fn external_tool_budget_diagnostic(&self) -> Value {
+        json!({
+            "attempted_declarations": self.budget.attempted_declarations,
+            "accepted_declarations": self.budget.accepted_declarations,
+            "budgeted_declarations": self.budget.budgeted_declarations,
+            "exempt_declarations": self.budget.exempt_declarations,
+            "payload_chars": self.budget.payload_chars,
+            "limits": {
+                "max_declarations": MAX_EXTERNAL_TOOL_DECLARATIONS,
+                "max_description_chars": MAX_EXTERNAL_TOOL_DESCRIPTION_CHARS,
+                "max_schema_chars": MAX_EXTERNAL_TOOL_SCHEMA_CHARS,
+                "max_payload_chars": MAX_EXTERNAL_TOOLS_PAYLOAD_CHARS
+            },
+            "truncated_descriptions": self.budget.truncated_descriptions,
+            "dropped": {
+                "count_limit": self.budget.dropped_by_count,
+                "schema_size": self.budget.dropped_by_schema_size,
+                "payload_size": self.budget.dropped_by_payload_size,
+                "sample_names": self.budget.dropped_names
+            }
+        })
+    }
+
     fn response_tool_name_set(&self) -> BTreeSet<String> {
         self.entries
             .values()
@@ -122,7 +165,7 @@ impl ToolContext {
         if self.has_response_tool("tool_search_tool") || self.has_response_tool("tool_search") {
             return;
         }
-        self.push_declaration(ToolDeclaration {
+        self.push_internal_declaration(ToolDeclaration {
             response_name: "tool_search_tool".to_owned(),
             description: "Search deferred Codex native tool metadata, such as sub-agents, computer-use, thread, automation, or plugin runtime tools, and expose matching tools for the next model turn.".to_owned(),
             parameters: json!({
@@ -145,29 +188,97 @@ impl ToolContext {
         });
     }
 
-    fn push_declaration(&mut self, declaration: ToolDeclaration) {
+    fn push_external_declaration(&mut self, declaration: ToolDeclaration) {
+        self.budget.attempted_declarations = self.budget.attempted_declarations.saturating_add(1);
+        if self.budget.budgeted_declarations >= MAX_EXTERNAL_TOOL_DECLARATIONS {
+            self.budget.dropped_by_count = self.budget.dropped_by_count.saturating_add(1);
+            self.remember_dropped_tool_name(&declaration.response_name);
+            return;
+        }
+
+        let schema_chars = serialized_json_chars(&declaration.parameters);
+        if schema_chars > MAX_EXTERNAL_TOOL_SCHEMA_CHARS {
+            self.budget.dropped_by_schema_size =
+                self.budget.dropped_by_schema_size.saturating_add(1);
+            self.remember_dropped_tool_name(&declaration.response_name);
+            return;
+        }
+
+        let mut declaration = declaration;
+        if declaration.description.chars().count() > MAX_EXTERNAL_TOOL_DESCRIPTION_CHARS {
+            declaration.description = truncate_chars(
+                &declaration.description,
+                MAX_EXTERNAL_TOOL_DESCRIPTION_CHARS.saturating_sub(3),
+            );
+            self.budget.truncated_descriptions =
+                self.budget.truncated_descriptions.saturating_add(1);
+        }
+
+        let Some(tool_value) = self.tool_value_for_declaration(&declaration) else {
+            return;
+        };
+        let tool_payload_chars = serialized_json_chars(&tool_value.value);
+        if self.budget.payload_chars.saturating_add(tool_payload_chars)
+            > MAX_EXTERNAL_TOOLS_PAYLOAD_CHARS
+        {
+            self.budget.dropped_by_payload_size =
+                self.budget.dropped_by_payload_size.saturating_add(1);
+            self.remember_dropped_tool_name(&declaration.response_name);
+            return;
+        }
+
+        self.push_tool_value(declaration, tool_value);
+        self.budget.accepted_declarations = self.budget.accepted_declarations.saturating_add(1);
+        self.budget.payload_chars = self.budget.payload_chars.saturating_add(tool_payload_chars);
+        self.budget.budgeted_declarations = self.budget.budgeted_declarations.saturating_add(1);
+    }
+
+    fn push_internal_declaration(&mut self, declaration: ToolDeclaration) {
+        if let Some(tool_value) = self.tool_value_for_declaration(&declaration) {
+            self.push_tool_value(declaration, tool_value);
+        }
+    }
+
+    fn tool_value_for_declaration(
+        &self,
+        declaration: &ToolDeclaration,
+    ) -> Option<PreparedToolValue> {
         let upstream_name = unique_tool_name(
             &declaration.response_name,
             declaration.namespace.as_deref(),
             &self.entries,
         );
-        self.upstream_tools.push(json!({
+        let value = json!({
             "type": "function",
             "function": {
                 "name": upstream_name,
                 "description": declaration.description,
                 "parameters": declaration.parameters
             }
-        }));
+        });
+        Some(PreparedToolValue {
+            upstream_name,
+            value,
+        })
+    }
+
+    fn push_tool_value(&mut self, declaration: ToolDeclaration, tool_value: PreparedToolValue) {
+        self.upstream_tools.push(tool_value.value);
         self.source_names.push(declaration.response_name.clone());
         self.entries.insert(
-            upstream_name.clone(),
+            tool_value.upstream_name,
             ToolEntry {
                 response_name: declaration.response_name,
                 namespace: declaration.namespace,
                 kind: declaration.kind,
             },
         );
+    }
+
+    fn remember_dropped_tool_name(&mut self, name: &str) {
+        if self.budget.dropped_names.len() < MAX_TOOL_BUDGET_DIAGNOSTIC_NAMES {
+            self.budget.dropped_names.push(name.to_owned());
+        }
     }
 
     pub fn response_item_from_chat_call(&self, call: &ChatToolCall) -> Value {
@@ -236,6 +347,12 @@ struct ToolDeclaration {
     parameters: Value,
     namespace: Option<String>,
     kind: ToolEntryKind,
+}
+
+#[derive(Debug)]
+struct PreparedToolValue {
+    upstream_name: String,
+    value: Value,
 }
 
 fn normalize_tool_declarations(tool: &Value, index: usize) -> Vec<ToolDeclaration> {
@@ -353,6 +470,12 @@ fn truncate_chars(value: &str, max_chars: usize) -> String {
     let mut output = value.chars().take(max_chars).collect::<String>();
     output.push_str("...");
     output
+}
+
+fn serialized_json_chars(value: &Value) -> usize {
+    serde_json::to_string(value)
+        .map(|value| value.chars().count())
+        .unwrap_or(usize::MAX)
 }
 
 fn tool_search_output_tool_declarations(
@@ -958,6 +1081,242 @@ mod tests {
 
         assert_eq!(context.upstream_tools.len(), 1);
         assert_eq!(context.upstream_names(), vec!["tool_search_tool"]);
+    }
+
+    #[test]
+    fn request_tool_declarations_are_count_and_payload_bounded() {
+        let tools = (0..(MAX_EXTERNAL_TOOL_DECLARATIONS + 20))
+            .map(|index| {
+                json!({
+                    "type": "function",
+                    "name": format!("external_{index}"),
+                    "description": "small",
+                    "parameters": { "type": "object", "properties": {} }
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let context = ToolContext::from_request_tools(Some(&Value::Array(tools)));
+        let diagnostic = context.external_tool_budget_diagnostic();
+
+        assert_eq!(context.upstream_tools.len(), MAX_EXTERNAL_TOOL_DECLARATIONS);
+        assert_eq!(
+            diagnostic["attempted_declarations"].as_u64(),
+            Some((MAX_EXTERNAL_TOOL_DECLARATIONS + 20) as u64)
+        );
+        assert_eq!(
+            diagnostic["accepted_declarations"].as_u64(),
+            Some(MAX_EXTERNAL_TOOL_DECLARATIONS as u64)
+        );
+        assert_eq!(diagnostic["dropped"]["count_limit"].as_u64(), Some(20));
+        assert!(
+            diagnostic["payload_chars"].as_u64().unwrap()
+                <= MAX_EXTERNAL_TOOLS_PAYLOAD_CHARS as u64
+        );
+    }
+
+    #[test]
+    fn oversized_external_schema_is_dropped() {
+        let huge_description = "d".repeat(MAX_EXTERNAL_TOOL_DESCRIPTION_CHARS + 100);
+        let huge_schema_text = "x".repeat(MAX_EXTERNAL_TOOL_SCHEMA_CHARS + 1);
+        let context = ToolContext::from_request_tools(Some(&json!([
+            {
+                "type": "function",
+                "name": "small_tool",
+                "description": huge_description,
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string"
+                        }
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "name": "huge_schema_tool",
+                "description": "too large",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "blob": {
+                            "type": "string",
+                            "description": huge_schema_text
+                        }
+                    }
+                }
+            }
+        ])));
+        let diagnostic = context.external_tool_budget_diagnostic();
+
+        assert_eq!(context.upstream_names(), vec!["small_tool"]);
+        assert_eq!(diagnostic["truncated_descriptions"].as_u64(), Some(1));
+        assert_eq!(diagnostic["dropped"]["schema_size"].as_u64(), Some(1));
+        assert!(
+            context.upstream_tools[0]
+                .pointer("/function/description")
+                .and_then(Value::as_str)
+                .unwrap()
+                .chars()
+                .count()
+                <= MAX_EXTERNAL_TOOL_DESCRIPTION_CHARS
+        );
+    }
+
+    #[test]
+    fn discovered_tool_search_output_declarations_are_budgeted() {
+        let discovered_tools = (0..(MAX_EXTERNAL_TOOL_DECLARATIONS + 5))
+            .map(|index| {
+                json!({
+                    "name": format!("discovered_{index}"),
+                    "description": "Discovered tool",
+                    "input_schema": { "type": "object", "properties": {} }
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut context = ToolContext::default();
+        context.add_tool_search_output_tools(
+            Some(&json!([
+                {
+                    "type": "tool_search_call",
+                    "call_id": "call_search",
+                    "arguments": { "query": "many tools" }
+                },
+                {
+                    "type": "tool_search_output",
+                    "call_id": "call_search",
+                    "tools": [
+                        {
+                            "type": "namespace",
+                            "name": "many",
+                            "tools": discovered_tools
+                        }
+                    ]
+                }
+            ])),
+            &BTreeSet::new(),
+        );
+        let diagnostic = context.external_tool_budget_diagnostic();
+
+        assert_eq!(context.upstream_tools.len(), MAX_EXTERNAL_TOOL_DECLARATIONS);
+        assert_eq!(
+            diagnostic["attempted_declarations"].as_u64(),
+            Some((MAX_EXTERNAL_TOOL_DECLARATIONS + 5) as u64)
+        );
+        assert_eq!(diagnostic["dropped"]["count_limit"].as_u64(), Some(5));
+        assert!(
+            context.discovered_tool_items() >= MAX_EXTERNAL_TOOL_DECLARATIONS,
+            "discovered count should still expose incoming discovery pressure"
+        );
+    }
+
+    #[test]
+    fn external_codex_tool_search_declaration_is_budgeted() {
+        let mut tools = (0..MAX_EXTERNAL_TOOL_DECLARATIONS)
+            .map(|index| {
+                json!({
+                    "type": "function",
+                    "name": format!("external_{index}"),
+                    "description": "small",
+                    "parameters": { "type": "object", "properties": {} }
+                })
+            })
+            .collect::<Vec<_>>();
+        tools.push(json!({
+            "type": "function",
+            "name": "tool_search_tool",
+            "description": "Search deferred tools",
+            "parameters": { "type": "object", "properties": {} }
+        }));
+
+        let context = ToolContext::from_request_tools(Some(&Value::Array(tools)));
+        let diagnostic = context.external_tool_budget_diagnostic();
+
+        assert!(!context.has_external_tool("tool_search_tool"));
+        assert_eq!(context.upstream_tools.len(), MAX_EXTERNAL_TOOL_DECLARATIONS);
+        assert_eq!(diagnostic["exempt_declarations"].as_u64(), Some(0));
+        assert_eq!(diagnostic["dropped"]["count_limit"].as_u64(), Some(1));
+        assert_eq!(
+            diagnostic["dropped"]["sample_names"][0].as_str(),
+            Some("tool_search_tool")
+        );
+    }
+
+    #[test]
+    fn internal_codex_tool_search_bridge_survives_external_count_budget() {
+        let tools = (0..MAX_EXTERNAL_TOOL_DECLARATIONS)
+            .map(|index| {
+                json!({
+                    "type": "function",
+                    "name": format!("external_{index}"),
+                    "description": "small",
+                    "parameters": { "type": "object", "properties": {} }
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut context = ToolContext::from_request_tools(Some(&Value::Array(tools)));
+
+        context.ensure_codex_tool_search_bridge();
+
+        assert!(context.has_external_tool("tool_search_tool"));
+        assert_eq!(
+            context.upstream_tools.len(),
+            MAX_EXTERNAL_TOOL_DECLARATIONS + 1
+        );
+        assert_eq!(
+            context.external_tool_budget_diagnostic()["exempt_declarations"].as_u64(),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn discovered_codex_tool_search_declaration_is_budgeted() {
+        let discovered_tools = (0..MAX_EXTERNAL_TOOL_DECLARATIONS)
+            .map(|index| {
+                json!({
+                    "name": format!("discovered_{index}"),
+                    "description": "Discovered tool",
+                    "input_schema": { "type": "object", "properties": {} }
+                })
+            })
+            .chain(std::iter::once(json!({
+                "name": "tool_search_tool",
+                "description": "Discovered tool search should not bypass budgets",
+                "input_schema": { "type": "object", "properties": {} }
+            })))
+            .collect::<Vec<_>>();
+        let mut context = ToolContext::default();
+        context.add_tool_search_output_tools(
+            Some(&json!([
+                {
+                    "type": "tool_search_call",
+                    "call_id": "call_search",
+                    "arguments": { "query": "many tools" }
+                },
+                {
+                    "type": "tool_search_output",
+                    "call_id": "call_search",
+                    "tools": [
+                        {
+                            "type": "namespace",
+                            "name": "many",
+                            "tools": discovered_tools
+                        }
+                    ]
+                }
+            ])),
+            &BTreeSet::new(),
+        );
+        let diagnostic = context.external_tool_budget_diagnostic();
+
+        assert!(!context.has_external_tool("tool_search_tool"));
+        assert_eq!(context.upstream_tools.len(), MAX_EXTERNAL_TOOL_DECLARATIONS);
+        assert_eq!(diagnostic["dropped"]["count_limit"].as_u64(), Some(1));
+        assert_eq!(
+            diagnostic["dropped"]["sample_names"][0].as_str(),
+            Some("tool_search_tool")
+        );
     }
 
     #[test]

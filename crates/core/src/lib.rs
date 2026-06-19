@@ -13,6 +13,4 @@ pub use config::{
     UserToolsConfig, UserUiConfig, UserUpstreamConfig, UserVisionToolConfig,
     UserWebSearchToolConfig,
 };
-pub use models::{
-    available_models, ModelInfo, ModelRouteHint, TemperaturePreset, UpstreamModelOverride,
-};
+pub use models::{available_models, ModelInfo, TemperaturePreset, UpstreamModelOverride};

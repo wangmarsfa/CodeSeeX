@@ -281,11 +281,12 @@ fn start_embedded_proxy(app: AppHandle) -> Result<(), String> {
     };
 
     tauri::async_runtime::spawn(async move {
-        let config = AppConfig::load();
+        let config = AppConfig::load_base();
+        let effective_config = AppConfig::load();
         let endpoint = ProxyRuntimeEndpoint {
-            host: config.host.clone(),
-            port: config.port,
-            base_url: config.proxy_base_url(),
+            host: effective_config.host.clone(),
+            port: effective_config.port,
+            base_url: effective_config.proxy_base_url(),
         };
         set_proxy_runtime_endpoint_if_generation(&app, generation, endpoint);
         let running_app = app.clone();
@@ -513,7 +514,7 @@ async fn desktop_manager_runtime(
         return Err("desktop manager runtime lock was poisoned".to_owned());
     }
 
-    let manager = codeseex_proxy::ManagerRuntime::open(AppConfig::load())
+    let manager = codeseex_proxy::ManagerRuntime::open(AppConfig::load_base())
         .await
         .map_err(|error| format!("{error:#}"))?;
     let mut guard = state

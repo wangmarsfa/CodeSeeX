@@ -1,0 +1,94 @@
+:root {
+  --bg-app: #f4f5f7;
+  --bg-panel: #ffffff;
+  --hover-bg: #f8fafc;
+  --text-main: #111827;
+  --text-secondary: #4b5563;
+  --text-muted: #9ca3af;
+  --border-color: #e5e7eb;
+  
+  --primary: #0f172a;
+  --primary-hover: #334155;
+  --primary-text: #ffffff;
+  
+  --success: #10b981;
+  --success-bg: #ecfdf5;
+  --danger: #ef4444;
+  --danger-bg: #fef2f2;
+  --warn: #f59e0b;
+  --info: #3b82f6;
+  --info-bg: #eff6ff;
+  --tool: #7c3aed;
+  --ctrl-bg: #f1f5f9;
+  --ctrl-selected-bg: #ffffff;
+  --danger-hover-bg: #fecaca;
+  --warn-badge-bg: #fef3c7;
+  --tool-badge-bg: #ede9fe;
+  --request-badge-bg: #dbeafe;
+  --overlay-bg: rgba(17, 24, 39, 0.4);
+  --theme-duration: 0.2s;
+  --theme-easing: ease;
+  --theme-transition: background-color var(--theme-duration) var(--theme-easing), border-color var(--theme-duration) var(--theme-easing), color var(--theme-duration) var(--theme-easing), box-shadow var(--theme-duration) var(--theme-easing);
+  
+  --radius-sm: 6px;
+  --radius-md: 10px;
+  --radius-lg: 14px;
+  --shadow-sm: 0 1px 2px 0 rgba(0, 0, 0, 0.05);
+  --shadow-md: 0 4px 6px -1px rgba(0, 0, 0, 0.05), 0 2px 4px -1px rgba(0, 0, 0, 0.03);
+}
+
+:root[data-theme="dark"] {
+  --bg-app: #09090b;
+  --bg-panel: #151519;
+  --hover-bg: #202026;
+  --text-main: #f4f4f5;
+  --text-secondary: #a1a1aa;
+  --text-muted: #71717a;
+  --border-color: #222227;
+  
+  --primary: #f4f4f5;
+  --primary-hover: #ffffff;
+  --primary-text: #09090b;
+  
+  --success-bg: rgba(16, 185, 129, 0.1);
+  --danger-bg: rgba(239, 68, 68, 0.1);
+  --tool: #a78bfa;
+  
+  --ctrl-bg: #1e1e24;
+  --ctrl-selected-bg: #2d2d34;
+  --danger-hover-bg: rgba(239, 68, 68, 0.2);
+  --warn-badge-bg: rgba(245, 158, 11, 0.12);
+  --tool-badge-bg: rgba(139, 92, 246, 0.12);
+  --request-badge-bg: rgba(59, 130, 246, 0.12);
+  --overlay-bg: rgba(0, 0, 0, 0.7);
+  
+  --shadow-sm: 0 1px 2px 0 rgba(0, 0, 0, 0.4);
+  --shadow-md: 0 8px 16px -4px rgba(0, 0, 0, 0.5);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root[data-theme="system"] {
+    --bg-app: #09090b;
+    --bg-panel: #151519;
+    --hover-bg: #202026;
+    --text-main: #f4f4f5;
+    --text-secondary: #a1a1aa;
+    --text-muted: #71717a;
+    --border-color: #222227;
+    --primary: #f4f4f5;
+    --primary-hover: #ffffff;
+    --primary-text: #09090b;
+    --success-bg: rgba(16, 185, 129, 0.1);
+    --danger-bg: rgba(239, 68, 68, 0.1);
+    --tool: #a78bfa;
+    --ctrl-bg: #1e1e24;
+    --ctrl-selected-bg: #2d2d34;
+    --danger-hover-bg: rgba(239, 68, 68, 0.2);
+    --warn-badge-bg: rgba(245, 158, 11, 0.12);
+    --tool-badge-bg: rgba(139, 92, 246, 0.12);
+    --request-badge-bg: rgba(59, 130, 246, 0.12);
+    --overlay-bg: rgba(0, 0, 0, 0.7);
+    --shadow-sm: 0 1px 2px 0 rgba(0, 0, 0, 0.4);
+    --shadow-md: 0 8px 16px -4px rgba(0, 0, 0, 0.6);
+  }
+}

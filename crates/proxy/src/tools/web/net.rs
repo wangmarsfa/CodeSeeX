@@ -7,6 +7,8 @@ use std::net::{IpAddr, Ipv4Addr};
 use super::extract::{bytes_have_binary_markers, decode_text_bytes};
 use super::MAX_BYTES;
 
+pub(super) const WEB_REQUEST_TIMEOUT_SECS: u64 = 12;
+
 pub(super) fn user_agent() -> &'static str {
     "Mozilla/5.0 (compatible; CodeSeeX/1.0; +https://localhost)"
 }
@@ -15,7 +17,7 @@ pub(super) fn web_client(proxy_mode: NetworkProxyMode) -> reqwest::Client {
     crate::network::apply_proxy_mode(reqwest::Client::builder(), proxy_mode)
         .http1_only()
         .local_address(IpAddr::V4(Ipv4Addr::UNSPECIFIED))
-        .timeout(std::time::Duration::from_secs(30))
+        .timeout(std::time::Duration::from_secs(WEB_REQUEST_TIMEOUT_SECS))
         .build()
         .expect("build web client")
 }
@@ -25,7 +27,7 @@ pub(super) fn no_redirect_client(proxy_mode: NetworkProxyMode) -> reqwest::Clien
         .http1_only()
         .local_address(IpAddr::V4(Ipv4Addr::UNSPECIFIED))
         .redirect(reqwest::redirect::Policy::none())
-        .timeout(std::time::Duration::from_secs(30))
+        .timeout(std::time::Duration::from_secs(WEB_REQUEST_TIMEOUT_SECS))
         .build()
         .expect("build no-redirect web client")
 }
@@ -114,4 +116,14 @@ pub(super) async fn read_limited_response_bytes(response: reqwest::Response) -> 
         bytes.extend_from_slice(&chunk);
     }
     (bytes, truncated)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn web_request_timeout_stays_short_enough_for_agent_loops() {
+        assert!(WEB_REQUEST_TIMEOUT_SECS <= 12);
+    }
 }

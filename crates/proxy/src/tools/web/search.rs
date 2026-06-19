@@ -1,5 +1,11 @@
 use regex::Regex;
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
+use tokio::sync::Mutex;
+
+use codeseex_core::NetworkProxyMode;
 
 use super::candidates::{average_score, dedupe_results, make_search_result, retain_usable_results};
 use super::extract::{
@@ -7,35 +13,40 @@ use super::extract::{
 };
 use super::net::{fetch_text, read_limited_response_bytes, request_error_message, user_agent};
 
-pub(super) async fn query(client: &reqwest::Client, query: &str, max_results: usize) -> Value {
+const SEARCH_SOURCE_HEALTH_TTL_SECS: u64 = 300;
+
+static SEARCH_SOURCE_HEALTH: OnceLock<Mutex<BTreeMap<String, SearchHealthSnapshot>>> =
+    OnceLock::new();
+
+pub(super) async fn query(
+    client: &reqwest::Client,
+    proxy_mode: NetworkProxyMode,
+    query: &str,
+    max_results: usize,
+) -> Value {
+    let plan = search_plan(client, proxy_mode).await;
     let mut fallback_errors = Vec::new();
     let mut collected = Vec::new();
+    let mut sources_attempted = Vec::new();
 
-    let results_by_source = tokio::join!(
-        bing_html(client, query, max_results),
-        brave_html(client, query, max_results),
-        duckduckgo_lite(client, query, max_results),
-        duckduckgo_html(client, query, max_results),
-        duckduckgo_instant_answer(client, query, max_results)
+    let primary_sources = plan.primary_sources();
+    let primary_results = run_search_sources(client, query, max_results, &primary_sources).await;
+    collect_source_results(
+        primary_results,
+        &mut collected,
+        &mut fallback_errors,
+        &mut sources_attempted,
     );
-    for result in [
-        results_by_source.0,
-        results_by_source.1,
-        results_by_source.2,
-        results_by_source.3,
-        results_by_source.4,
-    ] {
-        if let Some(results) = result.get("results").and_then(Value::as_array) {
-            collected.extend(results.iter().cloned());
-        }
-        if result.get("ok").and_then(Value::as_bool) != Some(true) {
-            fallback_errors.push(json!({
-                "source": result.get("source").and_then(Value::as_str).unwrap_or("unknown"),
-                "error": result.get("error").and_then(Value::as_str).unwrap_or("empty_results"),
-                "status": result.get("status").and_then(Value::as_u64),
-                "message": result.get("message").and_then(Value::as_str).unwrap_or_default()
-            }));
-        }
+
+    if collected.is_empty() && !plan.deprioritized_sources().is_empty() {
+        let fallback_results =
+            run_search_sources(client, query, max_results, &plan.deprioritized_sources()).await;
+        collect_source_results(
+            fallback_results,
+            &mut collected,
+            &mut fallback_errors,
+            &mut sources_attempted,
+        );
     }
 
     let mut results = dedupe_results(collected);
@@ -56,7 +67,10 @@ pub(super) async fn query(client: &reqwest::Client, query: &str, max_results: us
         "mode": "search",
         "query": query,
         "source": if results.is_empty() { "none" } else { "multi_source_html" },
-        "sources_attempted": ["bing_html", "brave_html", "duckduckgo_lite", "duckduckgo_html", "duckduckgo_instant_answer"],
+        "sources_attempted": sources_attempted,
+        "source_order": plan.source_order_names(),
+        "sources_deprioritized": plan.deprioritized_source_names(),
+        "source_health": plan.health_diagnostic(),
         "results": results.clone(),
         "candidates": results.clone(),
         "candidate_count": results.len(),
@@ -66,10 +80,213 @@ pub(super) async fn query(client: &reqwest::Client, query: &str, max_results: us
     })
 }
 
+pub(super) async fn warm_sources(client: &reqwest::Client, proxy_mode: NetworkProxyMode) -> Value {
+    let snapshot =
+        refresh_search_source_health(client, &crate::network::proxy_cache_key(proxy_mode)).await;
+    json!({
+        "ok": true,
+        "stage": "search_source_probe",
+        "proxy_key": snapshot.cache_key,
+        "source_order": ranked_sources_from_health(&snapshot.sources)
+            .iter()
+            .map(|source| source.name())
+            .collect::<Vec<_>>(),
+        "source_health": source_health_diagnostic(&snapshot.sources, snapshot.checked_at.elapsed().as_millis() as u64)
+    })
+}
+
+async fn run_search_sources(
+    client: &reqwest::Client,
+    query: &str,
+    max_results: usize,
+    sources: &[SearchSource],
+) -> Vec<Value> {
+    futures_util::future::join_all(
+        sources
+            .iter()
+            .copied()
+            .map(|source| source.search(client, query, max_results)),
+    )
+    .await
+}
+
+fn collect_source_results(
+    results_by_source: Vec<Value>,
+    collected: &mut Vec<Value>,
+    fallback_errors: &mut Vec<Value>,
+    sources_attempted: &mut Vec<String>,
+) {
+    for result in results_by_source {
+        let source = result
+            .get("source")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        push_unique_source(sources_attempted, source);
+        if let Some(results) = result.get("results").and_then(Value::as_array) {
+            collected.extend(results.iter().cloned());
+        }
+        if result.get("ok").and_then(Value::as_bool) != Some(true) {
+            fallback_errors.push(json!({
+                "source": source,
+                "error": result.get("error").and_then(Value::as_str).unwrap_or("empty_results"),
+                "status": result.get("status").and_then(Value::as_u64),
+                "message": result.get("message").and_then(Value::as_str).unwrap_or_default()
+            }));
+        }
+    }
+}
+
+fn push_unique_source(output: &mut Vec<String>, source: &str) {
+    if !output.iter().any(|value| value == source) {
+        output.push(source.to_owned());
+    }
+}
+
+async fn search_plan(client: &reqwest::Client, proxy_mode: NetworkProxyMode) -> SearchPlan {
+    let snapshot = search_source_health(client, &crate::network::proxy_cache_key(proxy_mode)).await;
+    let ordered_sources = ranked_sources_from_health(&snapshot.sources);
+    SearchPlan {
+        cache_key: snapshot.cache_key,
+        checked_at_age_ms: snapshot.checked_at.elapsed().as_millis() as u64,
+        ordered_sources,
+        health: snapshot.sources,
+    }
+}
+
+async fn search_source_health(client: &reqwest::Client, cache_key: &str) -> SearchHealthSnapshot {
+    let cache = SEARCH_SOURCE_HEALTH.get_or_init(|| Mutex::new(BTreeMap::new()));
+    {
+        let guard = cache.lock().await;
+        if let Some(snapshot) = guard.get(cache_key) {
+            if snapshot.checked_at.elapsed() < Duration::from_secs(SEARCH_SOURCE_HEALTH_TTL_SECS) {
+                return snapshot.clone();
+            }
+        }
+    }
+
+    refresh_search_source_health(client, cache_key).await
+}
+
+async fn refresh_search_source_health(
+    client: &reqwest::Client,
+    cache_key: &str,
+) -> SearchHealthSnapshot {
+    let snapshot = SearchHealthSnapshot {
+        cache_key: cache_key.to_owned(),
+        checked_at: Instant::now(),
+        sources: futures_util::future::join_all(
+            SearchSource::ALL
+                .iter()
+                .copied()
+                .map(|source| probe_search_source(client, source)),
+        )
+        .await,
+    };
+    let cache = SEARCH_SOURCE_HEALTH.get_or_init(|| Mutex::new(BTreeMap::new()));
+    let mut guard = cache.lock().await;
+    guard.insert(cache_key.to_owned(), snapshot.clone());
+    snapshot
+}
+
+async fn probe_search_source(client: &reqwest::Client, source: SearchSource) -> SearchSourceHealth {
+    let Some(url) = source.probe_url() else {
+        return SearchSourceHealth {
+            source,
+            reachable: false,
+            latency_ms: None,
+            status: None,
+            error: Some("invalid_probe_url".to_owned()),
+        };
+    };
+    let started = Instant::now();
+    let response = tokio::time::timeout(
+        Duration::from_secs(super::net::WEB_REQUEST_TIMEOUT_SECS),
+        client
+            .get(url)
+            .header(reqwest::header::USER_AGENT, user_agent())
+            .header(
+                reqwest::header::ACCEPT,
+                "text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8",
+            )
+            .send(),
+    )
+    .await;
+    let latency_ms = Some(started.elapsed().as_millis() as u64);
+    match response {
+        Ok(Ok(response)) => SearchSourceHealth {
+            source,
+            reachable: true,
+            latency_ms,
+            status: Some(response.status().as_u16()),
+            error: None,
+        },
+        Ok(Err(error)) => SearchSourceHealth {
+            source,
+            reachable: false,
+            latency_ms,
+            status: None,
+            error: Some(request_error_message(&error)),
+        },
+        Err(_) => SearchSourceHealth {
+            source,
+            reachable: false,
+            latency_ms,
+            status: None,
+            error: Some("probe_timeout".to_owned()),
+        },
+    }
+}
+
+fn ranked_sources_from_health(health: &[SearchSourceHealth]) -> Vec<SearchSource> {
+    let mut health = health.to_vec();
+    health.sort_by(|left, right| {
+        right
+            .reachable
+            .cmp(&left.reachable)
+            .then_with(|| {
+                left.latency_ms
+                    .unwrap_or(u64::MAX)
+                    .cmp(&right.latency_ms.unwrap_or(u64::MAX))
+            })
+            .then_with(|| {
+                left.source
+                    .preferred_rank()
+                    .cmp(&right.source.preferred_rank())
+            })
+    });
+    let mut sources = health
+        .into_iter()
+        .map(|health| health.source)
+        .collect::<Vec<_>>();
+    for source in SearchSource::ALL {
+        if !sources.contains(&source) {
+            sources.push(source);
+        }
+    }
+    sources
+}
+
 async fn bing_html(client: &reqwest::Client, query: &str, max_results: usize) -> Value {
+    bing_html_at(
+        client,
+        query,
+        max_results,
+        "bing_html",
+        "https://www.bing.com/search",
+    )
+    .await
+}
+
+async fn bing_html_at(
+    client: &reqwest::Client,
+    query: &str,
+    max_results: usize,
+    source: &'static str,
+    endpoint: &'static str,
+) -> Value {
     let locale = web_locale(query);
     let Ok(url) = reqwest::Url::parse_with_params(
-        "https://www.bing.com/search",
+        endpoint,
         &[
             ("q", query),
             ("setlang", locale.bing_setlang),
@@ -78,21 +295,21 @@ async fn bing_html(client: &reqwest::Client, query: &str, max_results: usize) ->
             ("ensearch", locale.bing_english_search),
         ],
     ) else {
-        return json!({ "ok": false, "query": query, "source": "bing_html", "error": "invalid_search_url" });
+        return json!({ "ok": false, "query": query, "source": source, "error": "invalid_search_url" });
     };
     let fetched = fetch_text(client, url, "text/html,application/xhtml+xml").await;
     if fetched.get("ok").and_then(Value::as_bool) != Some(true) {
-        return merge_search_error("bing_html", query, fetched);
+        return merge_search_error(source, query, fetched);
     }
     let html = fetched
         .get("text")
         .and_then(Value::as_str)
         .unwrap_or_default();
-    let results = parse_bing_results(query, html, max_results);
+    let results = parse_bing_results(query, html, max_results, source);
     json!({
         "ok": !results.is_empty(),
         "query": query,
-        "source": "bing_html",
+        "source": source,
         "results": results,
         "error": if results.is_empty() { "empty_results" } else { "" }
     })
@@ -267,6 +484,186 @@ async fn duckduckgo_instant_answer(
     })
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SearchSource {
+    BingHtml,
+    BraveHtml,
+    DuckDuckGoLite,
+    DuckDuckGoHtml,
+    DuckDuckGoInstantAnswer,
+}
+
+impl SearchSource {
+    const ALL: [SearchSource; 5] = [
+        SearchSource::BingHtml,
+        SearchSource::BraveHtml,
+        SearchSource::DuckDuckGoLite,
+        SearchSource::DuckDuckGoHtml,
+        SearchSource::DuckDuckGoInstantAnswer,
+    ];
+
+    fn name(self) -> &'static str {
+        match self {
+            SearchSource::BingHtml => "bing_html",
+            SearchSource::BraveHtml => "brave_html",
+            SearchSource::DuckDuckGoLite => "duckduckgo_lite",
+            SearchSource::DuckDuckGoHtml => "duckduckgo_html",
+            SearchSource::DuckDuckGoInstantAnswer => "duckduckgo_instant_answer",
+        }
+    }
+
+    fn preferred_rank(self) -> usize {
+        match self {
+            SearchSource::BingHtml => 0,
+            SearchSource::BraveHtml => 1,
+            SearchSource::DuckDuckGoLite => 2,
+            SearchSource::DuckDuckGoHtml => 3,
+            SearchSource::DuckDuckGoInstantAnswer => 4,
+        }
+    }
+
+    fn probe_url(self) -> Option<reqwest::Url> {
+        match self {
+            SearchSource::BingHtml => reqwest::Url::parse_with_params(
+                "https://www.bing.com/search",
+                &[("q", "codeseex web search probe")],
+            ),
+            SearchSource::BraveHtml => reqwest::Url::parse_with_params(
+                "https://search.brave.com/search",
+                &[("q", "codeseex web search probe"), ("source", "web")],
+            ),
+            SearchSource::DuckDuckGoLite => reqwest::Url::parse_with_params(
+                "https://lite.duckduckgo.com/lite/",
+                &[("q", "codeseex web search probe")],
+            ),
+            SearchSource::DuckDuckGoHtml => reqwest::Url::parse_with_params(
+                "https://html.duckduckgo.com/html/",
+                &[("q", "codeseex web search probe")],
+            ),
+            SearchSource::DuckDuckGoInstantAnswer => reqwest::Url::parse_with_params(
+                "https://api.duckduckgo.com/",
+                &[
+                    ("q", "codeseex web search probe"),
+                    ("format", "json"),
+                    ("no_html", "1"),
+                    ("skip_disambig", "1"),
+                ],
+            ),
+        }
+        .ok()
+    }
+
+    async fn search(self, client: &reqwest::Client, query: &str, max_results: usize) -> Value {
+        match self {
+            SearchSource::BingHtml => bing_html(client, query, max_results).await,
+            SearchSource::BraveHtml => brave_html(client, query, max_results).await,
+            SearchSource::DuckDuckGoLite => duckduckgo_lite(client, query, max_results).await,
+            SearchSource::DuckDuckGoHtml => duckduckgo_html(client, query, max_results).await,
+            SearchSource::DuckDuckGoInstantAnswer => {
+                duckduckgo_instant_answer(client, query, max_results).await
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct SearchSourceHealth {
+    source: SearchSource,
+    reachable: bool,
+    latency_ms: Option<u64>,
+    status: Option<u16>,
+    error: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct SearchHealthSnapshot {
+    cache_key: String,
+    checked_at: Instant,
+    sources: Vec<SearchSourceHealth>,
+}
+
+#[derive(Clone, Debug)]
+struct SearchPlan {
+    cache_key: String,
+    checked_at_age_ms: u64,
+    ordered_sources: Vec<SearchSource>,
+    health: Vec<SearchSourceHealth>,
+}
+
+impl SearchPlan {
+    fn primary_sources(&self) -> Vec<SearchSource> {
+        let primary = self
+            .ordered_sources
+            .iter()
+            .copied()
+            .filter(|source| self.source_reachable(*source).unwrap_or(true))
+            .collect::<Vec<_>>();
+        if primary.is_empty() {
+            self.ordered_sources.clone()
+        } else {
+            primary
+        }
+    }
+
+    fn deprioritized_sources(&self) -> Vec<SearchSource> {
+        self.ordered_sources
+            .iter()
+            .copied()
+            .filter(|source| self.source_reachable(*source) == Some(false))
+            .collect()
+    }
+
+    fn source_order_names(&self) -> Vec<&'static str> {
+        self.ordered_sources
+            .iter()
+            .map(|source| source.name())
+            .collect()
+    }
+
+    fn deprioritized_source_names(&self) -> Vec<&'static str> {
+        self.deprioritized_sources()
+            .iter()
+            .map(|source| source.name())
+            .collect()
+    }
+
+    fn health_diagnostic(&self) -> Vec<Value> {
+        let mut diagnostic = source_health_diagnostic(&self.health, self.checked_at_age_ms);
+        for item in &mut diagnostic {
+            if let Some(object) = item.as_object_mut() {
+                object.insert(
+                    "proxy_key".to_owned(),
+                    Value::String(self.cache_key.clone()),
+                );
+            }
+        }
+        diagnostic
+    }
+
+    fn source_reachable(&self, source: SearchSource) -> Option<bool> {
+        self.health
+            .iter()
+            .find(|health| health.source == source)
+            .map(|health| health.reachable)
+    }
+}
+
+fn source_health_diagnostic(health: &[SearchSourceHealth], age_ms: u64) -> Vec<Value> {
+    health
+        .iter()
+        .map(|health| {
+            json!({
+                "source": health.source.name(),
+                "reachable": health.reachable,
+                "latency_ms": health.latency_ms,
+                "status": health.status,
+                "error": health.error,
+                "age_ms": age_ms
+            })
+        })
+        .collect()
+}
+
 fn merge_search_error(source: &str, query: &str, error: Value) -> Value {
     json!({
         "ok": false,
@@ -318,9 +715,15 @@ fn collect_duckduckgo_related(
     }
 }
 
-fn parse_bing_results(query: &str, html: &str, max_results: usize) -> Vec<Value> {
-    let Ok(block_re) = Regex::new(r#"(?is)<li[^>]+class="[^"]*b_algo[^"]*"[^>]*>(.*?)</li>"#)
-    else {
+fn parse_bing_results(
+    query: &str,
+    html: &str,
+    max_results: usize,
+    source: &'static str,
+) -> Vec<Value> {
+    let Ok(block_re) = Regex::new(
+        r#"(?is)<li\b[^>]*\bclass\s*=\s*(?:"[^"]*\bb_algo\b[^"]*"|'[^']*\bb_algo\b[^']*'|[^\s>]*\bb_algo\b[^\s>]*)[^>]*>(.*?)</li>"#,
+    ) else {
         return Vec::new();
     };
     let Ok(link_re) =
@@ -329,7 +732,7 @@ fn parse_bing_results(query: &str, html: &str, max_results: usize) -> Vec<Value>
         return Vec::new();
     };
     let Ok(snippet_re) = Regex::new(
-        r#"(?is)<(?:p|div)[^>]+class="[^"]*(?:b_caption|b_snippet|b_lineclamp)[^"]*"[^>]*>(.*?)</(?:p|div)>"#,
+        r#"(?is)<(?:p|div)\b[^>]*\bclass\s*=\s*(?:"[^"]*\b(?:b_caption|b_snippet|b_lineclamp\d*)\b[^"]*"|'[^']*\b(?:b_caption|b_snippet|b_lineclamp\d*)\b[^']*'|[^\s>]*\b(?:b_caption|b_snippet|b_lineclamp\d*)\b[^\s>]*)[^>]*>(.*?)</(?:p|div)>"#,
     ) else {
         return Vec::new();
     };
@@ -348,8 +751,7 @@ fn parse_bing_results(query: &str, html: &str, max_results: usize) -> Vec<Value>
             .captures(block)
             .and_then(|caps| caps.get(1).map(|value| strip_html_tags(value.as_str())))
             .unwrap_or_default();
-        if let Some(item) =
-            make_search_result(query, &title, &url, &snippet, "bing_html", results.len())
+        if let Some(item) = make_search_result(query, &title, &url, &snippet, source, results.len())
         {
             results.push(item);
         }
@@ -544,7 +946,7 @@ mod tests {
               </li>
             </body></html>
         "#;
-        let results = parse_bing_results("CodeSeeX", html, 5);
+        let results = parse_bing_results("CodeSeeX", html, 5, "bing_html");
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0]["url"], "https://example.com/result");
@@ -554,6 +956,110 @@ mod tests {
             .as_str()
             .unwrap_or_default()
             .starts_with("cand_"));
+    }
+
+    #[test]
+    fn parses_bing_html_results_with_unquoted_data_attributes() {
+        let html = r#"
+            <ol id="b_results">
+              <li class="b_algo" data-id iid=SERP.5159>
+                <h2 class=""><a target="_blank" href="https://example.com/current" h="ID=SERP,5102.2">Current Result</a></h2>
+                <div class="b_caption"><p class="b_lineclamp2">Current Bing HTML snippet.</p></div>
+              </li>
+            </ol>
+        "#;
+        let results = parse_bing_results("Current Bing HTML", html, 5, "bing_html");
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["url"], "https://example.com/current");
+        assert_eq!(results[0]["title"], "Current Result");
+        assert_eq!(results[0]["snippet"], "Current Bing HTML snippet.");
+    }
+
+    #[test]
+    fn source_ranking_moves_unreachable_sources_after_reachable_sources() {
+        let ranked = ranked_sources_from_health(&[
+            SearchSourceHealth {
+                source: SearchSource::DuckDuckGoLite,
+                reachable: false,
+                latency_ms: Some(3000),
+                status: None,
+                error: Some("probe_timeout".to_owned()),
+            },
+            SearchSourceHealth {
+                source: SearchSource::BingHtml,
+                reachable: true,
+                latency_ms: Some(580),
+                status: Some(200),
+                error: None,
+            },
+        ]);
+
+        assert_eq!(ranked[0], SearchSource::BingHtml);
+        assert!(
+            ranked
+                .iter()
+                .position(|source| *source == SearchSource::DuckDuckGoLite)
+                .unwrap()
+                > ranked
+                    .iter()
+                    .position(|source| *source == SearchSource::BingHtml)
+                    .unwrap()
+        );
+    }
+
+    #[test]
+    fn source_ranking_keeps_slow_reachable_sources_before_unreachable_sources() {
+        let ranked = ranked_sources_from_health(&[
+            SearchSourceHealth {
+                source: SearchSource::DuckDuckGoHtml,
+                reachable: true,
+                latency_ms: Some(9000),
+                status: Some(200),
+                error: None,
+            },
+            SearchSourceHealth {
+                source: SearchSource::BraveHtml,
+                reachable: false,
+                latency_ms: Some(3000),
+                status: None,
+                error: Some("probe_timeout".to_owned()),
+            },
+        ]);
+
+        assert!(
+            ranked
+                .iter()
+                .position(|source| *source == SearchSource::DuckDuckGoHtml)
+                .unwrap()
+                < ranked
+                    .iter()
+                    .position(|source| *source == SearchSource::BraveHtml)
+                    .unwrap()
+        );
+    }
+
+    #[test]
+    fn search_source_set_stays_quality_only_without_region_specific_fallbacks() {
+        let names = SearchSource::ALL
+            .iter()
+            .map(|source| source.name())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            names,
+            vec![
+                "bing_html",
+                "brave_html",
+                "duckduckgo_lite",
+                "duckduckgo_html",
+                "duckduckgo_instant_answer"
+            ]
+        );
+        assert!(!names.iter().any(|name| name.contains("cn_bing")));
+        assert!(!names.iter().any(|name| name.contains("sogou")));
+        assert!(!names.iter().any(|name| name.contains("360")));
+        assert!(!names.iter().any(|name| name.contains("baidu")));
     }
 
     #[test]

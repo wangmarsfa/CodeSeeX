@@ -1,4 +1,8 @@
 use crate::app_state::ProxyState;
+use crate::diagnostics::{
+    client_tool_handoff_diagnostic_event, context_compile_diagnostic_event,
+    retry_cache_diagnostic_event, upstream_call_usage_breakdown_event,
+};
 use crate::http_response::{
     json_error, json_response, passthrough_stream_with_completion, response_content_type_json,
     response_from_bytes, response_from_stream,
@@ -28,14 +32,17 @@ use crate::responses::stream_tool_calls::{
     StreamingVisibleToolBridge,
 };
 use crate::responses::usage::{merge_response_usage, response_usage_from_chat_usage};
+use crate::runtime_config::{RuntimeConfigChangeKind, RuntimeConfigChangeSource};
 use crate::text::compact_line;
 use crate::tool_passthrough::ToolContext;
 use crate::tools::chat_protocol::chat_tool_calls_to_assistant_message;
 use crate::tools::coordinator::{complete_chat_with_tools, ToolLoopContext, ToolLoopResult};
-use crate::tools::diagnostics::{attach_tool_loop_warning, ToolLoopDiagnostics};
+use crate::tools::diagnostics::{
+    attach_tool_loop_warning, ToolLoopDiagnostics, MAX_TOOL_LOOP_ITERATIONS,
+};
 use crate::tools::hosted::{
-    execute_code_tools_concurrently, is_code_tool_executable, summarize_tool_result,
-    summarize_tool_result_for_log, tool_fact_line,
+    execute_code_tools_concurrently, is_code_tool_executable, model_replay_tool_result,
+    summarize_tool_result, summarize_tool_result_for_log, tool_fact_line,
 };
 use crate::tools::ownership::ChatToolCall;
 use crate::tools::ownership::{
@@ -49,8 +56,8 @@ use crate::tools::response_items::{
     web_search_call_output_response_item,
 };
 use crate::upstream::payload::{
-    normalize_chat_payload, request_is_lightweight_auxiliary, request_shape_diagnostic,
-    resolve_upstream_model,
+    codex_service_request_kind, normalize_chat_payload, request_is_codex_service,
+    request_shape_diagnostic, resolve_upstream_model, CodexServiceRequestKind,
 };
 use crate::upstream::{codex_request_markers, CodexRequestMarkers};
 use axum::body::{Body, Bytes};
@@ -59,7 +66,7 @@ use axum::http::{header, HeaderMap, Response, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use codeseex_core::context::{redact_inline_data_urls, request_looks_like_codex_full_context};
+use codeseex_core::context::request_looks_like_codex_full_context;
 use codeseex_core::models::available_models;
 use codeseex_core::protocol::ChatMessage;
 use codeseex_core::{AppConfig, UserConfig};
@@ -79,6 +86,7 @@ use tower_http::trace::TraceLayer;
 use uuid::Uuid;
 
 const RESPONSES_BODY_LIMIT_BYTES: usize = 64 * 1024 * 1024;
+const WEB_SEARCH_SOURCE_PROBE_DEBOUNCE_MS: u64 = 5_000;
 
 pub async fn serve(config: AppConfig) -> anyhow::Result<()> {
     serve_with_shutdown(config, std::future::pending::<()>(), || {}).await
@@ -93,10 +101,17 @@ where
     F: Future<Output = ()> + Send + 'static,
     L: FnOnce() + Send + 'static,
 {
-    let store = Store::open(&config.data_dir).await?;
+    let effective_config = {
+        let mut effective = config.clone();
+        if let Ok(user_config) = UserConfig::read_from(&effective.config_path()) {
+            effective.apply_user_config(user_config);
+        }
+        effective
+    };
+    let store = Store::open(&effective_config.data_dir).await?;
     let maintenance = store
         .run_maintenance(
-            UserConfig::read_from(&config.config_path())
+            UserConfig::read_from(&effective_config.config_path())
                 .unwrap_or_default()
                 .log_retention_days(),
         )
@@ -130,15 +145,11 @@ where
             )
             .await;
     }
-    let timeout = std::time::Duration::from_millis(config.upstream.timeout_ms);
-    let state = ProxyState {
-        config: Arc::new(config.clone()),
-        client: crate::network::client(config.network_proxy, timeout)?,
-        store,
-    };
+    let state = ProxyState::new(config.clone(), store);
     let shutdown_store = state.store.clone();
+    state.telemetry.emit_framework_started();
 
-    ensure_catalog(&config)?;
+    ensure_catalog(&effective_config)?;
 
     let app = Router::new()
         .merge(crate::manager_api::router())
@@ -155,32 +166,33 @@ where
                 .allow_methods(Any),
         )
         .layer(TraceLayer::new_for_http())
-        .with_state(state);
+        .with_state(state.clone());
 
-    let listener = match TcpListener::bind((config.host.as_str(), config.port)).await {
-        Ok(listener) => listener,
-        Err(error) => {
-            let _ = shutdown_store
-                .record_event(
-                    "error",
-                    "proxy_start_failed",
-                    "CodeSeeX proxy failed to start.",
-                    Some(&json!({
-                        "host": config.host.clone(),
-                        "port": config.port,
-                        "error": error.to_string()
-                    })),
-                )
-                .await;
-            shutdown_store.close().await;
-            return Err(error.into());
-        }
-    };
+    let listener =
+        match TcpListener::bind((effective_config.host.as_str(), effective_config.port)).await {
+            Ok(listener) => listener,
+            Err(error) => {
+                let _ = shutdown_store
+                    .record_event(
+                        "error",
+                        "proxy_start_failed",
+                        "CodeSeeX proxy failed to start.",
+                        Some(&json!({
+                            "host": effective_config.host.clone(),
+                            "port": effective_config.port,
+                            "error": error.to_string()
+                        })),
+                    )
+                    .await;
+                shutdown_store.close().await;
+                return Err(error.into());
+            }
+        };
     let local_addr = listener.local_addr()?;
-    let listener_base_url = proxy_base_url_for_listener(&config, local_addr);
+    let listener_base_url = proxy_base_url_for_listener(&effective_config, local_addr);
     let listener_detail = json!({
         "base_url": listener_base_url.clone(),
-        "host": config.host.clone(),
+        "host": effective_config.host.clone(),
         "port": local_addr.port()
     });
     tracing::info!("CodeSeeX proxy listening on {}", listener_base_url);
@@ -192,10 +204,26 @@ where
             Some(&listener_detail),
         )
         .await;
+    let config_file_watcher = state
+        .runtime_config
+        .spawn_config_file_watcher(shutdown_store.clone());
+    let system_proxy_watcher = state
+        .runtime_config
+        .spawn_system_proxy_watcher(shutdown_store.clone());
+    let search_source_probe_changes = state.runtime_config.subscribe();
+    let search_source_probe = spawn_web_search_source_probe_subscriber(
+        state.runtime_config.clone(),
+        search_source_probe_changes,
+        shutdown_store.clone(),
+    );
+    state.runtime_config.emit_startup();
     on_listening();
     let result = axum::serve(listener, app)
         .with_graceful_shutdown(shutdown)
         .await;
+    config_file_watcher.abort();
+    system_proxy_watcher.abort();
+    search_source_probe.abort();
     let _ = shutdown_store
         .record_event(
             "info",
@@ -207,6 +235,65 @@ where
     shutdown_store.close().await;
     result?;
     Ok(())
+}
+
+fn spawn_web_search_source_probe_subscriber(
+    runtime_config: crate::runtime_config::RuntimeConfigService,
+    mut changes: tokio::sync::broadcast::Receiver<crate::runtime_config::RuntimeConfigChange>,
+    store: Store,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let debounce = std::time::Duration::from_millis(WEB_SEARCH_SOURCE_PROBE_DEBOUNCE_MS);
+        loop {
+            let Ok(mut change) = changes.recv().await else {
+                break;
+            };
+            if !change.has_kind(RuntimeConfigChangeKind::NetworkProxy)
+                && change.source != RuntimeConfigChangeSource::Startup
+            {
+                continue;
+            }
+            let sleep = tokio::time::sleep(debounce);
+            tokio::pin!(sleep);
+            loop {
+                tokio::select! {
+                    _ = &mut sleep => break,
+                    received = changes.recv() => {
+                        let Ok(next) = received else {
+                            break;
+                        };
+                        if next.has_kind(RuntimeConfigChangeKind::NetworkProxy)
+                            || next.source == RuntimeConfigChangeSource::Startup
+                        {
+                            change = next;
+                            sleep.as_mut().reset(tokio::time::Instant::now() + debounce);
+                        }
+                    }
+                }
+            }
+            let snapshot = runtime_config.snapshot();
+            if change.source != RuntimeConfigChangeSource::Startup
+                && snapshot.network_proxy_signature != change.snapshot.network_proxy_signature
+            {
+                continue;
+            }
+            let diagnostic =
+                crate::tools::web::warm_search_sources(snapshot.config.network_proxy).await;
+            let _ = store
+                .record_event(
+                    "info",
+                    "web_search_source_probe",
+                    "CodeSeeX web_search source probe completed.",
+                    Some(&json!({
+                        "trigger": change.source.label(),
+                        "debounce_ms": WEB_SEARCH_SOURCE_PROBE_DEBOUNCE_MS,
+                        "network_proxy_signature": snapshot.network_proxy_signature,
+                        "diagnostic": diagnostic
+                    })),
+                )
+                .await;
+        }
+    })
 }
 
 fn proxy_base_url_for_listener(config: &AppConfig, local_addr: SocketAddr) -> String {
@@ -222,14 +309,44 @@ fn tool_exposure_diagnostic(
     external_tool_context: &ToolContext,
     upstream_tools: &[Value],
     bridge_decision: &CodexToolSearchBridgeDecision,
+    codeseex_enabled_tools: &[String],
+    codeseex_base_tools_injected: bool,
+    service_kind: CodexServiceRequestKind,
 ) -> Value {
     let upstream_names = upstream_tool_names(upstream_tools);
+    let configurable_tools_disabled_by_config =
+        codeseex_base_tools_injected && codeseex_enabled_tools.is_empty();
+    let expected_codeseex_tools = if codeseex_base_tools_injected {
+        upstream_tool_names(&crate::tools::upstream_tool_definitions(
+            codeseex_enabled_tools,
+        ))
+    } else {
+        Vec::new()
+    };
+    let missing_expected_codeseex_tools = expected_codeseex_tools
+        .iter()
+        .filter_map(|name| {
+            (!upstream_names.iter().any(|upstream| upstream == name)).then(|| name.to_owned())
+        })
+        .collect::<Vec<_>>();
+    let enabled_codeseex_tools_missing = !service_kind.is_service()
+        && codeseex_base_tools_injected
+        && !expected_codeseex_tools.is_empty()
+        && !missing_expected_codeseex_tools.is_empty();
     json!({
         "id": request_id,
         "incoming_tool_items": external_tool_context.request_tool_items(),
         "discovered_tool_items": external_tool_context.discovered_tool_items(),
+        "codeseex_enabled_tools": limited_tool_names(codeseex_enabled_tools.to_vec()),
+        "codeseex_expected_upstream_tools": limited_tool_names(expected_codeseex_tools),
+        "codeseex_base_tools_injected": codeseex_base_tools_injected,
+        "configurable_tools_disabled_by_config": configurable_tools_disabled_by_config,
+        "missing_expected_codeseex_tools": limited_tool_names(missing_expected_codeseex_tools),
+        "warning": enabled_codeseex_tools_missing
+            .then_some("enabled_codeseex_tools_missing_from_upstream_payload"),
         "external_callable_tools": limited_tool_names(external_tool_context.source_names()),
         "external_upstream_tools": limited_tool_names(external_tool_context.upstream_names()),
+        "external_tool_budget": external_tool_context.external_tool_budget_diagnostic(),
         "final_upstream_tools": limited_tool_names(upstream_names.clone()),
         "codex_request_markers": {
             "client_metadata": bridge_decision.markers.client_metadata,
@@ -239,12 +356,54 @@ fn tool_exposure_diagnostic(
         "tool_search_bridge": {
             "injected": bridge_decision.injected,
             "reason": bridge_decision.reason,
+            "suppressed_by_service_kind": service_kind.is_service().then_some(service_kind.label()),
             "has_tool_search_tool": upstream_names.iter().any(|name| name == "tool_search_tool"),
             "has_tool_search": upstream_names.iter().any(|name| name == "tool_search"),
             "upstream_had_tool_search": bridge_decision.upstream_had_tool_search,
             "codex_native_tool_surface": bridge_decision.codex_native_tool_surface
         },
         "interesting_tools": interesting_tool_names(&upstream_names)
+    })
+}
+
+fn service_lifecycle_for_kind(kind: CodexServiceRequestKind) -> Option<&'static str> {
+    kind.is_service().then_some("service_ephemeral")
+}
+
+fn service_completion_diagnostic(kind: CodexServiceRequestKind) -> Option<Value> {
+    kind.is_service().then(|| {
+        json!({
+            "codeseex_lifecycle": "service_ephemeral",
+            "codeseex_service_kind": kind.label()
+        })
+    })
+}
+
+fn service_request_diagnostic(
+    id: &str,
+    endpoint: &str,
+    kind: CodexServiceRequestKind,
+    requested_model: Option<&str>,
+    upstream_model: &str,
+    tools_suppressed: bool,
+    request: &Value,
+) -> Value {
+    let shape = request_shape_diagnostic(request);
+    json!({
+        "id": id,
+        "endpoint": endpoint,
+        "kind": kind.label(),
+        "route": {
+            "requested_model": requested_model,
+            "model": upstream_model
+        },
+        "tools_suppressed": tools_suppressed,
+        "thinking_disabled": true,
+        "lifecycle": "service_ephemeral",
+        "signals": shape.get("service_signals").cloned().unwrap_or(Value::Null),
+        "estimated_text_chars": shape.get("estimated_text_chars").cloned().unwrap_or(Value::Null),
+        "input_items": shape.get("input_items").cloned().unwrap_or(Value::Null),
+        "max_output_tokens": shape.get("max_output_tokens").cloned().unwrap_or(Value::Null)
     })
 }
 
@@ -307,6 +466,14 @@ fn request_has_codex_native_tool_surface(external_tool_context: &ToolContext) ->
     ])
 }
 
+fn should_inject_codeseex_proxy_tools(
+    _request: &Value,
+    suppress_proxy_tools: bool,
+    _external_tool_context: &ToolContext,
+) -> bool {
+    !suppress_proxy_tools
+}
+
 async fn immediate_previous_response_tool_call_ids(
     state: &ProxyState,
     previous: Option<&str>,
@@ -362,7 +529,7 @@ fn codex_tool_search_bridge_decision(
     let codex_native_tool_surface = request_has_codex_native_tool_surface(external_tool_context);
 
     let (injected, reason) = if suppress_proxy_tools {
-        (false, "suppressed_lightweight_auxiliary")
+        (false, "suppressed_service_request")
     } else if upstream_had_tool_search {
         (false, "already_present")
     } else if markers.has_any() {
@@ -407,11 +574,31 @@ async fn chat_completions(
         .get("model")
         .and_then(Value::as_str)
         .map(str::to_owned);
+    let service_kind = codex_service_request_kind(&original_payload);
     normalize_chat_payload(&config, &original_payload, &mut payload);
     let model = payload
         .get("model")
         .and_then(Value::as_str)
         .map(str::to_owned);
+    if service_kind.is_service() {
+        let _ = state
+            .store
+            .record_event(
+                "info",
+                "service_request_diagnostic",
+                "CodeSeeX service request diagnostic.",
+                Some(&service_request_diagnostic(
+                    &id,
+                    "/v1/chat/completions",
+                    service_kind,
+                    requested_model.as_deref(),
+                    model.as_deref().unwrap_or_default(),
+                    true,
+                    &original_payload,
+                )),
+            )
+            .await;
+    }
     if let Err(error) = state
         .store
         .checkpoint_request(&id, None, model.as_deref(), &original_payload)
@@ -454,10 +641,12 @@ async fn chat_completions(
     if let Some(auth) = auth.as_deref() {
         codeseex_core::codex_auth::remember_authorization_header(auth);
     }
+    let client = state.client();
     match crate::upstream::post_chat_completions(
-        &state.client,
+        &client,
         &config.upstream,
         auth.as_deref(),
+        Some(&original_payload),
         payload.clone(),
     )
     .await
@@ -472,8 +661,12 @@ async fn chat_completions(
                     .unwrap_or("")
                     .contains("text/event-stream")
             {
-                let stream =
-                    passthrough_stream_with_completion(response, state.store.clone(), id.clone());
+                let stream = passthrough_stream_with_completion(
+                    response,
+                    state.store.clone(),
+                    id.clone(),
+                    service_completion_diagnostic(service_kind),
+                );
                 let _ = state
                     .store
                     .record_event(
@@ -494,9 +687,15 @@ async fn chat_completions(
                         } else {
                             RequestStatus::Failed
                         };
+                        let completion_diagnostic = service_completion_diagnostic(service_kind);
                         if let Err(error) = state
                             .store
-                            .finish_request(&id, status_to_store, body_json.as_ref(), None)
+                            .finish_request(
+                                &id,
+                                status_to_store,
+                                body_json.as_ref(),
+                                completion_diagnostic.as_ref(),
+                            )
                             .await
                         {
                             if status.is_success() {
@@ -526,7 +725,7 @@ async fn chat_completions(
                                         &id,
                                         requested_model.as_deref(),
                                         model.as_deref(),
-                                        None,
+                                        service_lifecycle_for_kind(service_kind),
                                         body_json.as_ref(),
                                     );
                                     detail["status"] = json!(status.as_u16());
@@ -808,13 +1007,18 @@ async fn responses(
         .get("model")
         .and_then(Value::as_str)
         .map(str::to_owned);
+    let service_kind = codex_service_request_kind(&input);
     let model = response_model_from_input(&config, &input);
     if let Err(response) = ensure_new_response_id(&state, &id, previous).await {
         return response;
     }
-    let previous_resolution = match resolve_previous_response_id(&state, previous).await {
-        Ok(resolution) => resolution,
-        Err(response) => return response,
+    let previous_resolution = if service_kind.is_service() {
+        PreviousResponseResolution::suppressed_service(previous)
+    } else {
+        match resolve_previous_response_id(&state, previous).await {
+            Ok(resolution) => resolution,
+            Err(response) => return response,
+        }
     };
     record_previous_response_resolution_warning(&state, &id, &input, &previous_resolution).await;
     let previous_for_context = previous_resolution.resolved.as_deref();
@@ -877,11 +1081,24 @@ async fn responses(
         "stream": stream_requested
     });
     normalize_chat_payload(&config, &input, &mut payload);
-    let suppress_proxy_tools = request_is_lightweight_auxiliary(&input);
-    let enabled_tools = if suppress_proxy_tools {
-        Vec::new()
-    } else {
+    let suppress_tools_for_service = request_is_codex_service(&input);
+    let mut external_tool_context =
+        crate::tool_passthrough::ToolContext::from_request_tools(input.get("tools"));
+    if !suppress_tools_for_service {
+        let valid_previous_tool_call_ids =
+            immediate_previous_response_tool_call_ids(&state, previous_for_context).await;
+        external_tool_context
+            .add_tool_search_output_tools(input.get("input"), &valid_previous_tool_call_ids);
+    }
+    let inject_codeseex_proxy_tools = should_inject_codeseex_proxy_tools(
+        &input,
+        suppress_tools_for_service,
+        &external_tool_context,
+    );
+    let enabled_tools = if inject_codeseex_proxy_tools {
         enabled_tool_ids(&config)
+    } else {
+        Vec::new()
     };
     let tool_settings = tool_settings(&config);
     let community_tools = crate::community_tools::CommunityToolSet::load(
@@ -889,17 +1106,12 @@ async fn responses(
         &enabled_tools,
         &tool_settings,
     );
-    let mut external_tool_context =
-        crate::tool_passthrough::ToolContext::from_request_tools(input.get("tools"));
-    if !suppress_proxy_tools {
-        let valid_previous_tool_call_ids =
-            immediate_previous_response_tool_call_ids(&state, previous_for_context).await;
-        external_tool_context
-            .add_tool_search_output_tools(input.get("input"), &valid_previous_tool_call_ids);
-    }
-    let tool_search_bridge_decision =
-        codex_tool_search_bridge_decision(&input, suppress_proxy_tools, &external_tool_context);
-    if !suppress_proxy_tools
+    let tool_search_bridge_decision = codex_tool_search_bridge_decision(
+        &input,
+        suppress_tools_for_service,
+        &external_tool_context,
+    );
+    if !suppress_tools_for_service
         && tool_search_bridge_decision.upstream_had_tool_search
         && (tool_search_bridge_decision.markers.has_any()
             || tool_search_bridge_decision.codex_native_tool_surface)
@@ -909,13 +1121,15 @@ async fn responses(
     if tool_search_bridge_decision.injected {
         external_tool_context.ensure_codex_tool_search_bridge();
     }
-    let mut tools = if suppress_proxy_tools {
-        Vec::new()
-    } else {
+    let mut tools = if inject_codeseex_proxy_tools {
         crate::tools::upstream_tool_definitions(&enabled_tools)
+    } else {
+        Vec::new()
     };
-    if !suppress_proxy_tools {
+    if inject_codeseex_proxy_tools {
         tools.extend(community_tools.definitions());
+    }
+    if !suppress_tools_for_service {
         tools.extend(external_tool_context.upstream_tools.clone());
     }
     let tools = dedupe_tool_definitions(tools);
@@ -930,6 +1144,9 @@ async fn responses(
                 &external_tool_context,
                 &tools,
                 &tool_search_bridge_decision,
+                &enabled_tools,
+                inject_codeseex_proxy_tools,
+                service_kind,
             )),
         )
         .await;
@@ -945,12 +1162,33 @@ async fn responses(
         .and_then(Value::as_str)
         .unwrap_or(&model)
         .to_owned();
+    if service_kind.is_service() {
+        let _ = state
+            .store
+            .record_event(
+                "info",
+                "service_request_diagnostic",
+                "CodeSeeX service request diagnostic.",
+                Some(&service_request_diagnostic(
+                    &id,
+                    "/v1/responses",
+                    service_kind,
+                    requested_model.as_deref(),
+                    upstream_model.as_str(),
+                    suppress_tools_for_service,
+                    &input,
+                )),
+            )
+            .await;
+    }
+    let current_turn_messages = if request_looks_like_codex_full_context(&input) {
+        Vec::new()
+    } else {
+        chat_messages_to_values(&built_context.current_messages)
+    };
     if let Err(error) = state
         .store
-        .replace_request_turn_messages(
-            &id,
-            &chat_messages_to_values(&built_context.current_messages),
-        )
+        .replace_request_turn_messages(&id, &current_turn_messages)
         .await
     {
         return json_error(
@@ -990,6 +1228,21 @@ async fn responses(
             })),
         )
         .await;
+    let runtime_context_storage_value = runtime_context_storage.diagnostic();
+    let _ = state
+        .store
+        .record_event(
+            "info",
+            "context_compile_diagnostic",
+            "CodeSeeX context compile diagnostic.",
+            Some(&context_compile_diagnostic_event(
+                &id,
+                &context_diagnostic,
+                &input,
+                &runtime_context_storage_value,
+            )),
+        )
+        .await;
     record_request_shape_diagnostic(
         &state.store,
         &id,
@@ -1007,10 +1260,12 @@ async fn responses(
     if let Some(auth) = auth.as_deref() {
         codeseex_core::codex_auth::remember_authorization_header(auth);
     }
+    let client = state.client();
     match crate::upstream::post_chat_completions(
-        &state.client,
+        &client,
         &config.upstream,
         auth.as_deref(),
+        Some(&input),
         payload.clone(),
     )
     .await
@@ -1025,6 +1280,22 @@ async fn responses(
                         let _ = state
                             .store
                             .finish_request(&id, RequestStatus::Failed, body_json.as_ref(), None)
+                            .await;
+                        let _ = state
+                            .store
+                            .record_event(
+                                "info",
+                                "retry_cache_diagnostic",
+                                "CodeSeeX retry/cache diagnostic.",
+                                Some(&retry_cache_diagnostic_event(
+                                    &id,
+                                    requested_model.as_deref(),
+                                    Some(upstream_model.as_str()),
+                                    &input,
+                                    Some(&payload),
+                                    "upstream_status_failed_initial",
+                                )),
+                            )
                             .await;
                         let _ = state
                             .store
@@ -1052,6 +1323,22 @@ async fn responses(
                         let _ = state
                             .store
                             .record_event(
+                                "info",
+                                "retry_cache_diagnostic",
+                                "CodeSeeX retry/cache diagnostic.",
+                                Some(&retry_cache_diagnostic_event(
+                                    &id,
+                                    requested_model.as_deref(),
+                                    Some(upstream_model.as_str()),
+                                    &input,
+                                    Some(&payload),
+                                    "upstream_body_failed_initial",
+                                )),
+                            )
+                            .await;
+                        let _ = state
+                            .store
+                            .record_event(
                                 "error",
                                 "request_failed",
                                 "Failed to read upstream response body.",
@@ -1075,6 +1362,7 @@ async fn responses(
                 return response_stream_from_chat(StreamingResponseParams {
                     response_id: id,
                     model: model.to_owned(),
+                    requested_model,
                     response,
                     state: state.clone(),
                     config,
@@ -1086,12 +1374,34 @@ async fn responses(
                     external_tool_context,
                     current_image_refs,
                     auto_compaction,
+                    service_kind,
+                    original_request: input,
+                    context_diagnostic,
+                    runtime_context_storage: runtime_context_storage_value,
                 });
             }
             match response.json::<Value>().await {
                 Ok(chat) => {
+                    let _ = state
+                        .store
+                        .record_event(
+                            "info",
+                            "upstream_call_usage_breakdown",
+                            "CodeSeeX upstream call usage breakdown.",
+                            Some(&upstream_call_usage_breakdown_event(
+                                &id,
+                                "non_streaming_initial",
+                                0,
+                                &input,
+                                &payload,
+                                chat.get("usage"),
+                                false,
+                            )),
+                        )
+                        .await;
+                    let client = state.client();
                     let tool_loop_context = ToolLoopContext {
-                        client: &state.client,
+                        client: &client,
                         store: &state.store,
                         config: &config,
                         auth: auth.as_deref(),
@@ -1101,15 +1411,35 @@ async fn responses(
                         community_tools: &community_tools,
                         external_tool_context: &external_tool_context,
                         current_image_refs: &current_image_refs,
+                        original_request: &input,
+                        context_diagnostic: &context_diagnostic,
+                        runtime_context_storage: &runtime_context_storage_value,
+                        requested_model: requested_model.as_deref(),
+                        upstream_model: upstream_model.as_str(),
                     };
                     let tool_loop_result =
                         match complete_chat_with_tools(tool_loop_context, payload, chat).await {
                             Ok(result) => result,
                             Err(error) => {
-                                let detail = json!({ "error": error });
+                                let failed_response = failed_billable_response(
+                                    &id,
+                                    &model,
+                                    "tool_loop_failed",
+                                    &error.message,
+                                    &error.usage,
+                                );
+                                let detail = json!({
+                                    "error": error.message,
+                                    "codeseex_lifecycle": "failed_billable"
+                                });
                                 let _ = state
                                     .store
-                                    .finish_request(&id, RequestStatus::Failed, None, Some(&detail))
+                                    .finish_request(
+                                        &id,
+                                        RequestStatus::Failed,
+                                        Some(&failed_response),
+                                        Some(&detail),
+                                    )
                                     .await;
                                 let _ = state
                                     .store
@@ -1117,13 +1447,13 @@ async fn responses(
                                         "error",
                                         "request_failed",
                                         "Tool execution loop failed.",
-                                        Some(&json!({ "id": id, "error": error })),
+                                        Some(&json!({ "id": id, "error": error.message })),
                                     )
                                     .await;
                                 return json_error(
                                     StatusCode::BAD_GATEWAY,
                                     "tool_loop_failed",
-                                    error,
+                                    error.message,
                                 );
                             }
                         };
@@ -1150,6 +1480,7 @@ async fn responses(
                                 result.chat,
                                 show_thinking_enabled(&config),
                             );
+                            response["usage"] = result.usage;
                             prepend_response_output_items(&mut response, result.response_items);
                             response
                         }
@@ -1164,6 +1495,7 @@ async fn responses(
                                 &external_tool_context,
                                 show_thinking_enabled(&config),
                             );
+                            response["usage"] = result.usage;
                             prepend_response_output_items(&mut response, result.response_items);
                             response
                         }
@@ -1179,8 +1511,11 @@ async fn responses(
                             )
                             .await;
                     }
-                    let completion_diagnostic = client_tool_handoff
-                        .then(|| json!({ "codeseex_lifecycle": "client_tool_handoff" }));
+                    let completion_diagnostic = if client_tool_handoff {
+                        Some(json!({ "codeseex_lifecycle": "client_tool_handoff" }))
+                    } else {
+                        service_completion_diagnostic(service_kind)
+                    };
                     if let Err(error) = state
                         .store
                         .finish_request(
@@ -1197,7 +1532,11 @@ async fn responses(
                             error.to_string(),
                         );
                     }
-                    let lifecycle = client_tool_handoff.then_some("client_tool_handoff");
+                    let lifecycle = if client_tool_handoff {
+                        Some("client_tool_handoff")
+                    } else {
+                        service_lifecycle_for_kind(service_kind)
+                    };
                     let _ = state
                         .store
                         .record_event(
@@ -1246,6 +1585,22 @@ async fn responses(
             let _ = state
                 .store
                 .finish_request(&id, RequestStatus::Failed, None, Some(&detail))
+                .await;
+            let _ = state
+                .store
+                .record_event(
+                    "info",
+                    "retry_cache_diagnostic",
+                    "CodeSeeX retry/cache diagnostic.",
+                    Some(&retry_cache_diagnostic_event(
+                        &id,
+                        requested_model.as_deref(),
+                        Some(upstream_model.as_str()),
+                        &input,
+                        Some(&payload),
+                        "upstream_connection_failed_initial",
+                    )),
+                )
                 .await;
             let _ = state
                 .store
@@ -1367,6 +1722,30 @@ fn response_usage_for_log(response: &Value) -> Option<&Value> {
         .or_else(|| response.pointer("/choices/0/usage"))
 }
 
+fn failed_billable_response(
+    id: &str,
+    model: &str,
+    code: &str,
+    message: &str,
+    usage: &Value,
+) -> Value {
+    json!({
+        "id": id,
+        "object": "response",
+        "created_at": now_seconds(),
+        "model": model,
+        "status": "failed",
+        "error": {
+            "code": code,
+            "message": message
+        },
+        "incomplete_details": Value::Null,
+        "parallel_tool_calls": true,
+        "output": [],
+        "usage": usage
+    })
+}
+
 fn usage_u64(usage: &Value, keys: &[&str]) -> Option<u64> {
     keys.iter()
         .filter_map(|key| usage.get(*key))
@@ -1475,6 +1854,16 @@ impl PreviousResponseResolution {
             warning: Some(
                 "previous_response_id is not completed; local history replay was skipped",
             ),
+        }
+    }
+
+    fn suppressed_service(previous: Option<&str>) -> Self {
+        Self {
+            requested: previous.map(str::to_owned),
+            resolved: None,
+            kind: "suppressed_service",
+            status: None,
+            warning: None,
         }
     }
 
@@ -1928,6 +2317,7 @@ fn external_client_tool_sse_events(
 struct StreamingResponseParams {
     response_id: String,
     model: String,
+    requested_model: Option<String>,
     response: reqwest::Response,
     state: ProxyState,
     config: AppConfig,
@@ -1939,6 +2329,10 @@ struct StreamingResponseParams {
     external_tool_context: crate::tool_passthrough::ToolContext,
     current_image_refs: Vec<String>,
     auto_compaction: Option<Value>,
+    service_kind: CodexServiceRequestKind,
+    original_request: Value,
+    context_diagnostic: Value,
+    runtime_context_storage: Value,
 }
 
 type StreamingCancellationMap = BTreeMap<String, StreamingCancellation>;
@@ -2038,6 +2432,7 @@ fn response_stream_from_chat(params: StreamingResponseParams) -> axum::response:
     let StreamingResponseParams {
         response_id,
         model,
+        requested_model,
         response,
         state,
         config,
@@ -2049,6 +2444,10 @@ fn response_stream_from_chat(params: StreamingResponseParams) -> axum::response:
         external_tool_context,
         current_image_refs,
         auto_compaction,
+        service_kind,
+        original_request,
+        context_diagnostic,
+        runtime_context_storage,
     } = params;
     let cancelled = register_streaming_response(&response_id);
     let guard = StreamingRequestGuard {
@@ -2077,6 +2476,7 @@ fn response_stream_from_chat(params: StreamingResponseParams) -> axum::response:
             let mut output_index = 0_u64;
             let mut output = Vec::new();
             let mut usage = response_usage_from_chat_usage(None);
+            let mut current_payload = payload.clone();
             let mut next_response = Some(response);
             stop_if_cancelled!("response cancelled before streaming started");
             yield sse_bytes("response.created", json!({
@@ -2131,6 +2531,7 @@ fn response_stream_from_chat(params: StreamingResponseParams) -> axum::response:
                 let mut tool_states: BTreeMap<u64, StreamingToolCallState> = BTreeMap::new();
                 let mut visible_tool_bridge = StreamingVisibleToolBridge::default();
                 let mut upstream = response.bytes_stream();
+                let mut iteration_usage = response_usage_from_chat_usage(None);
 
                 macro_rules! close_reasoning_if_needed {
                     () => {{
@@ -2236,10 +2637,9 @@ fn response_stream_from_chat(params: StreamingResponseParams) -> axum::response:
                         }
                         let Ok(parsed) = serde_json::from_str::<Value>(&data) else { continue };
                         if let Some(next_usage) = parsed.get("usage") {
-                            usage = merge_response_usage(
-                                &usage,
-                                &response_usage_from_chat_usage(Some(next_usage)),
-                            );
+                            let parsed_usage = response_usage_from_chat_usage(Some(next_usage));
+                            iteration_usage = merge_response_usage(&iteration_usage, &parsed_usage);
+                            usage = merge_response_usage(&usage, &parsed_usage);
                         }
                         let delta = parsed.pointer("/choices/0/delta").cloned().unwrap_or(Value::Null);
                         if let Some(reasoning) = delta
@@ -2393,6 +2793,23 @@ fn response_stream_from_chat(params: StreamingResponseParams) -> axum::response:
                 }
 
                 stop_if_cancelled!("response cancelled after upstream stream");
+                let _ = state
+                    .store
+                    .record_event(
+                        "info",
+                        "upstream_call_usage_breakdown",
+                        "CodeSeeX upstream call usage breakdown.",
+                        Some(&upstream_call_usage_breakdown_event(
+                            &response_id,
+                            "streaming_iteration",
+                            iteration,
+                            &original_request,
+                            &current_payload,
+                            Some(&iteration_usage),
+                            false,
+                        )),
+                    )
+                    .await;
                 let tool_calls = streaming_tool_calls(tool_states);
                 let message_phase = if tool_calls.is_empty() {
                     "final_answer"
@@ -2518,7 +2935,16 @@ fn response_stream_from_chat(params: StreamingResponseParams) -> axum::response:
                         "output": output,
                         "usage": usage
                     });
-                    let _ = state.store.finish_request(&response_id, RequestStatus::Completed, Some(&final_response), None).await;
+                    let completion_diagnostic = service_completion_diagnostic(service_kind);
+                    let _ = state
+                        .store
+                        .finish_request(
+                            &response_id,
+                            RequestStatus::Completed,
+                            Some(&final_response),
+                            completion_diagnostic.as_ref(),
+                        )
+                        .await;
                     let _ = state
                         .store
                         .record_event(
@@ -2532,7 +2958,7 @@ fn response_stream_from_chat(params: StreamingResponseParams) -> axum::response:
                                     .get("model")
                                     .and_then(Value::as_str)
                                     .or(Some(model.as_str())),
-                                None,
+                                service_lifecycle_for_kind(service_kind),
                                 Some(&final_response),
                             )),
                         )
@@ -2655,6 +3081,24 @@ fn response_stream_from_chat(params: StreamingResponseParams) -> axum::response:
                     });
                     let diagnostic = json!({ "codeseex_lifecycle": "client_tool_handoff" });
                     let _ = state.store.finish_request(&response_id, RequestStatus::Completed, Some(&final_response), Some(&diagnostic)).await;
+                    let _ = state
+                        .store
+                        .record_event(
+                            "info",
+                            "client_tool_handoff_diagnostic",
+                            "CodeSeeX client tool handoff diagnostic.",
+                            Some(&client_tool_handoff_diagnostic_event(
+                                &response_id,
+                                "streaming_tool_loop",
+                                iteration,
+                                &original_request,
+                                &context_diagnostic,
+                                &runtime_context_storage,
+                                Some(&partition),
+                                Some(&usage),
+                            )),
+                        )
+                        .await;
                     let _ = state
                         .store
                         .record_event(
@@ -2782,9 +3226,10 @@ fn response_stream_from_chat(params: StreamingResponseParams) -> axum::response:
                         )
                         .await;
                 }
+                let client = state.client();
                 let executed_tools = tokio::select! {
                     result = execute_code_tools_concurrently(
-                        &state.client,
+                        &client,
                         &config,
                         &tool_execution_context,
                         &message_snapshot,
@@ -2800,6 +3245,7 @@ fn response_stream_from_chat(params: StreamingResponseParams) -> axum::response:
                     return;
                 };
                 let mut tool_messages = Vec::new();
+                let mut repeated_failure_error = None;
                 for executed in executed_tools {
                     let call = executed.call;
                     let mut result = executed.result;
@@ -2821,8 +3267,9 @@ fn response_stream_from_chat(params: StreamingResponseParams) -> axum::response:
                             )
                             .await;
                     }
-                    let result_text = serde_json::to_string(&result).unwrap_or_else(|_| "{}".to_owned());
-                    let result_text = redact_inline_data_urls(&result_text);
+                    let repeated_error = tool_loop_diagnostics
+                        .record_tool_result_and_repeated_failure(&call, &result);
+                    let result_text = model_replay_tool_result(&call, &result);
                     let fact = tool_fact_line(&call, &result);
                     if let Err(error) = state.store.append_request_tool_fact(&response_id, &fact).await {
                         let message = format!("failed to persist tool fact: {error}");
@@ -2844,7 +3291,8 @@ fn response_stream_from_chat(params: StreamingResponseParams) -> axum::response:
                                 "name": call.name,
                                 "iteration": iteration + 1,
                                 "ok": result.get("ok").and_then(Value::as_bool),
-                                "summary": summarize_tool_result_for_log(&result)
+                                "summary": summarize_tool_result_for_log(&result),
+                                "result_size": crate::diagnostics::tool_result_size_summary(&result)
                             })),
                         )
                         .await;
@@ -2868,6 +3316,9 @@ fn response_stream_from_chat(params: StreamingResponseParams) -> axum::response:
                         "content": result_text
                     });
                     tool_messages.push(tool_message.clone());
+                    if let Some(error) = repeated_error {
+                        repeated_failure_error = Some(error);
+                    }
                     if let Some(messages) = payload.get_mut("messages").and_then(Value::as_array_mut) {
                         messages.push(tool_message);
                     } else {
@@ -2893,6 +3344,68 @@ fn response_stream_from_chat(params: StreamingResponseParams) -> axum::response:
                     return;
                 }
                 stop_if_cancelled!("response cancelled after tool turn message persistence");
+                if let Some(error) = repeated_failure_error {
+                    let failed_response = failed_billable_response(
+                        &response_id,
+                        &model,
+                        "tool_loop_repeated_failure",
+                        &error,
+                        &usage,
+                    );
+                    let detail = json!({
+                        "error": error,
+                        "codeseex_lifecycle": "failed_billable"
+                    });
+                    let _ = state.store.finish_request(&response_id, RequestStatus::Failed, Some(&failed_response), Some(&detail)).await;
+                    let _ = state
+                        .store
+                        .record_event(
+                            "warn",
+                            "tool_loop_repeated_failure_stopped",
+                            "CodeSeeX stopped repeated failing streaming tool calls.",
+                            Some(&json!({
+                                "id": response_id,
+                                "iteration": iteration + 1,
+                                "error": error
+                            })),
+                        )
+                        .await;
+                    yield stream_failed_event(&response_id, &model, created_at, &mut sequence, "tool_loop_repeated_failure", &error);
+                    yield Bytes::from_static(b"data: [DONE]\n\n");
+                    return;
+                }
+                if completed_tool_iterations + 1 >= MAX_TOOL_LOOP_ITERATIONS {
+                    let error = tool_loop_diagnostics.iteration_limit_error();
+                    let failed_response = failed_billable_response(
+                        &response_id,
+                        &model,
+                        "tool_loop_iteration_limit",
+                        &error,
+                        &usage,
+                    );
+                    let detail = json!({
+                        "error": error,
+                        "codeseex_lifecycle": "failed_billable"
+                    });
+                    let _ = state.store.finish_request(&response_id, RequestStatus::Failed, Some(&failed_response), Some(&detail)).await;
+                    let _ = state
+                        .store
+                        .record_event(
+                            "warn",
+                            "tool_loop_iteration_limit_stopped",
+                            "CodeSeeX stopped a streaming tool loop that exceeded the iteration limit.",
+                            Some(&json!({
+                                "id": response_id,
+                                "iteration": completed_tool_iterations + 1,
+                                "limit": MAX_TOOL_LOOP_ITERATIONS,
+                                "error": error
+                            })),
+                        )
+                        .await;
+                    yield stream_failed_event(&response_id, &model, created_at, &mut sequence, "tool_loop_iteration_limit", &error);
+                    yield Bytes::from_static(b"data: [DONE]\n\n");
+                    return;
+                }
 
                 if has_client_tools {
                     stop_if_cancelled!("response cancelled before native/external handoff");
@@ -2938,6 +3451,24 @@ fn response_stream_from_chat(params: StreamingResponseParams) -> axum::response:
                         .store
                         .record_event(
                             "info",
+                            "client_tool_handoff_diagnostic",
+                            "CodeSeeX client tool handoff diagnostic.",
+                            Some(&client_tool_handoff_diagnostic_event(
+                                &response_id,
+                                "streaming_tool_loop",
+                                iteration,
+                                &original_request,
+                                &context_diagnostic,
+                                &runtime_context_storage,
+                                Some(&partition),
+                                Some(&usage),
+                            )),
+                        )
+                        .await;
+                    let _ = state
+                        .store
+                        .record_event(
+                            "info",
                             "request_completed",
                             "Streaming response completed.",
                             Some(&request_completed_detail(
@@ -2963,12 +3494,15 @@ fn response_stream_from_chat(params: StreamingResponseParams) -> axum::response:
 
                 completed_tool_iterations += 1;
                 stop_if_cancelled!("response cancelled before upstream continuation");
+                current_payload = payload.clone();
+                let client = state.client();
                 let next_chat = tokio::select! {
                     result = crate::upstream::post_chat_completions(
-                        &state.client,
+                        &client,
                         &config.upstream,
                         auth.as_deref(),
-                        payload.clone(),
+                        Some(&original_request),
+                        current_payload.clone(),
                     ) => Some(result),
                     _ = cancelled.cancelled() => None,
                 };
@@ -2987,6 +3521,22 @@ fn response_stream_from_chat(params: StreamingResponseParams) -> axum::response:
                         let message = format!("upstream returned {status} after streaming tool execution: {body}");
                         let detail = json!({ "error": message });
                         let _ = state.store.finish_request(&response_id, RequestStatus::Failed, None, Some(&detail)).await;
+                        let _ = state
+                            .store
+                            .record_event(
+                                "info",
+                                "retry_cache_diagnostic",
+                                "CodeSeeX retry/cache diagnostic.",
+                                Some(&retry_cache_diagnostic_event(
+                                    &response_id,
+                                    requested_model.as_deref(),
+                                    Some(model.as_str()),
+                                    &original_request,
+                                    Some(&current_payload),
+                                    "streaming_upstream_status_failed_after_tool",
+                                )),
+                            )
+                            .await;
                         yield stream_failed_event(&response_id, &model, created_at, &mut sequence, "upstream_after_tool_failed", &message);
                         yield Bytes::from_static(b"data: [DONE]\n\n");
                         return;
@@ -2995,6 +3545,22 @@ fn response_stream_from_chat(params: StreamingResponseParams) -> axum::response:
                         let message = error.to_string();
                         let detail = json!({ "error": message });
                         let _ = state.store.finish_request(&response_id, RequestStatus::Failed, None, Some(&detail)).await;
+                        let _ = state
+                            .store
+                            .record_event(
+                                "info",
+                                "retry_cache_diagnostic",
+                                "CodeSeeX retry/cache diagnostic.",
+                                Some(&retry_cache_diagnostic_event(
+                                    &response_id,
+                                    requested_model.as_deref(),
+                                    Some(model.as_str()),
+                                    &original_request,
+                                    Some(&current_payload),
+                                    "streaming_upstream_connection_failed_after_tool",
+                                )),
+                            )
+                            .await;
                         yield stream_failed_event(&response_id, &model, created_at, &mut sequence, "upstream_connection_failed", &message);
                         yield Bytes::from_static(b"data: [DONE]\n\n");
                         return;

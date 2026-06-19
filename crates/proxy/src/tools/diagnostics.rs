@@ -2,9 +2,12 @@ use crate::tools::ownership::{ChatToolCall, ToolCallPartition};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
+pub(crate) const MAX_TOOL_LOOP_ITERATIONS: u32 = 8;
+
 #[derive(Debug, Default)]
 pub(crate) struct ToolLoopDiagnostics {
     seen_signatures: BTreeMap<String, u32>,
+    consecutive_failures_by_name: BTreeMap<String, u32>,
 }
 
 impl ToolLoopDiagnostics {
@@ -55,6 +58,47 @@ impl ToolLoopDiagnostics {
         Some(format!(
             "CodeSeeX noticed this exact tool call has repeated {repeat_count} times in the same response. Reuse the existing returned evidence when possible instead of repeating the same call again."
         ))
+    }
+
+    pub(crate) fn record_tool_result_and_repeated_failure(
+        &mut self,
+        call: &ChatToolCall,
+        result: &Value,
+    ) -> Option<String> {
+        let failed = result.get("ok").and_then(Value::as_bool) == Some(false)
+            || result.get("error").is_some();
+        if !failed {
+            self.consecutive_failures_by_name
+                .insert(call.name.clone(), 0);
+            return None;
+        }
+        let failures = self
+            .consecutive_failures_by_name
+            .entry(call.name.clone())
+            .or_insert(0);
+        *failures = failures.saturating_add(1);
+        let threshold = consecutive_failure_threshold(&call.name);
+        if *failures < threshold {
+            return None;
+        }
+        Some(format!(
+            "Tool '{}' failed {failures} consecutive times in one response. CodeSeeX stopped the loop to avoid burning tokens on repeated failing tool retries.",
+            call.name,
+        ))
+    }
+
+    pub(crate) fn iteration_limit_error(&self) -> String {
+        format!(
+            "Tool loop exceeded {MAX_TOOL_LOOP_ITERATIONS} iterations in one response. CodeSeeX stopped the loop to avoid unbounded tool execution and upstream token usage."
+        )
+    }
+}
+
+fn consecutive_failure_threshold(tool_name: &str) -> u32 {
+    if tool_name == "web_search" {
+        2
+    } else {
+        3
     }
 }
 

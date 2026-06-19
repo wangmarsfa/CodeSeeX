@@ -1,0 +1,20 @@
+.billing-rate-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; width: 100%; }
+.billing-rate-card { display: flex; flex-direction: column; gap: 12px; padding: 14px; border: 1px solid var(--border-color); border-radius: var(--radius-md); background: var(--bg-panel); transition: var(--theme-transition); }
+.billing-card-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; min-width: 0; }
+.billing-model-meta { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.billing-model-meta strong { font-size: 14px; line-height: 1.2; color: var(--text-main); }
+.billing-model-meta .muted { font-size: 12px; line-height: 1.35; }
+.billing-model-badge { flex: none; display: inline-flex; align-items: center; min-height: 24px; padding: 3px 9px; border: 1px solid var(--border-color); border-radius: var(--radius-sm); color: var(--text-secondary); background: var(--hover-bg); font-size: 11px; font-weight: 700; letter-spacing: 0.02em; transition: var(--theme-transition); }
+.billing-row { display: grid; grid-template-columns: 1fr; gap: 8px; width: 100%; }
+.billing-field { display: grid; grid-template-columns: minmax(112px, 1fr) minmax(76px, 88px) auto; align-items: center; border: 1px solid var(--border-color); border-radius: var(--radius-sm); background: var(--hover-bg); overflow: hidden; transition: var(--theme-transition); }
+.billing-field:focus-within { border-color: var(--info); box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.1); }
+.billing-prefix, .billing-suffix { padding: 8px 10px; color: var(--text-secondary); font-size: 12px; font-weight: 500; white-space: nowrap; transition: var(--theme-transition); }
+.billing-prefix { border-right: 1px solid var(--border-color); }
+.billing-suffix { border-left: 1px solid var(--border-color); }
+.billing-field input { border: none; padding: 8px 10px; width: 100%; min-width: 0; outline: none; font-size: 13px; color: var(--text-main); background: var(--bg-panel); text-align: right; font-variant-numeric: tabular-nums; transition: var(--theme-transition); }
+.billing-field input[type="number"]::-webkit-inner-spin-button, .billing-field input[type="number"]::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
+.billing-field input[type="number"] { -moz-appearance: textfield; }
+
+@media (max-width: 1024px) {
+  .billing-rate-grid { grid-template-columns: 1fr; }
+}

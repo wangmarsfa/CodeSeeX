@@ -206,11 +206,18 @@ async function loadI18n(targetLanguage) {
       : [];
     renderLanguageOptions();
     const languageId = resolveLanguageId(targetLanguage);
-    const pack = await fetchLanguagePack(languageId);
+    const [fallbackPack, pack] = await Promise.all([
+      languageId === FALLBACK_LANGUAGE ? Promise.resolve(null) : fetchLanguagePack(FALLBACK_LANGUAGE),
+      fetchLanguagePack(languageId),
+    ]);
     if (pack) languages = mergeLanguageName(languages, languageId, pack.languageName || languageId);
     uiLanguage = languageId;
     configuredLanguage = normalizeConfiguredLanguageId(targetLanguage);
-    i18n = pack ? { [languageId]: pack } : {};
+    i18n = Object.assign(
+      {},
+      fallbackPack ? { [FALLBACK_LANGUAGE]: fallbackPack } : {},
+      pack ? { [languageId]: pack } : {},
+    );
     renderLanguageOptions();
     return i18n;
   } catch {
@@ -1765,8 +1772,11 @@ function isTruthy(value) {
 
 function renderUsage(runtime) {
   const started = performance.now();
-  const billable = Array.isArray(runtime.billable_history) ? runtime.billable_history : null;
-  const turns = billable || (Array.isArray(runtime.turn_history) ? runtime.turn_history : []);
+  const billable = Array.isArray(runtime.billable_history) ? runtime.billable_history : [];
+  const fallbackTurns = billable.length ? billable : (Array.isArray(runtime.turn_history) ? runtime.turn_history : []);
+  const sessions = Array.isArray(runtime.usage_sessions)
+    ? runtime.usage_sessions
+    : usageSessionsFromTurns(fallbackTurns);
   const usageSignature = stableStringify({
     locale: uiLanguage,
     billing: currentBillingSignature(),
@@ -1774,140 +1784,211 @@ function renderUsage(runtime) {
     total_cache_miss_input_tokens: runtime.total_cache_miss_input_tokens || 0,
     total_output_tokens: runtime.total_output_tokens || 0,
     billable_request_count: runtime.billable_request_count || 0,
-    turn_ids: turns.map((turn) => [
-      turn.id || "",
-      turn.completed_at || "",
-      turn.model || "",
-      turn.requested_model || "",
-      turn.lifecycle || "",
-      turn.conversation_turn ? 1 : 0,
-      turn.billable ? 1 : 0,
-      turn.cached_input_tokens || 0,
-      turn.cache_miss_input_tokens || 0,
-      turn.output_tokens || 0,
-      turn.total_tokens || 0,
-      turn.request_ms || 0,
+    sessions: sessions.map((session) => [
+      session.id || "",
+      session.completed_at || "",
+      session.title || "",
+      session.title_source || "",
+      session.status || "",
+      session.cached_input_tokens || 0,
+      session.cache_miss_input_tokens || 0,
+      session.output_tokens || 0,
+      session.total_tokens || 0,
+      session.request_ms || 0,
+      (session.segments || []).map((segment) => [
+        segment.id || "",
+        segment.kind || "",
+        segment.label || "",
+        segment.hint || "",
+        segment.model || "",
+        segment.reasoning_effort || "",
+        segment.tool_name || "",
+        segment.iteration || 0,
+        segment.status || "",
+        segment.cached_input_tokens || 0,
+        segment.cache_miss_input_tokens || 0,
+        segment.output_tokens || 0,
+        segment.total_tokens || 0,
+        segment.request_ms || 0,
+        (segment.rows || []).map((row) => row.id || ""),
+      ]),
+      (session.rows || []).map((row) => [
+        row.id || "",
+        row.kind || "",
+        row.model || "",
+        row.reasoning_effort || "",
+        row.lifecycle || "",
+        row.cached_input_tokens || 0,
+        row.cache_miss_input_tokens || 0,
+        row.output_tokens || 0,
+        row.total_tokens || 0,
+        row.request_ms || 0,
+      ]),
     ]),
   });
   if (usageSignature === lastUsageSignature) return;
   lastUsageSignature = usageSignature;
-  const totalTurnsCount = turns.length;
-  const avgMs = average(turns.map((turn) => turn.request_ms || 0).filter((value) => value > 0));
+  const totalTurnsCount = fallbackTurns.length;
+  const avgMs = average(billable.map((turn) => turn.request_ms || 0).filter((value) => value > 0));
   const totalCached = runtime.total_cached_input_tokens || 0;
   const totalMiss = runtime.total_cache_miss_input_tokens || 0;
   const cacheHitRate = usageCacheHitRate(totalCached, totalMiss);
-  const totalCostVal = turns.reduce((sum, turn) => sum + costForTokens(turn), 0);
+  const totalCostVal = billable.reduce((sum, turn) => sum + costForTokens(turn), 0);
 
   els.usageTotalTurns.textContent = formatNumber(totalTurnsCount);
   els.usageCacheHitRate.textContent = cacheHitRate;
+  els.usageCacheHitRate.className = ["usage-metric-value", "selectable", usageCacheToneClass(totalCached, totalMiss)].filter(Boolean).join(" ");
   els.usageAverageMs.textContent = formatDuration(avgMs);
   els.usageTotalCost.textContent = formatCost(totalCostVal);
-  renderUsageRows(turns);
+  renderUsageRows(sessions);
   noteSlow("renderUsage", performance.now() - started);
 }
 
-function renderUsageRows(turns) {
+function usageSessionsFromTurns(turns) {
+  return turns.map((turn) => {
+    const kind = usageTurnKind(turn, turn && turn.conversation_turn !== false);
+    const row = {
+      id: turn.id,
+      kind,
+      label: usageRecordTitle(turn),
+      hint: turn.lifecycle || "",
+      model: turn.model,
+      requested_model: turn.requested_model,
+      reasoning_effort: turn.reasoning_effort || "",
+      lifecycle: turn.lifecycle,
+      status: turn.lifecycle === "failed_billable" ? "failed" : "completed",
+      billable: turn.billable,
+      cached_input_tokens: turn.cached_input_tokens || 0,
+      cache_miss_input_tokens: turn.cache_miss_input_tokens || 0,
+      output_tokens: turn.output_tokens || 0,
+      total_tokens: turn.total_tokens || 0,
+      request_ms: turn.request_ms || 0,
+    };
+    return {
+      id: turn.id,
+      title: usageRecordTitle(turn),
+      title_source: "localized",
+      completed_at: turn.completed_at,
+      conversation_turn: turn.conversation_turn,
+      status: row.status,
+      cached_input_tokens: row.cached_input_tokens,
+      cache_miss_input_tokens: row.cache_miss_input_tokens,
+      output_tokens: row.output_tokens,
+      total_tokens: row.total_tokens,
+      request_ms: row.request_ms,
+      rows: [row],
+      segments: [{
+        ...row,
+        tool_name: null,
+        iteration: null,
+        summary: null,
+        completed_at: turn.completed_at,
+        rows: [row],
+      }],
+      technical_details: [
+        { label: "request id", value: turn.id || "-" },
+        { label: "lifecycle", value: turn.lifecycle || "-" },
+      ],
+    };
+  });
+}
+
+function renderUsageRows(sessions) {
   els.usageRows.replaceChildren();
-  if (turns.length === 0) {
+  if (sessions.length === 0) {
     const empty = document.createElement("div");
     empty.className = "usage-empty";
     empty.textContent = t("noRows");
     els.usageRows.appendChild(empty);
     return;
   }
-  for (const turn of turns.slice().reverse()) {
-    els.usageRows.appendChild(usageRecord(turn));
+  for (const session of sessions.slice().reverse()) {
+    els.usageRows.appendChild(usageRecord(session));
   }
 }
 
-function usageRecord(turn) {
+function usageRecord(session) {
   const details = document.createElement("details");
   details.className = "usage-record";
   const summary = document.createElement("summary");
-  const modelLabel = usageModelLabel(turn);
-  const totalCost = formatCost(costForTokens(turn));
-  const cachedTokens = Number(turn.cached_input_tokens || 0);
-  const missTokens = Number(turn.cache_miss_input_tokens || 0);
+  summary.className = "usage-grid-spec";
+  const totalCost = formatCost(costForSession(session));
+  const cachedTokens = Number(session.cached_input_tokens || 0);
+  const missTokens = Number(session.cache_miss_input_tokens || 0);
   const inputTokens = cachedTokens + missTokens;
   const cacheHitRate = usageCacheHitRate(cachedTokens, missTokens);
-  summary.appendChild(usageTitle(usageRecordTitle(turn), [
-    formatDateTime(turn.completed_at),
-  ].filter(Boolean).join(" · ")));
-  [
-    [t("elapsed"), formatDuration(turn.request_ms)],
-    [t("total"), formatNumber(turn.total_tokens)],
-    [t("usageCacheHitRateShort"), cacheHitRate],
-    [t("cost"), totalCost],
-  ].forEach(([label, value]) => summary.appendChild(usageMetric(label, value)));
+  summary.append(
+    usageTitleCell(usageSessionTitle(session), usageRelativeDateTime(session.completed_at)),
+    usageValueCell(formatDuration(session.request_ms), "muted"),
+    usageValueCell(formatNumber(inputTokens)),
+    usageValueCell(formatNumber(session.output_tokens || 0)),
+    usageValueCell(cacheHitRate, usageCacheToneClass(cachedTokens, missTokens)),
+    usageValueCell(totalCost),
+  );
   details.appendChild(summary);
   details.addEventListener("toggle", () => {
     if (!details.open || details.dataset.rendered === "true") return;
-    details.appendChild(usageRecordBody(turn, modelLabel, totalCost, cachedTokens, missTokens));
+    details.appendChild(usageRecordBody(session));
     details.dataset.rendered = "true";
   });
   return details;
 }
 
+function usageSessionTitle(session) {
+  const title = String(session && session.title || "").trim();
+  if (session && session.conversation_turn === false) {
+    return usageSemanticText(title || "service_request");
+  }
+  if (title && (session.title_source === "semantic" || session.title_source === "localized")) {
+    return usageSemanticText(title);
+  }
+  if (title) return title;
+  return session && session.conversation_turn === false ? t("usageIntermediateReply") : t("usageConversationRecord");
+}
+
 function usageRecordTitle(turn) {
+  if (turn && turn.lifecycle === "service_ephemeral") return t("usageServiceRequest");
+  if (turn && turn.lifecycle === "failed_billable") return t("usageFailedBillable");
   if (turn && turn.conversation_turn === false) return t("usageIntermediateReply");
   return t("usageConversationRecord");
 }
 
-function usageRecordBody(turn, modelLabel, totalCost, cachedTokens, missTokens) {
+function usageTurnKind(turn, isFinal) {
+  if (isFinal) return "final_reply";
+  if (turn && turn.lifecycle === "service_ephemeral") return "service";
+  if (turn && turn.lifecycle === "failed_billable") return "failed_reply";
+  return "intermediate_reply";
+}
+
+function usageRecordBody(session) {
   const body = document.createElement("div");
-  body.className = "usage-record-body";
-  const detailHead = document.createElement("div");
-  detailHead.className = "usage-detail-head";
-  const detailTitle = document.createElement("strong");
-  detailTitle.textContent = t("usageReplyDetails");
-  const chips = document.createElement("div");
-  chips.className = "usage-detail-chips";
-  chips.append(
-    usageChip(modelLabel),
-    usageChip(t("usageStatusCompleted"), "ok"),
-    usageChip(t("usageCacheHitRateShort") + " " + usageCacheHitRate(cachedTokens, missTokens)),
-  );
-  detailHead.append(detailTitle, chips);
-  body.appendChild(detailHead);
-
-  const list = document.createElement("div");
-  list.className = "usage-reply-list";
-  list.appendChild(usageReplyHeader());
-  usageIntermediateRows(turn, modelLabel, totalCost, cachedTokens, missTokens).forEach((row) => {
-    list.appendChild(usageReplyRow(row));
+  body.className = "usage-trace-pure-container";
+  const segments = usageSegmentsForRender(session);
+  segments.forEach((segment) => {
+    body.appendChild(usageSegmentRow(segment));
   });
-  body.appendChild(list);
-
-  body.appendChild(usageTechDetails([
-    [t("requestId"), turn.id || "-"],
-    [t("completedAt"), formatDateTime(turn.completed_at)],
-    [t("actualModel"), turn.model || "-"],
-    [t("requestedModel"), turn.requested_model || "-"],
-    [t("usageCacheHitRateShort"), usageCacheHitRate(cachedTokens, missTokens)],
-  ]));
   return body;
 }
 
-function usageTitle(title, subtitle) {
+function usageTitleCell(title, subtitle) {
   const wrap = document.createElement("div");
-  wrap.className = "usage-record-title";
-  const strong = document.createElement("strong");
-  strong.textContent = title;
-  const span = document.createElement("span");
-  span.textContent = subtitle || "-";
-  wrap.append(strong, span);
+  wrap.className = "usage-title-cell";
+  const text = document.createElement("span");
+  text.className = "usage-record-title-text";
+  text.textContent = title || "-";
+  const time = document.createElement("span");
+  time.className = "usage-record-meta-time";
+  time.textContent = subtitle || "-";
+  wrap.append(text, time);
   return wrap;
 }
 
-function usageMetric(label, value) {
-  const wrap = document.createElement("div");
-  wrap.className = "usage-metric";
-  const span = document.createElement("span");
-  span.textContent = label;
-  const strong = document.createElement("strong");
-  strong.textContent = value || "-";
-  wrap.append(span, strong);
-  return wrap;
+function usageValueCell(value, tone) {
+  const span = document.createElement("div");
+  span.className = ["usage-cell-value", "text-right", tone || ""].filter(Boolean).join(" ");
+  span.textContent = value || "-";
+  span.title = span.textContent;
+  return span;
 }
 
 function usageModelLabel(turn) {
@@ -1925,155 +2006,282 @@ function usageCacheHitRate(cachedTokens, missTokens) {
   return (Number.isInteger(rate) ? rate.toFixed(0) : rate.toFixed(1)) + "%";
 }
 
-function usageChip(text, variant) {
-  const chip = document.createElement("span");
-  chip.className = ["usage-chip", variant ? "usage-chip-" + variant : ""].filter(Boolean).join(" ");
-  chip.textContent = text || "-";
-  return chip;
+function usageCacheToneClass(cachedTokens, missTokens) {
+  const cached = Number(cachedTokens || 0);
+  const miss = Number(missTokens || 0);
+  const total = cached + miss;
+  if (total <= 0) return "";
+  const rate = cached / total * 100;
+  if (rate >= 85) return "usage-cache-strong";
+  if (rate >= 60) return "usage-cache-good";
+  if (rate >= 40) return "usage-cache-mid";
+  if (rate >= 10) return "usage-cache-low";
+  return "usage-cache-none";
 }
 
-function usageReplyHeader() {
-  return usageReplyRow({
-    className: "header",
-    segment: t("usageReplySegment"),
-    model: t("usageModel"),
-    elapsed: t("elapsed"),
-    miss: t("usageCacheMissShort"),
-    hit: t("usageCacheHitShort"),
-    output: t("output"),
-    cost: t("cost"),
-  });
+function usageSegmentsForRender(session) {
+  const segments = Array.isArray(session && session.segments) ? session.segments : [];
+  if (segments.length) return segments;
+  return Array.isArray(session && session.rows) ? session.rows : [];
 }
 
-function usageIntermediateRows(turn, modelLabel, totalCost, cachedTokens, missTokens) {
-  const elapsed = formatDuration(turn.request_ms);
-  const miss = formatNumber(missTokens);
-  const hit = formatNumber(cachedTokens);
-  const output = formatNumber(turn.output_tokens);
-  return [
-    {
-      segment: t("usageReceiveRequest"),
-      hint: t("usageReceiveRequestHint"),
-      model: t("usageLocalProxy"),
-      elapsed: usageTinyDuration(),
-      miss: "-",
-      hit: "-",
-      output: "-",
-      cost: "-",
-    },
-    {
-      segment: t("usageCacheCheck"),
-      hint: t("usageCacheCheckHint"),
-      model: modelLabel,
-      elapsed: usageTinyDuration(),
-      miss,
-      hit,
-      output: "-",
-      cost: "-",
-    },
-    {
-      segment: t("usageUpstreamRequest"),
-      hint: t("usageUpstreamRequestHint"),
-      model: modelLabel,
-      elapsed,
-      miss,
-      hit,
-      output: "-",
-      cost: t("usageIncludedInFinal"),
-    },
-    {
-      className: "billable",
-      segment: t("usageFinalReply"),
-      hint: t("usageStatusCompleted"),
-      model: modelLabel,
-      elapsed,
-      miss,
-      hit,
-      output,
-      cost: totalCost,
-    },
-    {
-      segment: t("usagePersistUsage"),
-      hint: t("usagePersistUsageHint"),
-      model: t("usageLocalLedger"),
-      elapsed: usageTinyDuration(),
-      miss: "-",
-      hit: "-",
-      output: "-",
-      cost: t("usageRecorded"),
-    },
-    {
-      className: "total",
-      segment: t("total"),
-      model: "-",
-      elapsed,
-      miss,
-      hit,
-      output,
-      cost: totalCost,
-    },
-  ];
-}
+function usageSegmentRow(segment) {
+  const display = usageSegmentDisplay(segment);
+  const row = document.createElement("div");
+  row.className = "usage-grid-spec trace-stripe-row";
 
-function usageTinyDuration() {
-  return "< 1 ms";
-}
+  const combined = document.createElement("div");
+  combined.className = "trace-cell-combined";
+  const time = document.createElement("span");
+  time.className = "trace-sub-time";
+  time.textContent = usageShortTime(segment && segment.completed_at);
+  const stage = document.createElement("span");
+  stage.className = ["trace-stage", usageStageClass(segment)].filter(Boolean).join(" ");
+  stage.textContent = usageStageLabel(segment);
+  stage.dataset.tip = usageSegmentTip(segment);
+  combined.append(time, stage, usageSplitTag(display.tagCore, display.tagTelemetry));
 
-function usageReplyRow(row) {
-  const wrap = document.createElement("div");
-  wrap.className = ["usage-reply-row", row.className ? "usage-reply-row-" + row.className : ""].filter(Boolean).join(" ");
-  const segment = document.createElement("div");
-  segment.className = "usage-reply-segment";
-  const strong = document.createElement("strong");
-  strong.textContent = row.segment || "-";
-  segment.appendChild(strong);
-  if (row.hint) {
-    const span = document.createElement("span");
-    span.textContent = row.hint;
-    segment.appendChild(span);
-  }
-  wrap.append(
-    segment,
-    usageReplyCell(row.model),
-    usageReplyCell(row.elapsed, true),
-    usageReplyCell(row.miss, true),
-    usageReplyCell(row.hit, true),
-    usageReplyCell(row.output, true),
-    usageReplyCell(row.cost, true),
+  row.append(
+    combined,
+    usageTraceCell(display.elapsed, true),
+    usageTraceInputCell(display.inputTotal, display.hit),
+    usageTraceCell(display.output, true),
+    usageTraceCell(display.cacheHitRate, true),
+    usageTraceCell(display.cost, true, display.cost === "-" ? "" : "cost-val"),
   );
-  return wrap;
+  return row;
 }
 
-function usageReplyCell(value, numeric) {
-  const span = document.createElement("span");
-  span.className = numeric ? "usage-reply-cell usage-reply-num" : "usage-reply-cell";
-  span.textContent = value || "-";
-  span.title = span.textContent;
-  return span;
+function usageHasTokens(value) {
+  if (!value) return false;
+  return Number(value.cached_input_tokens || 0) > 0
+    || Number(value.cache_miss_input_tokens || 0) > 0
+    || Number(value.output_tokens || 0) > 0
+    || Number(value.total_tokens || 0) > 0;
 }
 
-function usageTechDetails(items) {
-  const details = document.createElement("details");
-  details.className = "usage-tech-details";
-  const summary = document.createElement("summary");
-  summary.textContent = t("usageTechnicalDetails");
-  details.appendChild(summary);
-  const body = document.createElement("div");
-  body.className = "usage-tech-body";
-  for (const [label, value] of items) {
-    const text = value || "-";
-    const row = document.createElement("div");
-    row.className = "usage-tech-row";
-    const span = document.createElement("span");
-    span.textContent = label;
-    const strong = document.createElement("strong");
-    strong.textContent = text;
-    strong.title = text;
-    row.append(span, strong);
-    body.appendChild(row);
+function usageSegmentDisplay(segment) {
+  const hasTokens = usageHasTokens(segment);
+  const hasRows = Array.isArray(segment && segment.rows) && segment.rows.length > 0;
+  const cached = Number(segment && segment.cached_input_tokens || 0);
+  const miss = Number(segment && segment.cache_miss_input_tokens || 0);
+  return {
+    tagCore: usageTagCore(segment),
+    tagTelemetry: usageTagTelemetry(segment),
+    elapsed: segment && segment.request_ms ? formatDuration(segment.request_ms) : "-",
+    inputTotal: hasTokens ? formatNumber(cached + miss) : "-",
+    miss: hasTokens ? formatNumber(segment.cache_miss_input_tokens) : "-",
+    hit: hasTokens ? formatNumber(segment.cached_input_tokens) : "-",
+    output: hasTokens ? formatNumber(segment.output_tokens) : "-",
+    cacheHitRate: hasTokens ? usageCacheHitRate(segment.cached_input_tokens, segment.cache_miss_input_tokens) : "-",
+    cost: hasRows || hasTokens ? formatCost(costForTokens(segment)) : "-",
+  };
+}
+
+function usageTraceInputCell(total, hit) {
+  const cell = document.createElement("div");
+  cell.className = "trace-cell trace-input-cell text-right";
+  cell.append(
+    usageTraceInputLine("total", total),
+    usageTraceInputLine("hit", hit),
+  );
+  return cell;
+}
+
+function usageTraceInputLine(kind, value) {
+  const line = document.createElement("span");
+  line.className = "trace-input-line";
+  const label = document.createElement("span");
+  label.className = "trace-input-label";
+  label.textContent = kind === "hit" ? t("usageCacheHitShort") : t("usageInputTotalShort");
+  const number = document.createElement("span");
+  number.className = "trace-input-number";
+  number.textContent = value || "-";
+  if (number.textContent === "-") number.classList.add("dash");
+  line.append(label, number);
+  return line;
+}
+
+function usageTraceCell(value, numeric, innerClass) {
+  const cell = document.createElement("div");
+  cell.className = ["trace-cell", numeric ? "text-right" : ""].filter(Boolean).join(" ");
+  const text = value || "-";
+  if (text === "-" || innerClass) {
+    const inner = document.createElement("span");
+    inner.className = text === "-" ? "dash" : innerClass;
+    inner.textContent = text;
+    cell.appendChild(inner);
+  } else {
+    cell.textContent = text;
   }
-  details.appendChild(body);
-  return details;
+  return cell;
+}
+
+function costForSession(session) {
+  const rows = Array.isArray(session && session.rows) ? session.rows : [];
+  if (rows.length) return rows.reduce((sum, row) => sum + costForTokens(row), 0);
+  return costForTokens(session || {});
+}
+
+function usageSplitTag(core, telemetry) {
+  const pill = document.createElement("div");
+  pill.className = "split-tag-pill";
+  const coreEl = document.createElement("span");
+  coreEl.className = "tag-core";
+  coreEl.textContent = core || "-";
+  const telemetryEl = document.createElement("span");
+  telemetryEl.className = "tag-telemetry";
+  telemetryEl.textContent = telemetry || "-";
+  pill.append(coreEl, telemetryEl);
+  return pill;
+}
+
+function usageStageClass(segment) {
+  if (!segment) return "";
+  if (segment.status === "failed" || segment.kind === "failed_reply") return "failed";
+  if (segment.status === "running" || segment.kind === "in_progress_reply" || segment.kind === "tool_call") return "running";
+  if (segment.kind === "tool_result") return "tool";
+  if (segment.kind === "final_reply") return "final";
+  if (segment.kind === "service" || segment.lifecycle === "service_ephemeral") return "service";
+  return "reply";
+}
+
+function usageStageLabel(segment) {
+  if (!segment) return "-";
+  if (segment.status === "failed" || segment.kind === "failed_reply") return t("usageFailedBillable");
+  if (segment.kind === "tool_result" || segment.kind === "tool_call") return t("usageToolStage");
+  if (segment.kind === "final_reply") return t("usageFinalReply");
+  if (segment.kind === "service" || segment.lifecycle === "service_ephemeral") return t("usageServiceRequest");
+  if (segment.kind === "in_progress_reply" || segment.status === "running") return t("usageInProgressReply");
+  return t("usageIntermediateReply");
+}
+
+function usageTagCore(segment) {
+  if (!segment) return "-";
+  if (segment.tool_name) return String(segment.tool_name);
+  return usageModelLabel(segment);
+}
+
+function usageTagTelemetry(segment) {
+  if (!segment) return "-";
+  if (segment.status === "failed") return "failed";
+  if (segment.status === "running" || segment.kind === "tool_call") return "open";
+  if (segment.kind === "tool_result") {
+    const summary = String(segment.summary || "").toLowerCase();
+    if (summary.includes("opened") || summary.includes("open_page")) return "open";
+    if (summary.includes("candidate") || summary.includes("source") || summary.includes("search")) return "search";
+    return "done";
+  }
+  const effort = String(segment.reasoning_effort || "").trim().toLowerCase();
+  if (effort) return effort;
+  if (segment.lifecycle === "service_ephemeral" || segment.kind === "service") return "none";
+  if (segment.kind === "final_reply") return "final";
+  if (segment.kind === "client_handoff_model") return "handoff";
+  return "model";
+}
+
+function usageSegmentTip(segment) {
+  if (!segment) return "";
+  return [
+    usageTipLine("status", segment.status),
+    usageTipLine("kind", segment.kind),
+    usageTipLine("lifecycle", segment.lifecycle),
+    usageTipLine("reasoning", segment.reasoning_effort),
+    usageTipLine("hint", usageSemanticText(segment.hint)),
+    segment.iteration ? usageTipLine("iteration", formatNumber(segment.iteration)) : "",
+    usageTipLine("summary", segment.summary),
+  ].filter(Boolean).join("\n");
+}
+
+function usageTipLine(label, value) {
+  const text = String(value || "").trim();
+  return text ? label + ": " + text : "";
+}
+
+function usageRelativeDateTime(value) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "-";
+  const now = new Date();
+  const label = isSameDate(date, now)
+    ? t("usageToday")
+    : isSameDate(date, new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1))
+      ? t("usageYesterday")
+      : String(date.getMonth() + 1).padStart(2, "0") + "-" + String(date.getDate()).padStart(2, "0");
+  return label + " " + String(date.getHours()).padStart(2, "0") + ":" + String(date.getMinutes()).padStart(2, "0");
+}
+
+function usageShortTime(value) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "--:--:--";
+  return [
+    String(date.getHours()).padStart(2, "0"),
+    String(date.getMinutes()).padStart(2, "0"),
+    String(date.getSeconds()).padStart(2, "0"),
+  ].join(":");
+}
+
+function isSameDate(left, right) {
+  return left.getFullYear() === right.getFullYear()
+    && left.getMonth() === right.getMonth()
+    && left.getDate() === right.getDate();
+}
+
+function usageSemanticText(value) {
+  const key = String(value || "").trim();
+  switch (key) {
+    case "conversation":
+      return t("usageConversationRecord");
+    case "intermediate_reply":
+      return t("usageIntermediateReply");
+    case "final_reply":
+      return t("usageFinalReply");
+    case "service_request":
+      return t("usageServiceRequest");
+    case "failed_billable":
+      return t("usageFailedBillable");
+    case "intermediate":
+      return t("usageIntermediateInfo");
+    case "completed_final_response":
+      return t("usageCompletedFinalResponse");
+    case "background_service_request":
+      return t("usageBackgroundServiceRequest");
+    case "billable_failed_request":
+      return t("usageBillableFailedRequest");
+    case "client_tool_handoff":
+      return t("usageClientToolHandoff");
+    case "billable_model_request":
+      return t("usageBillableModelRequest");
+    case "usageStatusCompleted":
+      return t("usageStatusCompleted");
+    case "usage_model_iteration":
+      return t("usageModelIteration");
+    case "usage_model_iteration_hint":
+      return t("usageModelIterationHint");
+    case "usage_model_request":
+      return t("usageModelRequest");
+    case "usage_model_request_hint":
+      return t("usageModelRequestHint");
+    case "usage_client_handoff_model_stage":
+      return t("usageClientHandoffModelStage");
+    case "usage_client_handoff_model_stage_hint":
+      return t("usageClientHandoffModelStageHint");
+    case "usage_web_search_stage":
+      return t("usageWebSearchStage");
+    case "usage_tool_stage":
+      return t("usageToolStage");
+    case "usage_tool_completed":
+      return t("usageToolCompleted");
+    case "usage_tool_failed":
+      return t("usageToolFailed");
+    case "usage_tool_requested":
+      return t("usageToolRequested");
+    case "usage_in_progress_reply":
+      return t("usageInProgressReply");
+    case "usage_in_progress_reply_hint":
+      return t("usageInProgressReplyHint");
+    default:
+      return key;
+  }
 }
 
 function updateLatestLogs(events, options = {}) {
@@ -2638,7 +2846,9 @@ function systemLanguageLabel() {
 }
 
 function t(key) {
-  return (i18n[uiLanguage] && i18n[uiLanguage][key]) || key;
+  return (i18n[uiLanguage] && i18n[uiLanguage][key])
+    || (i18n[FALLBACK_LANGUAGE] && i18n[FALLBACK_LANGUAGE][key])
+    || key;
 }
 
 function billingInputs() {

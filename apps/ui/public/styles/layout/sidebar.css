@@ -1,0 +1,26 @@
+.sidebar { width: 260px; background: var(--bg-panel); border-right: 1px solid var(--border-color); display: flex; flex-direction: column; padding: 24px 20px; z-index: 10; transition: var(--theme-transition); }
+.brand { display: flex; align-items: center; gap: 12px; margin-bottom: 32px; }
+.brand-icon { width: 40px; height: 40px; display: flex; align-items: center; justify-content: center; flex: none; transition: var(--theme-transition); }
+.app-icon { background: url("/assets/icons/app.png") center / contain no-repeat; }
+.brand-text .title { font-weight: 600; font-size: 15px; }
+.brand-text .subtitle { font-size: 12px; color: var(--text-muted); margin-top: 2px; transition: var(--theme-transition); }
+
+.status-indicator { display: flex; align-items: center; gap: 8px; padding: 10px 14px; border-radius: var(--radius-sm); background: var(--danger-bg); color: var(--danger); font-size: 13px; font-weight: 500; margin-bottom: 24px; transition: var(--theme-transition); }
+.status-indicator.running { background: var(--success-bg); color: var(--success); }
+.status-indicator.starting { background: var(--warn-badge-bg); color: var(--warn); }
+.status-dot { width: 8px; height: 8px; border-radius: 50%; background: currentColor; transition: var(--theme-transition); }
+
+.nav-menu { display: flex; flex-direction: column; gap: 4px; }
+.nav-item { text-decoration: none; color: var(--text-secondary); padding: 10px 14px; border-radius: var(--radius-sm); font-size: 14px; font-weight: 500; transition: var(--theme-transition); display: flex; align-items: center; justify-content: flex-start; gap: 10px; }
+.nav-item:hover { background: var(--hover-bg); color: var(--text-main); }
+.nav-item.active { background: var(--primary); color: var(--primary-text); }
+.nav-icon { width: 20px; height: 20px; flex: none; display: inline-block; color: currentColor; background: currentColor; opacity: 0.72; -webkit-mask: var(--nav-icon-url) center / contain no-repeat; mask: var(--nav-icon-url) center / contain no-repeat; }
+.nav-icon-console { --nav-icon-url: url("/assets/icons/dashboard.svg"); }
+.nav-icon-usage { --nav-icon-url: url("/assets/icons/usage.svg"); }
+.nav-icon-logs { --nav-icon-url: url("/assets/icons/console.svg"); }
+.nav-icon-config { --nav-icon-url: url("/assets/icons/settings.svg"); }
+.nav-icon-about { --nav-icon-url: url("/assets/icons/about.svg"); }
+.nav-label { min-width: 0; flex: 1; }
+.nav-item .update-dot { margin-left: auto; }
+
+.sidebar-footer { margin-top: auto; font-size: 12px; color: var(--text-muted); line-height: 1.5; border-top: 1px solid var(--border-color); padding-top: 16px; text-align: center; white-space: pre-line; transition: var(--theme-transition); }

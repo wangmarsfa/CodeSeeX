@@ -1,20 +1,37 @@
-use codeseex_core::{AppConfig, UserConfig};
+use crate::runtime_config::RuntimeConfigService;
+use crate::telemetry::TelemetryHub;
+use codeseex_core::AppConfig;
 use codeseex_store::Store;
-use std::sync::Arc;
 
 #[derive(Clone)]
 pub(crate) struct ProxyState {
-    pub(crate) config: Arc<AppConfig>,
-    pub(crate) client: reqwest::Client,
+    pub(crate) runtime_config: RuntimeConfigService,
     pub(crate) store: Store,
+    pub(crate) telemetry: TelemetryHub,
 }
 
 impl ProxyState {
-    pub(crate) fn active_config(&self) -> AppConfig {
-        let mut config = self.config.as_ref().clone();
-        if let Ok(user_config) = UserConfig::read_from(&config.config_path()) {
-            config.apply_user_config(user_config);
+    pub(crate) fn new(config: AppConfig, store: Store) -> Self {
+        Self {
+            runtime_config: RuntimeConfigService::new(config),
+            store,
+            telemetry: TelemetryHub::new(),
         }
-        config
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(config: AppConfig, store: Store) -> Self {
+        Self::new(config, store)
+    }
+
+    pub(crate) fn active_config(&self) -> AppConfig {
+        self.runtime_config.active_config()
+    }
+
+    pub(crate) fn client(&self) -> reqwest::Client {
+        let config = self.active_config();
+        let timeout = std::time::Duration::from_millis(config.upstream.timeout_ms);
+        crate::network::client(config.network_proxy, timeout)
+            .unwrap_or_else(|_| reqwest::Client::new())
     }
 }
