@@ -38,7 +38,8 @@ use crate::tool_passthrough::ToolContext;
 use crate::tools::chat_protocol::chat_tool_calls_to_assistant_message;
 use crate::tools::coordinator::{complete_chat_with_tools, ToolLoopContext, ToolLoopResult};
 use crate::tools::diagnostics::{
-    attach_tool_loop_warning, ToolLoopDiagnostics, MAX_TOOL_LOOP_ITERATIONS,
+    attach_tool_loop_warning, prepare_tool_loop_recovery_payload, ToolLoopDiagnostics,
+    ToolLoopStop, MAX_TOOL_LOOP_ITERATIONS,
 };
 use crate::tools::hosted::{
     execute_code_tools_concurrently, is_code_tool_executable, model_replay_tool_result,
@@ -3477,6 +3478,59 @@ fn response_stream_from_chat(params: StreamingResponseParams) -> axum::response:
                 }
                 stop_if_cancelled!("response cancelled after tool turn message persistence");
                 if let Some(stop) = repeated_failure_stop {
+                    let _ = state
+                        .store
+                        .record_event(
+                            "warn",
+                            "tool_loop_repeated_failure_stopped",
+                            "CodeSeeX stopped repeated failing streaming tool calls.",
+                            Some(&json!({
+                                "id": response_id,
+                                "iteration": iteration + 1,
+                                "error": stop.message,
+                                "recover_with_final_response": stop.recover_with_final_response
+                            })),
+                        )
+                        .await;
+                    if stop.recover_with_final_response {
+                        match recover_streaming_tool_loop_with_final_response(
+                            &state,
+                            &config,
+                            auth.as_deref(),
+                            &original_request,
+                            requested_model.as_deref(),
+                            &model,
+                            &response_id,
+                            &mut payload,
+                            &stop,
+                            "repeated failure",
+                        )
+                        .await {
+                            Ok(recovery) => {
+                                completed_tool_iterations += 1;
+                                current_payload = payload.clone();
+                                next_response = Some(recovery);
+                                continue;
+                            }
+                            Err(error) => {
+                                let failed_response = failed_billable_response(
+                                    &response_id,
+                                    &model,
+                                    "tool_loop_repeated_failure_recovery_failed",
+                                    &error,
+                                    &usage,
+                                );
+                                let detail = json!({
+                                    "error": error,
+                                    "codeseex_lifecycle": "failed_billable"
+                                });
+                                let _ = state.store.finish_request(&response_id, RequestStatus::Failed, Some(&failed_response), Some(&detail)).await;
+                                yield stream_failed_event(&response_id, &model, created_at, &mut sequence, "tool_loop_repeated_failure_recovery_failed", &error);
+                                yield Bytes::from_static(b"data: [DONE]\n\n");
+                                return;
+                            }
+                        }
+                    }
                     let error = stop.message;
                     let failed_response = failed_billable_response(
                         &response_id,
@@ -3490,37 +3544,11 @@ fn response_stream_from_chat(params: StreamingResponseParams) -> axum::response:
                         "codeseex_lifecycle": "failed_billable"
                     });
                     let _ = state.store.finish_request(&response_id, RequestStatus::Failed, Some(&failed_response), Some(&detail)).await;
-                    let _ = state
-                        .store
-                        .record_event(
-                            "warn",
-                            "tool_loop_repeated_failure_stopped",
-                            "CodeSeeX stopped repeated failing streaming tool calls.",
-                            Some(&json!({
-                                "id": response_id,
-                                "iteration": iteration + 1,
-                                "error": error
-                            })),
-                        )
-                        .await;
                     yield stream_failed_event(&response_id, &model, created_at, &mut sequence, "tool_loop_repeated_failure", &error);
                     yield Bytes::from_static(b"data: [DONE]\n\n");
                     return;
                 }
                 if let Some(stop) = tool_loop_diagnostics.web_search_budget_stop() {
-                    let error = stop.message;
-                    let failed_response = failed_billable_response(
-                        &response_id,
-                        &model,
-                        "tool_loop_web_search_budget",
-                        &error,
-                        &usage,
-                    );
-                    let detail = json!({
-                        "error": error,
-                        "codeseex_lifecycle": "failed_billable"
-                    });
-                    let _ = state.store.finish_request(&response_id, RequestStatus::Failed, Some(&failed_response), Some(&detail)).await;
                     let _ = state
                         .store
                         .record_event(
@@ -3530,14 +3558,48 @@ fn response_stream_from_chat(params: StreamingResponseParams) -> axum::response:
                             Some(&json!({
                                 "id": response_id,
                                 "iteration": iteration + 1,
-                                "error": error,
+                                "error": stop.message,
                                 "recover_with_final_response": stop.recover_with_final_response
                             })),
                         )
                         .await;
-                    yield stream_failed_event(&response_id, &model, created_at, &mut sequence, "tool_loop_web_search_budget", &error);
-                    yield Bytes::from_static(b"data: [DONE]\n\n");
-                    return;
+                    match recover_streaming_tool_loop_with_final_response(
+                        &state,
+                        &config,
+                        auth.as_deref(),
+                        &original_request,
+                        requested_model.as_deref(),
+                        &model,
+                        &response_id,
+                        &mut payload,
+                        &stop,
+                        "web_search budget",
+                    )
+                    .await {
+                        Ok(recovery) => {
+                            completed_tool_iterations += 1;
+                            current_payload = payload.clone();
+                            next_response = Some(recovery);
+                            continue;
+                        }
+                        Err(error) => {
+                            let failed_response = failed_billable_response(
+                                &response_id,
+                                &model,
+                                "tool_loop_web_search_budget_recovery_failed",
+                                &error,
+                                &usage,
+                            );
+                            let detail = json!({
+                                "error": error,
+                                "codeseex_lifecycle": "failed_billable"
+                            });
+                            let _ = state.store.finish_request(&response_id, RequestStatus::Failed, Some(&failed_response), Some(&detail)).await;
+                            yield stream_failed_event(&response_id, &model, created_at, &mut sequence, "tool_loop_web_search_budget_recovery_failed", &error);
+                            yield Bytes::from_static(b"data: [DONE]\n\n");
+                            return;
+                        }
+                    }
                 }
                 if completed_tool_iterations + 1 >= MAX_TOOL_LOOP_ITERATIONS {
                     let error = tool_loop_diagnostics.iteration_limit_error();
@@ -3742,6 +3804,80 @@ fn response_stream_from_chat(params: StreamingResponseParams) -> axum::response:
         .header("x-accel-buffering", "no")
         .body(Body::from_stream(stream))
         .unwrap_or_else(|_| Response::new(Body::empty()))
+}
+
+async fn recover_streaming_tool_loop_with_final_response(
+    state: &ProxyState,
+    config: &codeseex_core::AppConfig,
+    auth: Option<&str>,
+    original_request: &Value,
+    requested_model: Option<&str>,
+    model: &str,
+    response_id: &str,
+    payload: &mut Value,
+    stop: &ToolLoopStop,
+    phase: &'static str,
+) -> Result<reqwest::Response, String> {
+    prepare_tool_loop_recovery_payload(payload, &stop.message)
+        .map_err(|message| message.to_owned())?;
+    let client = state.client();
+    let response = match crate::upstream::post_chat_completions(
+        &client,
+        &config.upstream,
+        auth,
+        Some(original_request),
+        payload.clone(),
+    )
+    .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            let _ = state
+                .store
+                .record_event(
+                    "info",
+                    "retry_cache_diagnostic",
+                    "CodeSeeX retry/cache diagnostic.",
+                    Some(&retry_cache_diagnostic_event(
+                        response_id,
+                        requested_model,
+                        Some(model),
+                        original_request,
+                        Some(payload),
+                        "streaming_upstream_connection_failed_after_tool_loop_recovery",
+                    )),
+                )
+                .await;
+            return Err(error.to_string());
+        }
+    };
+    if response.status().is_success() {
+        return Ok(response);
+    }
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .unwrap_or_else(|error| error.to_string());
+    let _ = state
+        .store
+        .record_event(
+            "info",
+            "retry_cache_diagnostic",
+            "CodeSeeX retry/cache diagnostic.",
+            Some(&retry_cache_diagnostic_event(
+                response_id,
+                requested_model,
+                Some(model),
+                original_request,
+                Some(payload),
+                "streaming_upstream_status_failed_after_tool_loop_recovery",
+            )),
+        )
+        .await;
+    Err(format!(
+        "upstream returned {status} during streaming {phase} recovery: {body}"
+    ))
 }
 
 #[cfg(test)]

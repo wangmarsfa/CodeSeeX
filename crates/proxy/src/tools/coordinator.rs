@@ -8,7 +8,8 @@ use crate::tools::chat_protocol::{
     full_assistant_tool_message_from_chat, normalize_assistant_tool_message,
 };
 use crate::tools::diagnostics::{
-    attach_tool_loop_warning, ToolLoopDiagnostics, ToolLoopStop, MAX_TOOL_LOOP_ITERATIONS,
+    attach_tool_loop_warning, prepare_tool_loop_recovery_payload, ToolLoopDiagnostics,
+    ToolLoopStop, MAX_TOOL_LOOP_ITERATIONS,
 };
 use crate::tools::hosted::{
     execute_code_tools_concurrently, is_code_tool_executable, model_replay_tool_result,
@@ -496,27 +497,8 @@ async fn recover_final_response_after_tool_loop_stop(
     iteration: u32,
     response_items: Vec<Value>,
 ) -> Result<ToolLoopResult, ToolLoopError> {
-    if let Some(object) = payload.as_object_mut() {
-        object.remove("tools");
-        object.remove("tool_choice");
-        object.remove("parallel_tool_calls");
-    }
-    let messages = payload
-        .get_mut("messages")
-        .and_then(Value::as_array_mut)
-        .ok_or_else(|| {
-            ToolLoopError::new(
-                "chat payload messages were not an array during tool loop recovery",
-                &cumulative_usage,
-            )
-        })?;
-    messages.push(json!({
-        "role": "user",
-        "content": format!(
-            "CodeSeeX stopped repeated unsuccessful web_search calls to avoid wasting tokens: {} Provide a final answer now using the available search results and tool diagnostics. If the evidence is insufficient, say so briefly.",
-            stop.message
-        )
-    }));
+    prepare_tool_loop_recovery_payload(&mut payload, &stop.message)
+        .map_err(|message| ToolLoopError::new(message, &cumulative_usage))?;
 
     let response = match crate::upstream::post_chat_completions(
         context.client,

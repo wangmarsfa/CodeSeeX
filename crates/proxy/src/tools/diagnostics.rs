@@ -17,6 +17,28 @@ pub(crate) struct ToolLoopStop {
     pub(crate) recover_with_final_response: bool,
 }
 
+pub(crate) fn prepare_tool_loop_recovery_payload(
+    payload: &mut Value,
+    stop_message: &str,
+) -> Result<(), &'static str> {
+    if let Some(object) = payload.as_object_mut() {
+        object.remove("tools");
+        object.remove("tool_choice");
+        object.remove("parallel_tool_calls");
+    }
+    let messages = payload
+        .get_mut("messages")
+        .and_then(Value::as_array_mut)
+        .ok_or("chat payload messages were not an array during tool loop recovery")?;
+    messages.push(json!({
+        "role": "user",
+        "content": format!(
+            "CodeSeeX stopped repeated unsuccessful web_search calls to avoid wasting tokens: {stop_message} Provide a final answer now using the available search results and tool diagnostics. If the evidence is insufficient, say so briefly."
+        )
+    }));
+    Ok(())
+}
+
 impl ToolLoopDiagnostics {
     pub(crate) fn record_iteration(
         &mut self,

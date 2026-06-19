@@ -780,6 +780,82 @@ async fn fake_repeated_failing_web_search_chat_completions(
     .into_response()
 }
 
+async fn fake_repeated_failing_web_search_streaming_chat_completions(
+    State(state): State<FakeUpstreamState>,
+    Json(payload): Json<Value>,
+) -> axum::response::Response {
+    let has_tools = payload
+        .get("tools")
+        .and_then(Value::as_array)
+        .map(|items| !items.is_empty())
+        .unwrap_or(false);
+    {
+        let mut requests = state.requests.lock().expect("fake upstream lock poisoned");
+        requests.push(payload);
+    }
+    let body = if has_tools {
+        format!(
+            concat!(
+                "data: {{\"choices\":[{{\"delta\":{{\"tool_calls\":[{{\"index\":0,\"id\":\"call_web_{}\",\"type\":\"function\",\"function\":{{\"name\":\"web_search\",\"arguments\":\"{{\\\"mode\\\":\\\"open\\\"}}\"}}}}]}}}}]}}\n\n",
+                "data: {{\"choices\":[],\"usage\":{{\"prompt_tokens\":8,\"completion_tokens\":2,\"total_tokens\":10}}}}\n\n",
+                "data: [DONE]\n\n"
+            ),
+            Uuid::new_v4().simple()
+        )
+    } else {
+        concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"streaming recovered after repeated web search failures\"}}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":6,\"total_tokens\":17}}\n\n",
+            "data: [DONE]\n\n"
+        )
+        .to_owned()
+    };
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .body(Body::from(body))
+        .expect("fake upstream response should build")
+}
+
+async fn fake_budgeted_web_search_streaming_chat_completions(
+    State(state): State<FakeUpstreamState>,
+    Json(payload): Json<Value>,
+) -> axum::response::Response {
+    let has_tools = payload
+        .get("tools")
+        .and_then(Value::as_array)
+        .map(|items| !items.is_empty())
+        .unwrap_or(false);
+    let request_index = {
+        let mut requests = state.requests.lock().expect("fake upstream lock poisoned");
+        requests.push(payload);
+        requests.len()
+    };
+    let body = if has_tools {
+        format!(
+            concat!(
+                "data: {{\"choices\":[{{\"delta\":{{\"tool_calls\":[{{\"index\":0,\"id\":\"call_web_{}\",\"type\":\"function\",\"function\":{{\"name\":\"web_search\",\"arguments\":\"{{\\\"query\\\":\\\"bounded search {}\\\"}}\"}}}}]}}}}]}}\n\n",
+                "data: {{\"choices\":[],\"usage\":{{\"prompt_tokens\":8,\"completion_tokens\":2,\"total_tokens\":10}}}}\n\n",
+                "data: [DONE]\n\n"
+            ),
+            Uuid::new_v4().simple(),
+            request_index
+        )
+    } else {
+        concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"streaming recovered after the web search budget\"}}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":13,\"completion_tokens\":7,\"total_tokens\":20}}\n\n",
+            "data: [DONE]\n\n"
+        )
+        .to_owned()
+    };
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .body(Body::from(body))
+        .expect("fake upstream response should build")
+}
+
 async fn fake_repeated_failing_list_directory_chat_completions(
     State(state): State<FakeUpstreamState>,
     Json(payload): Json<Value>,
@@ -4337,6 +4413,189 @@ async fn streaming_web_search_emits_replayable_output_item() {
                 .unwrap_or_default()
                 .contains("missing_url")
     }));
+}
+
+#[tokio::test]
+async fn streaming_web_search_repeated_failure_recovers_with_final_answer() {
+    let fake_state = FakeUpstreamState::default();
+    let fake_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let fake_addr = fake_listener.local_addr().unwrap();
+    let fake_app = Router::new()
+        .route(
+            "/chat/completions",
+            post(fake_repeated_failing_web_search_streaming_chat_completions),
+        )
+        .with_state(fake_state.clone());
+    tokio::spawn(async move {
+        axum::serve(fake_listener, fake_app).await.unwrap();
+    });
+
+    let data_dir = temp_workspace("streaming-web-search-failure-recovery");
+    let config = test_config_with_upstream(data_dir.clone(), fake_addr);
+    let store = Store::open(&config.data_dir).await.unwrap();
+    let proxy_state = ProxyState::for_test(config, store.clone());
+    let proxy_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    let proxy_app = Router::new()
+        .route("/v1/responses", post(responses))
+        .with_state(proxy_state);
+    tokio::spawn(async move {
+        axum::serve(proxy_listener, proxy_app).await.unwrap();
+    });
+
+    let body = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/responses"))
+        .json(&json!({
+            "id": "resp_stream_web_search_failure_recovery",
+            "model": "deepseek-v4-pro",
+            "stream": true,
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "keep searching but then recover" }]
+            }]
+        }))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+
+    assert!(
+        body.contains("streaming recovered after repeated web search failures"),
+        "{body}"
+    );
+    assert!(body.contains("response.completed"), "{body}");
+    assert!(!body.contains("response.failed"), "{body}");
+    assert!(!body.contains("tool_loop_repeated_failure\""), "{body}");
+
+    let requests = fake_state
+        .requests
+        .lock()
+        .expect("fake upstream lock poisoned")
+        .clone();
+    assert_eq!(requests.len(), 3);
+    assert!(requests[0].get("tools").is_some());
+    assert!(requests[1].get("tools").is_some());
+    assert!(requests[2].get("tools").is_none());
+    let recovery_messages = requests[2]["messages"].as_array().unwrap();
+    assert!(recovery_messages.iter().any(|message| {
+        message.get("role").and_then(Value::as_str) == Some("user")
+            && message
+                .get("content")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .contains("stopped repeated unsuccessful web_search calls")
+    }));
+
+    let (events, _) = store.recent_events(80, None).await.unwrap();
+    assert!(events.iter().any(|event| {
+        event.event_type == "tool_loop_repeated_failure_stopped"
+            && event
+                .detail
+                .as_ref()
+                .and_then(|detail| detail.get("recover_with_final_response"))
+                .and_then(Value::as_bool)
+                == Some(true)
+    }));
+    assert!(!events
+        .iter()
+        .any(|event| event.event_type == "request_failed"));
+
+    let _ = std::fs::remove_dir_all(data_dir);
+}
+
+#[tokio::test]
+async fn streaming_web_search_budget_recovers_with_final_answer() {
+    let fake_state = FakeUpstreamState::default();
+    let fake_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let fake_addr = fake_listener.local_addr().unwrap();
+    let fake_app = Router::new()
+        .route(
+            "/chat/completions",
+            post(fake_budgeted_web_search_streaming_chat_completions),
+        )
+        .with_state(fake_state.clone());
+    tokio::spawn(async move {
+        axum::serve(fake_listener, fake_app).await.unwrap();
+    });
+
+    let data_dir = temp_workspace("streaming-web-search-budget-recovery");
+    let config = test_config_with_upstream(data_dir.clone(), fake_addr);
+    let store = Store::open(&config.data_dir).await.unwrap();
+    let proxy_state = ProxyState::for_test(config, store.clone());
+    let proxy_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    let proxy_app = Router::new()
+        .route("/v1/responses", post(responses))
+        .with_state(proxy_state);
+    tokio::spawn(async move {
+        axum::serve(proxy_listener, proxy_app).await.unwrap();
+    });
+
+    let body = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/responses"))
+        .json(&json!({
+            "id": "resp_stream_web_search_budget_recovery",
+            "model": "deepseek-v4-pro",
+            "stream": true,
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "keep searching distinct topics but then recover" }]
+            }]
+        }))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+
+    assert!(
+        body.contains("streaming recovered after the web search budget"),
+        "{body}"
+    );
+    assert!(body.contains("response.completed"), "{body}");
+    assert!(!body.contains("response.failed"), "{body}");
+    assert!(!body.contains("tool_loop_web_search_budget\""), "{body}");
+
+    let requests = fake_state
+        .requests
+        .lock()
+        .expect("fake upstream lock poisoned")
+        .clone();
+    assert_eq!(requests.len(), 4);
+    assert!(requests[0].get("tools").is_some());
+    assert!(requests[1].get("tools").is_some());
+    assert!(requests[2].get("tools").is_some());
+    assert!(requests[3].get("tools").is_none());
+    let recovery_messages = requests[3]["messages"].as_array().unwrap();
+    assert!(recovery_messages.iter().any(|message| {
+        message.get("role").and_then(Value::as_str) == Some("user")
+            && message
+                .get("content")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .contains("reached its per-response budget")
+    }), "{}", serde_json::to_string_pretty(recovery_messages).unwrap());
+
+    let (events, _) = store.recent_events(80, None).await.unwrap();
+    assert!(events.iter().any(|event| {
+        event.event_type == "tool_loop_web_search_budget_stopped"
+            && event
+                .detail
+                .as_ref()
+                .and_then(|detail| detail.get("recover_with_final_response"))
+                .and_then(Value::as_bool)
+                == Some(true)
+    }));
+    assert!(!events
+        .iter()
+        .any(|event| event.event_type == "request_failed"));
+
+    let _ = std::fs::remove_dir_all(data_dir);
 }
 
 #[tokio::test]
