@@ -7,6 +7,7 @@ use tokio::sync::{broadcast, mpsc};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RuntimeConfigChangeSource {
+    ProxyStartup,
     ManagerSave,
     ConfigFile,
     SystemProxy,
@@ -15,6 +16,7 @@ pub(crate) enum RuntimeConfigChangeSource {
 impl RuntimeConfigChangeSource {
     pub(crate) fn label(self) -> &'static str {
         match self {
+            Self::ProxyStartup => "proxy_startup",
             Self::ManagerSave => "manager_save",
             Self::ConfigFile => "config_file",
             Self::SystemProxy => "system_proxy",
@@ -223,6 +225,17 @@ impl RuntimeConfigService {
         };
         let _ = self.changes.send(change.clone());
         Some(change)
+    }
+
+    pub(crate) fn emit_proxy_startup(&self) {
+        let snapshot = self.snapshot();
+        let change = RuntimeConfigChange {
+            source: RuntimeConfigChangeSource::ProxyStartup,
+            kinds: vec![RuntimeConfigChangeKind::NetworkProxy],
+            snapshot,
+            previous: None,
+        };
+        let _ = self.changes.send(change);
     }
 
     pub(crate) fn spawn_config_file_watcher(
@@ -607,6 +620,21 @@ mod tests {
             service.active_config().network_proxy,
             NetworkProxyMode::None
         );
+        let _ = std::fs::remove_dir_all(config.data_dir);
+    }
+
+    #[test]
+    fn runtime_config_proxy_startup_emits_only_network_proxy_probe_signal() {
+        let config = temp_config("proxy-startup");
+        let service = RuntimeConfigService::new(config.clone());
+        let mut changes = service.subscribe();
+
+        service.emit_proxy_startup();
+
+        let change = changes.try_recv().expect("proxy startup change");
+        assert_eq!(change.source, RuntimeConfigChangeSource::ProxyStartup);
+        assert_eq!(change.kinds, vec![RuntimeConfigChangeKind::NetworkProxy]);
+        assert!(change.previous.is_none());
         let _ = std::fs::remove_dir_all(config.data_dir);
     }
 

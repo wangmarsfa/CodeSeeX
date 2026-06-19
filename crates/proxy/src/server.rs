@@ -205,6 +205,7 @@ where
         std::time::Duration::from_millis(WEB_SEARCH_SOURCE_PROBE_DEBOUNCE_MS),
         Arc::new(warm_search_sources_for_probe),
     );
+    state.runtime_config.emit_proxy_startup();
     on_listening();
     let result = axum::serve(listener, app)
         .with_graceful_shutdown(shutdown)
