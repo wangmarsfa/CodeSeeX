@@ -1522,7 +1522,18 @@ fn compact_event_detail(event_type: &str, detail: &Value) -> Option<Value> {
             }
         }
         "web_search_source_probe" => {
-            copy_log_fields(object, &mut output, &["ok", "stage", "proxy_key"]);
+            copy_log_fields(
+                object,
+                &mut output,
+                &[
+                    "ok",
+                    "stage",
+                    "proxy_key",
+                    "trigger",
+                    "debounce_ms",
+                    "network_proxy_signature",
+                ],
+            );
             copy_structured_log_fields(object, &mut output, &["source_order", "source_health"]);
         }
         "context_compaction_completed" | "context_compacted" => copy_log_fields(
@@ -3979,6 +3990,9 @@ mod tests {
                         "error": null,
                         "age_ms": 0
                     }],
+                    "trigger": "manager_save",
+                    "debounce_ms": 5000,
+                    "network_proxy_signature": "system:http://redacted:redacted@127.0.0.1:7890/",
                     "unsafe_prompt": "do not keep me"
                 })),
             )
@@ -3993,6 +4007,12 @@ mod tests {
         );
         assert_eq!(detail["source_order"][0], "bing_html");
         assert_eq!(detail["source_health"][0]["source"], "bing_html");
+        assert_eq!(detail["trigger"], "manager_save");
+        assert_eq!(detail["debounce_ms"], 5000);
+        assert_eq!(
+            detail["network_proxy_signature"],
+            "system:http://redacted:redacted@127.0.0.1:7890/"
+        );
         assert!(detail.get("unsafe_prompt").is_none());
         let _ = std::fs::remove_dir_all(dir);
     }

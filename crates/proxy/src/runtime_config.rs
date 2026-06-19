@@ -7,7 +7,6 @@ use tokio::sync::{broadcast, mpsc};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RuntimeConfigChangeSource {
-    Startup,
     ManagerSave,
     ConfigFile,
     SystemProxy,
@@ -16,7 +15,6 @@ pub(crate) enum RuntimeConfigChangeSource {
 impl RuntimeConfigChangeSource {
     pub(crate) fn label(self) -> &'static str {
         match self {
-            Self::Startup => "startup",
             Self::ManagerSave => "manager_save",
             Self::ConfigFile => "config_file",
             Self::SystemProxy => "system_proxy",
@@ -225,25 +223,6 @@ impl RuntimeConfigService {
         };
         let _ = self.changes.send(change.clone());
         Some(change)
-    }
-
-    pub(crate) fn emit_startup(&self) {
-        let snapshot = self.snapshot();
-        let change = RuntimeConfigChange {
-            source: RuntimeConfigChangeSource::Startup,
-            kinds: vec![
-                RuntimeConfigChangeKind::NetworkProxy,
-                RuntimeConfigChangeKind::Upstream,
-                RuntimeConfigChangeKind::Model,
-                RuntimeConfigChangeKind::Tools,
-                RuntimeConfigChangeKind::Ui,
-                RuntimeConfigChangeKind::Billing,
-                RuntimeConfigChangeKind::ProxyEndpoint,
-            ],
-            snapshot,
-            previous: None,
-        };
-        let _ = self.changes.send(change);
     }
 
     pub(crate) fn spawn_config_file_watcher(

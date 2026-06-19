@@ -32,7 +32,7 @@ use crate::responses::stream_tool_calls::{
     StreamingVisibleToolBridge,
 };
 use crate::responses::usage::{merge_response_usage, response_usage_from_chat_usage};
-use crate::runtime_config::{RuntimeConfigChangeKind, RuntimeConfigChangeSource};
+use crate::runtime_config::RuntimeConfigChangeKind;
 use crate::text::compact_line;
 use crate::tool_passthrough::ToolContext;
 use crate::tools::chat_protocol::chat_tool_calls_to_assistant_message;
@@ -61,8 +61,9 @@ use crate::upstream::payload::{
 };
 use crate::upstream::{codex_request_markers, CodexRequestMarkers};
 use axum::body::{Body, Bytes};
-use axum::extract::{DefaultBodyLimit, Path, State};
+use axum::extract::{DefaultBodyLimit, Path, Request, State};
 use axum::http::{header, HeaderMap, Response, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -77,6 +78,7 @@ use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use tokio::net::TcpListener;
@@ -151,22 +153,7 @@ where
 
     ensure_catalog(&effective_config)?;
 
-    let app = Router::new()
-        .merge(crate::manager_api::router())
-        .route("/v1/models", get(models))
-        .route("/v1/chat/completions", post(chat_completions))
-        .route("/v1/responses/compact", post(responses_compact))
-        .route("/v1/responses/{response_id}/cancel", post(cancel_response))
-        .route("/v1/responses", post(responses))
-        .layer(DefaultBodyLimit::max(RESPONSES_BODY_LIMIT_BYTES))
-        .layer(
-            CorsLayer::new()
-                .allow_origin(Any)
-                .allow_headers(Any)
-                .allow_methods(Any),
-        )
-        .layer(TraceLayer::new_for_http())
-        .with_state(state.clone());
+    let app = app_router(state.clone());
 
     let listener =
         match TcpListener::bind((effective_config.host.as_str(), effective_config.port)).await {
@@ -215,8 +202,9 @@ where
         state.runtime_config.clone(),
         search_source_probe_changes,
         shutdown_store.clone(),
+        std::time::Duration::from_millis(WEB_SEARCH_SOURCE_PROBE_DEBOUNCE_MS),
+        Arc::new(warm_search_sources_for_probe),
     );
-    state.runtime_config.emit_startup();
     on_listening();
     let result = axum::serve(listener, app)
         .with_graceful_shutdown(shutdown)
@@ -241,16 +229,15 @@ fn spawn_web_search_source_probe_subscriber(
     runtime_config: crate::runtime_config::RuntimeConfigService,
     mut changes: tokio::sync::broadcast::Receiver<crate::runtime_config::RuntimeConfigChange>,
     store: Store,
+    debounce: std::time::Duration,
+    warm_sources: WarmSearchSourcesFn,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let debounce = std::time::Duration::from_millis(WEB_SEARCH_SOURCE_PROBE_DEBOUNCE_MS);
         loop {
             let Ok(mut change) = changes.recv().await else {
                 break;
             };
-            if !change.has_kind(RuntimeConfigChangeKind::NetworkProxy)
-                && change.source != RuntimeConfigChangeSource::Startup
-            {
+            if !change.has_kind(RuntimeConfigChangeKind::NetworkProxy) {
                 continue;
             }
             let sleep = tokio::time::sleep(debounce);
@@ -262,9 +249,7 @@ fn spawn_web_search_source_probe_subscriber(
                         let Ok(next) = received else {
                             break;
                         };
-                        if next.has_kind(RuntimeConfigChangeKind::NetworkProxy)
-                            || next.source == RuntimeConfigChangeSource::Startup
-                        {
+                        if next.has_kind(RuntimeConfigChangeKind::NetworkProxy) {
                             change = next;
                             sleep.as_mut().reset(tokio::time::Instant::now() + debounce);
                         }
@@ -272,28 +257,130 @@ fn spawn_web_search_source_probe_subscriber(
                 }
             }
             let snapshot = runtime_config.snapshot();
-            if change.source != RuntimeConfigChangeSource::Startup
-                && snapshot.network_proxy_signature != change.snapshot.network_proxy_signature
-            {
+            if snapshot.network_proxy_signature != change.snapshot.network_proxy_signature {
                 continue;
             }
-            let diagnostic =
-                crate::tools::web::warm_search_sources(snapshot.config.network_proxy).await;
+            let diagnostic = (warm_sources)(snapshot.config.network_proxy).await;
             let _ = store
                 .record_event(
                     "info",
                     "web_search_source_probe",
                     "CodeSeeX web_search source probe completed.",
-                    Some(&json!({
-                        "trigger": change.source.label(),
-                        "debounce_ms": WEB_SEARCH_SOURCE_PROBE_DEBOUNCE_MS,
-                        "network_proxy_signature": snapshot.network_proxy_signature,
-                        "diagnostic": diagnostic
-                    })),
+                    Some(&web_search_source_probe_event_detail(
+                        change.source.label(),
+                        snapshot.network_proxy_signature.as_str(),
+                        diagnostic,
+                    )),
                 )
                 .await;
         }
     })
+}
+
+fn web_search_source_probe_event_detail(
+    trigger: &str,
+    network_proxy_signature: &str,
+    diagnostic: Value,
+) -> Value {
+    json!({
+        "trigger": trigger,
+        "debounce_ms": WEB_SEARCH_SOURCE_PROBE_DEBOUNCE_MS,
+        "network_proxy_signature": network_proxy_signature,
+        "stage": diagnostic.get("stage").cloned().unwrap_or(Value::Null),
+        "source_order": diagnostic.get("source_order").cloned().unwrap_or(Value::Null),
+        "source_health": diagnostic.get("source_health").cloned().unwrap_or(Value::Null)
+    })
+}
+
+type WarmSearchSourcesFuture = Pin<Box<dyn Future<Output = Value> + Send>>;
+type WarmSearchSourcesFn = Arc<
+    dyn Fn(codeseex_core::NetworkProxyMode) -> WarmSearchSourcesFuture + Send + Sync + 'static,
+>;
+
+fn warm_search_sources_for_probe(
+    proxy_mode: codeseex_core::NetworkProxyMode,
+) -> WarmSearchSourcesFuture {
+    Box::pin(crate::tools::web::warm_search_sources(proxy_mode))
+}
+
+fn app_router(state: ProxyState) -> Router {
+    let manager_router = crate::manager_api::router()
+        .route_layer(middleware::from_fn(manager_local_request_guard));
+    let v1_router = Router::new()
+        .route("/v1/models", get(models))
+        .route("/v1/chat/completions", post(chat_completions))
+        .route("/v1/responses/compact", post(responses_compact))
+        .route("/v1/responses/{response_id}/cancel", post(cancel_response))
+        .route("/v1/responses", post(responses))
+        .layer(
+            CorsLayer::new()
+                .allow_origin(Any)
+                .allow_headers(Any)
+                .allow_methods(Any),
+        );
+    Router::new()
+        .merge(manager_router)
+        .merge(v1_router)
+        .layer(DefaultBodyLimit::max(RESPONSES_BODY_LIMIT_BYTES))
+        .layer(TraceLayer::new_for_http())
+        .with_state(state)
+}
+
+async fn manager_local_request_guard(
+    request: Request,
+    next: Next,
+) -> axum::response::Response {
+    if manager_request_is_local(request.headers()) {
+        return next.run(request).await;
+    }
+    (
+        StatusCode::FORBIDDEN,
+        Json(json!({
+            "error": {
+                "code": "manager_api_forbidden",
+                "message": "CodeSeeX manager API only accepts local requests."
+            }
+        })),
+    )
+        .into_response()
+}
+
+fn manager_request_is_local(headers: &HeaderMap) -> bool {
+    let host_is_local = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .map(authority_host_is_local)
+        .unwrap_or(false);
+    let origin_is_local = headers
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+        .map(origin_host_is_local)
+        .unwrap_or(true);
+    host_is_local && origin_is_local
+}
+
+fn origin_host_is_local(origin: &str) -> bool {
+    reqwest::Url::parse(origin)
+        .ok()
+        .and_then(|url| url.host_str().map(authority_host_is_local))
+        .unwrap_or(false)
+}
+
+fn authority_host_is_local(authority: &str) -> bool {
+    let host = authority_host(authority);
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    matches!(host.as_str(), "localhost" | "127.0.0.1" | "::1")
+}
+
+fn authority_host(authority: &str) -> &str {
+    let trimmed = authority.trim();
+    if let Some(rest) = trimmed.strip_prefix('[') {
+        return rest.split(']').next().unwrap_or(trimmed);
+    }
+    if trimmed.matches(':').count() == 1 {
+        return trimmed.split(':').next().unwrap_or(trimmed);
+    }
+    trimmed
 }
 
 fn proxy_base_url_for_listener(config: &AppConfig, local_addr: SocketAddr) -> String {

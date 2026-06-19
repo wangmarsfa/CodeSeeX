@@ -7,9 +7,11 @@ use crate::tools::chat_protocol::assistant_message_from_chat_tool_subset;
 use crate::tools::ownership::ChatToolCall;
 use codeseex_core::config::UpstreamConfig;
 use codeseex_core::models::MODEL_FLASH;
+use codeseex_core::NetworkProxyMode;
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 
 #[derive(Clone, Default)]
@@ -195,6 +197,231 @@ async fn serve_with_shutdown_exits_after_listening() {
         .collect::<Vec<_>>();
     assert!(event_types.contains(&"proxy_started"), "{event_types:?}");
     assert!(event_types.contains(&"proxy_stopped"), "{event_types:?}");
+    let _ = std::fs::remove_dir_all(data_dir);
+}
+
+async fn spawn_test_app(config: AppConfig) -> (PathBuf, SocketAddr) {
+    let data_dir = config.data_dir.clone();
+    let store = Store::open(&config.data_dir).await.unwrap();
+    let state = ProxyState::for_test(config, store);
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = app_router(state);
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (data_dir, addr)
+}
+
+#[tokio::test]
+async fn manager_api_rejects_non_local_origin() {
+    let config = test_config(temp_workspace("manager-origin-rejects"));
+    let (data_dir, addr) = spawn_test_app(config).await;
+
+    let response = reqwest::Client::new()
+        .get(format!("http://{addr}/api/status"))
+        .header(header::ORIGIN, "https://evil.example")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let body = response.json::<Value>().await.unwrap();
+    assert_eq!(body["error"]["code"], "manager_api_forbidden");
+    let _ = std::fs::remove_dir_all(data_dir);
+}
+
+#[tokio::test]
+async fn manager_api_rejects_null_origin() {
+    let config = test_config(temp_workspace("manager-origin-null"));
+    let (data_dir, addr) = spawn_test_app(config).await;
+
+    let response = reqwest::Client::new()
+        .get(format!("http://{addr}/api/status"))
+        .header(header::ORIGIN, "null")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let _ = std::fs::remove_dir_all(data_dir);
+}
+
+#[tokio::test]
+async fn manager_api_rejects_non_local_host() {
+    let config = test_config(temp_workspace("manager-host-rejects"));
+    let (data_dir, addr) = spawn_test_app(config).await;
+
+    let response = reqwest::Client::new()
+        .get(format!("http://{addr}/api/status"))
+        .header(header::HOST, "evil.example")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let _ = std::fs::remove_dir_all(data_dir);
+}
+
+#[tokio::test]
+async fn tool_assets_reject_non_local_origin() {
+    let config = test_config(temp_workspace("manager-tool-assets-origin"));
+    let (data_dir, addr) = spawn_test_app(config).await;
+
+    let response = reqwest::Client::new()
+        .get(format!("http://{addr}/tool-assets/test/icon.svg"))
+        .header(header::ORIGIN, "https://evil.example")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let _ = std::fs::remove_dir_all(data_dir);
+}
+
+#[tokio::test]
+async fn manager_api_allows_local_requests_without_origin() {
+    let config = test_config(temp_workspace("manager-origin-none"));
+    let (data_dir, addr) = spawn_test_app(config).await;
+
+    let response = reqwest::Client::new()
+        .get(format!("http://{addr}/api/status"))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = std::fs::remove_dir_all(data_dir);
+}
+
+#[tokio::test]
+async fn v1_routes_keep_openai_compatible_cors() {
+    let config = test_config(temp_workspace("v1-cors"));
+    let (data_dir, addr) = spawn_test_app(config).await;
+
+    let response = reqwest::Client::new()
+        .get(format!("http://{addr}/v1/models"))
+        .header(header::ORIGIN, "https://example-client.test")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .and_then(|value| value.to_str().ok()),
+        Some("*")
+    );
+    let _ = std::fs::remove_dir_all(data_dir);
+}
+
+#[tokio::test]
+async fn web_search_source_probe_ignores_non_network_config_changes() {
+    let data_dir = temp_workspace("search-probe-ignore-model");
+    let config = test_config(data_dir.clone());
+    let store = Store::open(&config.data_dir).await.unwrap();
+    let runtime_config = crate::runtime_config::RuntimeConfigService::new(config.clone());
+    let changes = runtime_config.subscribe();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_for_warm = calls.clone();
+    let handle = spawn_web_search_source_probe_subscriber(
+        runtime_config.clone(),
+        changes,
+        store.clone(),
+        std::time::Duration::from_millis(20),
+        Arc::new(move |_proxy_mode| {
+            let calls = calls_for_warm.clone();
+            Box::pin(async move {
+                calls.fetch_add(1, AtomicOrdering::SeqCst);
+                json!({ "ok": true, "test": true })
+            })
+        }),
+    );
+
+    std::fs::create_dir_all(&config.data_dir).unwrap();
+    codeseex_core::UserConfig {
+        model: Some(codeseex_core::UserModelConfig {
+            thinking: Some("disabled".to_owned()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+    .write_atomic(&config.config_path())
+    .unwrap();
+    let change = runtime_config
+        .refresh(crate::runtime_config::RuntimeConfigChangeSource::ManagerSave)
+        .expect("model config change");
+    assert!(change.has_kind(crate::runtime_config::RuntimeConfigChangeKind::Model));
+
+    tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+    assert_eq!(calls.load(AtomicOrdering::SeqCst), 0);
+    let (events, _) = store.recent_events(20, None).await.unwrap();
+    assert!(!events
+        .iter()
+        .any(|event| event.event_type == "web_search_source_probe"));
+    handle.abort();
+    let _ = std::fs::remove_dir_all(data_dir);
+}
+
+#[tokio::test]
+async fn web_search_source_probe_runs_after_network_proxy_change() {
+    let data_dir = temp_workspace("search-probe-network");
+    let config = test_config(data_dir.clone());
+    std::fs::create_dir_all(&config.data_dir).unwrap();
+    let store = Store::open(&config.data_dir).await.unwrap();
+    let runtime_config = crate::runtime_config::RuntimeConfigService::new(config.clone());
+    let changes = runtime_config.subscribe();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_for_warm = calls.clone();
+    let handle = spawn_web_search_source_probe_subscriber(
+        runtime_config.clone(),
+        changes,
+        store.clone(),
+        std::time::Duration::from_millis(20),
+        Arc::new(move |proxy_mode| {
+            let calls = calls_for_warm.clone();
+            Box::pin(async move {
+                calls.fetch_add(1, AtomicOrdering::SeqCst);
+                json!({
+                    "ok": true,
+                    "test": true,
+                    "proxy_mode": format!("{proxy_mode:?}")
+                })
+            })
+        }),
+    );
+
+    codeseex_core::UserConfig {
+        network: Some(codeseex_core::UserNetworkConfig {
+            proxy: Some(NetworkProxyMode::None),
+        }),
+        ..Default::default()
+    }
+    .write_atomic(&config.config_path())
+    .unwrap();
+    let change = runtime_config
+        .refresh(crate::runtime_config::RuntimeConfigChangeSource::ManagerSave)
+        .expect("network proxy change");
+    assert!(change.has_kind(crate::runtime_config::RuntimeConfigChangeKind::NetworkProxy));
+
+    tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+    assert_eq!(calls.load(AtomicOrdering::SeqCst), 1);
+    let (events, _) = store.recent_events(20, None).await.unwrap();
+    let probe = events
+        .iter()
+        .find(|event| event.event_type == "web_search_source_probe")
+        .expect("probe event should be recorded");
+    assert_eq!(
+        probe
+            .detail
+            .as_ref()
+            .and_then(|detail| detail.get("trigger"))
+            .and_then(Value::as_str),
+        Some("manager_save")
+    );
+    handle.abort();
     let _ = std::fs::remove_dir_all(data_dir);
 }
 
