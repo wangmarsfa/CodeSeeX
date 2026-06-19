@@ -2045,7 +2045,6 @@ function usageSegmentRow(segment) {
   stage.className = ["trace-stage", usageStageClass(segment)].filter(Boolean).join(" ");
   stage.textContent = usageStageLabel(segment);
   stage.dataset.tip = usageSegmentTip(segment);
-  stage.tabIndex = 0;
   bindUsageTraceTooltip(stage);
   combined.append(time, stage, usageSplitTag(display.tagCore, display.tagTelemetry));
 
@@ -2208,9 +2207,7 @@ function usageTipLine(label, value) {
 
 function bindUsageTraceTooltip(target) {
   target.addEventListener("mouseenter", () => showUsageTraceTooltip(target));
-  target.addEventListener("focus", () => showUsageTraceTooltip(target));
   target.addEventListener("mouseleave", hideUsageTraceTooltip);
-  target.addEventListener("blur", hideUsageTraceTooltip);
 }
 
 function ensureUsageTraceTooltip() {
