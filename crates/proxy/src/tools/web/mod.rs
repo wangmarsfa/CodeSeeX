@@ -1,3 +1,4 @@
+mod browser;
 mod candidates;
 mod extract;
 mod input;
@@ -16,6 +17,9 @@ const MAX_TEXT_CHARS: usize = 12_000;
 const MAX_RESULTS: usize = 8;
 const MAX_QUERIES: usize = 3;
 const MAX_OPEN_TARGETS: usize = 6;
+const AUTO_OPEN_EVIDENCE_TARGETS: usize = 2;
+const MAX_EVIDENCE_EXCERPT_CHARS: usize = 1_500;
+const AUTO_OPEN_EVIDENCE_TIMEOUT_SECS: u64 = 6;
 const WEB_SEARCH_TOTAL_TIMEOUT_SECS: u64 = 15;
 
 pub(crate) async fn warm_search_sources(proxy_mode: NetworkProxyMode) -> Value {
@@ -141,6 +145,18 @@ async fn execute_inner(
     );
     let quality = candidates::average_score(&all_results);
     let ok = !all_results.is_empty();
+    let evidence_targets = evidence_targets(&all_results, AUTO_OPEN_EVIDENCE_TARGETS);
+    let evidence_open = auto_open_evidence(proxy_mode, &evidence_targets).await;
+    let evidence = compact_evidence(&evidence_open);
+    let auto_opened_count = evidence.len();
+    let auto_open_failed_count = evidence_open
+        .get("failure_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let auto_open_failed_results = evidence_open
+        .get("failed_results")
+        .cloned()
+        .unwrap_or_else(|| Value::Array(Vec::new()));
 
     json!({
         "ok": ok,
@@ -158,11 +174,97 @@ async fn execute_inner(
         "results": all_results.clone(),
         "candidates": all_results.clone(),
         "candidate_count": all_results.len(),
+        "evidence": evidence,
+        "evidence_count": auto_opened_count,
+        "auto_opened": !evidence_targets.is_empty(),
+        "auto_open_targets": evidence_targets,
+        "auto_opened_count": auto_opened_count,
+        "auto_open_failed_count": auto_open_failed_count,
+        "auto_open_failed_results": auto_open_failed_results,
         "per_query": per_query,
         "fallback_errors": fallback_errors,
         "source_diagnostics": source_diagnostics,
-        "next_action": "When page content is needed, call web_search again with mode=open and selected open_urls. open_ids are also accepted for candidate lookup.",
+        "next_action": if auto_opened_count > 0 { "Answer from evidence when sufficient. Do not repeat search for the same question. If a specific candidate needs more content, call web_search with mode=open and selected open_urls or open_ids." } else { "No evidence was opened automatically. If page content is needed, call web_search with mode=open and selected open_urls or open_ids." },
         "truncated": queries.len() > MAX_QUERIES
+    })
+}
+
+async fn auto_open_evidence(proxy_mode: NetworkProxyMode, targets: &[String]) -> Value {
+    if targets.is_empty() {
+        return Value::Null;
+    }
+    match tokio::time::timeout(
+        Duration::from_secs(AUTO_OPEN_EVIDENCE_TIMEOUT_SECS),
+        open::many(proxy_mode, targets, &[], &[]),
+    )
+    .await
+    {
+        Ok(value) => value,
+        Err(_) => json!({
+            "ok": false,
+            "stage": "open",
+            "mode": "open",
+            "error": "auto_open_timeout",
+            "message": "Automatic evidence opening timed out; search candidates are still available.",
+            "open_urls": targets,
+            "opened_count": 0,
+            "failure_count": targets.len(),
+            "failed_results": targets.iter().map(|url| json!({
+                "url": url,
+                "error": "auto_open_timeout"
+            })).collect::<Vec<_>>()
+        }),
+    }
+}
+
+fn evidence_targets(results: &[Value], max_targets: usize) -> Vec<String> {
+    let mut targets = Vec::new();
+    for item in results {
+        if targets.len() >= max_targets {
+            break;
+        }
+        let Some(url) = item.get("url").and_then(Value::as_str) else {
+            continue;
+        };
+        if targets.iter().any(|value| value == url) {
+            continue;
+        }
+        targets.push(url.to_owned());
+    }
+    targets
+}
+
+fn compact_evidence(open_result: &Value) -> Vec<Value> {
+    open_result
+        .get("results")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .take(AUTO_OPEN_EVIDENCE_TARGETS)
+                .map(compact_evidence_item)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+fn compact_evidence_item(item: &Value) -> Value {
+    let content = item
+        .get("content")
+        .or_else(|| item.get("text"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    json!({
+        "id": item.get("id").cloned().unwrap_or(Value::Null),
+        "title": item.get("title").cloned().unwrap_or(Value::Null),
+        "url": item.get("url").cloned().unwrap_or(Value::Null),
+        "status": item.get("status").cloned().unwrap_or(Value::Null),
+        "snippet": item.get("snippet").cloned().unwrap_or(Value::Null),
+        "content_excerpt": extract::truncate_chars(content, MAX_EVIDENCE_EXCERPT_CHARS),
+        "content_chars": content.chars().count(),
+        "source": "auto_open",
+        "opened": true,
+        "truncated": item.get("truncated").cloned().unwrap_or(Value::Null)
     })
 }
 
@@ -223,6 +325,7 @@ fn query_diagnostic(result: &Value) -> Value {
         "query": result.get("query").cloned().unwrap_or(Value::Null),
         "source": result.get("source").cloned().unwrap_or(Value::Null),
         "candidate_count": result_count,
+        "evidence_count": result.get("evidence_count").cloned().unwrap_or(Value::Null),
         "quality": result.get("quality").cloned().unwrap_or(Value::Null),
         "low_confidence": result.get("low_confidence").cloned().unwrap_or(Value::Null),
         "fallback_error_count": fallback_error_count,
@@ -318,6 +421,54 @@ mod tests {
         assert_eq!(all_results.len(), 1);
         assert_eq!(all_results[0]["source"], "brave_html");
         assert!(!low_confidence_fallback);
+    }
+
+    #[test]
+    fn evidence_targets_selects_top_unique_result_urls() {
+        let targets = evidence_targets(
+            &[
+                json!({ "url": "https://example.com/a", "score": 0.9 }),
+                json!({ "url": "https://example.com/a", "score": 0.8 }),
+                json!({ "url": "https://example.com/b", "score": 0.7 }),
+                json!({ "url": "https://example.com/c", "score": 0.6 }),
+            ],
+            2,
+        );
+
+        assert_eq!(
+            targets,
+            vec![
+                "https://example.com/a".to_owned(),
+                "https://example.com/b".to_owned()
+            ]
+        );
+    }
+
+    #[test]
+    fn compact_evidence_keeps_excerpt_not_full_page_text() {
+        let content = "A".repeat(MAX_EVIDENCE_EXCERPT_CHARS + 100);
+        let result = compact_evidence(&json!({
+            "results": [{
+                "id": "cand_a",
+                "title": "Evidence",
+                "url": "https://example.com/a",
+                "status": 200,
+                "snippet": "short",
+                "content": content,
+                "truncated": false
+            }]
+        }));
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0]["id"], "cand_a");
+        assert!(result[0]["content_excerpt"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("[truncated chars="));
+        assert_eq!(
+            result[0]["content_chars"].as_u64(),
+            Some((MAX_EVIDENCE_EXCERPT_CHARS + 100) as u64)
+        );
     }
 
     #[test]

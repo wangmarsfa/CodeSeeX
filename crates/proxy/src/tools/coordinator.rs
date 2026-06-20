@@ -348,6 +348,31 @@ pub(crate) async fn complete_chat_with_tools(
                     &cumulative_usage,
                 )
             })?;
+        if let Some(stop) = loop_diagnostics.web_search_budget_stop() {
+            let _ = context
+                .store
+                .record_event(
+                    "warn",
+                    "tool_loop_web_search_budget_stopped",
+                    "CodeSeeX stopped repeated web_search calls.",
+                    Some(&json!({
+                        "id": context.request_id,
+                        "iteration": iteration + 1,
+                        "error": stop.message,
+                        "recover_with_final_response": stop.recover_with_final_response
+                    })),
+                )
+                .await;
+            return recover_final_response_after_tool_loop_stop(
+                context,
+                payload,
+                cumulative_usage,
+                stop,
+                completed_tool_iterations + 1,
+                response_items,
+            )
+            .await;
+        }
         if let Some(stop) = repeated_failure_stop {
             let _ = context
                 .store
@@ -375,31 +400,6 @@ pub(crate) async fn complete_chat_with_tools(
                 .await;
             }
             return Err(ToolLoopError::new(stop.message, &cumulative_usage));
-        }
-        if let Some(stop) = loop_diagnostics.web_search_budget_stop() {
-            let _ = context
-                .store
-                .record_event(
-                    "warn",
-                    "tool_loop_web_search_budget_stopped",
-                    "CodeSeeX stopped repeated web_search calls.",
-                    Some(&json!({
-                        "id": context.request_id,
-                        "iteration": iteration + 1,
-                        "error": stop.message,
-                        "recover_with_final_response": stop.recover_with_final_response
-                    })),
-                )
-                .await;
-            return recover_final_response_after_tool_loop_stop(
-                context,
-                payload,
-                cumulative_usage,
-                stop,
-                completed_tool_iterations + 1,
-                response_items,
-            )
-            .await;
         }
         if completed_tool_iterations + 1 >= MAX_TOOL_LOOP_ITERATIONS {
             let error = loop_diagnostics.iteration_limit_error();

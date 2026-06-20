@@ -114,7 +114,8 @@ pub(crate) fn tool_result_event_detail(
                     "sources_deprioritized": result.get("sources_deprioritized").cloned().unwrap_or(Value::Null),
                     "source_health": compact_web_source_health_array(result.get("source_health")),
                     "source_diagnostics": compact_web_source_diagnostic_array(result.get("source_diagnostics")),
-                    "fallback_errors": compact_web_source_diagnostic_array(result.get("fallback_errors"))
+                    "fallback_errors": compact_web_source_diagnostic_array(result.get("fallback_errors")),
+                    "browser_fallback": compact_browser_fallback(result.get("browser_fallback"))
                 }),
             );
         }
@@ -151,10 +152,18 @@ fn compact_web_search_result_for_model(result: &Value) -> Value {
         "failure_count": result.get("failure_count").cloned().unwrap_or(Value::Null),
         "low_confidence": result.get("low_confidence").cloned().unwrap_or(Value::Null),
         "low_confidence_fallback": result.get("low_confidence_fallback").cloned().unwrap_or(Value::Null),
+        "evidence": compact_web_evidence_array(result.get("evidence")),
+        "evidence_count": result.get("evidence_count").cloned().unwrap_or(Value::Null),
         "results": compact_web_result_array(result.get("results")),
         "candidates": compact_web_result_array(result.get("candidates")),
+        "low_confidence_candidates": compact_web_result_array(result.get("low_confidence_candidates")),
         "opened_results": compact_web_result_array(result.get("opened_results")),
+        "auto_opened": result.get("auto_opened").cloned().unwrap_or(Value::Null),
+        "auto_open_targets": result.get("auto_open_targets").cloned().unwrap_or(Value::Null),
+        "auto_opened_count": result.get("auto_opened_count").cloned().unwrap_or(Value::Null),
+        "auto_open_failed_count": result.get("auto_open_failed_count").cloned().unwrap_or(Value::Null),
         "failed_results": compact_web_diagnostic_array(result.get("failed_results")),
+        "auto_open_failed_results": compact_web_diagnostic_array(result.get("auto_open_failed_results")),
         "source_plan": result.get("source_plan").cloned().unwrap_or(Value::Null),
         "source_order": result.get("source_order").cloned().unwrap_or(Value::Null),
         "sources_attempted": result.get("sources_attempted").cloned().unwrap_or(Value::Null),
@@ -223,6 +232,32 @@ fn compact_web_result_array(value: Option<&Value>) -> Value {
     Value::Array(items.iter().take(8).map(compact_web_result_item).collect())
 }
 
+fn compact_web_evidence_array(value: Option<&Value>) -> Value {
+    let Some(items) = value.and_then(Value::as_array) else {
+        return Value::Array(Vec::new());
+    };
+    Value::Array(
+        items
+            .iter()
+            .take(4)
+            .map(|item| {
+                json!({
+                    "id": item.get("id").cloned().unwrap_or(Value::Null),
+                    "title": item.get("title").cloned().unwrap_or(Value::Null),
+                    "url": item.get("url").cloned().unwrap_or(Value::Null),
+                    "status": item.get("status").cloned().unwrap_or(Value::Null),
+                    "snippet": item.get("snippet").cloned().unwrap_or(Value::Null),
+                    "content_excerpt": item.get("content_excerpt").cloned().unwrap_or(Value::Null),
+                    "content_chars": item.get("content_chars").cloned().unwrap_or(Value::Null),
+                    "source": item.get("source").cloned().unwrap_or(Value::Null),
+                    "opened": item.get("opened").cloned().unwrap_or(Value::Null),
+                    "truncated": item.get("truncated").cloned().unwrap_or(Value::Null)
+                })
+            })
+            .collect(),
+    )
+}
+
 fn compact_web_diagnostic_array(value: Option<&Value>) -> Value {
     let Some(items) = value.and_then(Value::as_array) else {
         return Value::Array(Vec::new());
@@ -241,6 +276,37 @@ fn compact_web_diagnostic_array(value: Option<&Value>) -> Value {
             })
             .collect(),
     )
+}
+
+fn compact_browser_fallback(value: Option<&Value>) -> Value {
+    let Some(item) = value else {
+        return Value::Null;
+    };
+    json!({
+        "ok": item.get("ok").cloned().unwrap_or(Value::Null),
+        "renderer": item.get("renderer").cloned().unwrap_or(Value::Null),
+        "error": item.get("error").cloned().unwrap_or(Value::Null),
+        "message": item.get("message").cloned().unwrap_or(Value::Null),
+        "browser": item.get("browser").cloned().unwrap_or(Value::Null),
+        "diagnostics": item.get("_diagnostics").map(compact_browser_diagnostics).unwrap_or(Value::Null)
+    })
+}
+
+fn compact_browser_diagnostics(item: &Value) -> Value {
+    json!({
+        "renderer": item.get("renderer").cloned().unwrap_or(Value::Null),
+        "browser": item.get("browser").cloned().unwrap_or(Value::Null),
+        "profile_isolated": item.get("profile_isolated").cloned().unwrap_or(Value::Null),
+        "shared_cookies": item.get("shared_cookies").cloned().unwrap_or(Value::Null),
+        "extensions_disabled": item.get("extensions_disabled").cloned().unwrap_or(Value::Null),
+        "headless": item.get("headless").cloned().unwrap_or(Value::Null),
+        "exit_status": item.get("exit_status").cloned().unwrap_or(Value::Null),
+        "stdout_bytes": item.get("stdout_bytes").cloned().unwrap_or(Value::Null),
+        "stdout_truncated": item.get("stdout_truncated").cloned().unwrap_or(Value::Null),
+        "stderr_bytes": item.get("stderr_bytes").cloned().unwrap_or(Value::Null),
+        "stderr_truncated": item.get("stderr_truncated").cloned().unwrap_or(Value::Null),
+        "readable_text": item.get("readable_text").cloned().unwrap_or(Value::Null)
+    })
 }
 
 fn compact_web_result_item(item: &Value) -> Value {
@@ -376,6 +442,10 @@ fn web_search_result_summary(result: &Value) -> String {
         .get("candidate_count")
         .and_then(Value::as_u64)
         .unwrap_or(0);
+    let evidence_count = result
+        .get("evidence_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
     let sources = joined_string_array(result.get("sources_attempted"));
     let deprioritized = joined_string_array(result.get("sources_deprioritized"));
     let fallback_errors = result
@@ -389,7 +459,7 @@ fn web_search_result_summary(result: &Value) -> String {
         .map(Vec::len)
         .unwrap_or(0);
     format!(
-        "web_search {stage} ok={ok} candidates={count} sources=[{sources}] deprioritized=[{deprioritized}] fallback_errors={fallback_errors} source_diagnostics={source_diagnostics}"
+        "web_search {stage} ok={ok} candidates={count} evidence={evidence_count} sources=[{sources}] deprioritized=[{deprioritized}] fallback_errors={fallback_errors} source_diagnostics={source_diagnostics}"
     )
 }
 
@@ -581,7 +651,7 @@ mod tests {
 
         assert_eq!(
             summary,
-            "web_search search ok=false candidates=0 sources=[bing_html] deprioritized=[duckduckgo_lite] fallback_errors=1 source_diagnostics=0"
+            "web_search search ok=false candidates=0 evidence=0 sources=[bing_html] deprioritized=[duckduckgo_lite] fallback_errors=1 source_diagnostics=0"
         );
     }
 }

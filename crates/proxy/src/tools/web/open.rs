@@ -3,6 +3,7 @@ use codeseex_core::NetworkProxyMode;
 use futures_util::future::join_all;
 use serde_json::{json, Value};
 
+use super::browser;
 use super::candidates::{
     candidate_id_for, open_diagnostic_item, open_result_item, open_summary_item,
 };
@@ -42,7 +43,7 @@ pub(super) async fn many(
     let opened = join_all(
         urls.iter()
             .take(MAX_OPEN_TARGETS)
-            .map(|url| one(&web_client, url)),
+            .map(|url| one(proxy_mode, &web_client, url)),
     )
     .await;
     let mut opened_results = Vec::new();
@@ -82,7 +83,7 @@ pub(super) async fn many(
     })
 }
 
-async fn one(web_client: &reqwest::Client, raw_url: &str) -> Value {
+async fn one(proxy_mode: NetworkProxyMode, web_client: &reqwest::Client, raw_url: &str) -> Value {
     let normalized_url =
         normalize_candidate_url(raw_url).unwrap_or_else(|| raw_url.trim().to_owned());
     let Ok(url) = reqwest::Url::parse(&normalized_url) else {
@@ -120,7 +121,18 @@ async fn one(web_client: &reqwest::Client, raw_url: &str) -> Value {
         {
             Ok(response) => response,
             Err(error) => {
-                return json!({ "ok": false, "error": "request_failed", "url": current_url.as_str(), "message": request_error_message(&error), "redirects": redirects });
+                let http_result = json!({
+                    "ok": false,
+                    "stage": "open",
+                    "mode": "open",
+                    "error": "request_failed",
+                    "url": current_url.as_str(),
+                    "requested_url": raw_url,
+                    "message": request_error_message(&error),
+                    "redirects": redirects
+                });
+                return maybe_browser_fallback(proxy_mode, &current_url, raw_url, http_result)
+                    .await;
             }
         };
         let status = response.status().as_u16();
@@ -225,7 +237,7 @@ async fn one(web_client: &reqwest::Client, raw_url: &str) -> Value {
         500,
     );
     if text.trim().is_empty() {
-        return json!({
+        let http_result = json!({
             "_diagnostics": {
                 "status": status,
                 "content_type": content_type,
@@ -255,6 +267,7 @@ async fn one(web_client: &reqwest::Client, raw_url: &str) -> Value {
             "redirects": redirects,
             "truncated": byte_truncated || full_text_chars > MAX_TEXT_CHARS
         });
+        return maybe_browser_fallback(proxy_mode, &current_url, raw_url, http_result).await;
     }
     let ok = (200..400).contains(&status);
     let mut output = json!({
@@ -294,6 +307,26 @@ async fn one(web_client: &reqwest::Client, raw_url: &str) -> Value {
     output
 }
 
+async fn maybe_browser_fallback(
+    proxy_mode: NetworkProxyMode,
+    url: &reqwest::Url,
+    requested_url: &str,
+    http_result: Value,
+) -> Value {
+    if !browser::render_enabled() || !browser::should_try_after_http_result(&http_result) {
+        return http_result;
+    }
+    let browser_result = browser::render_public_page(proxy_mode, url, requested_url).await;
+    if browser_result.get("ok").and_then(Value::as_bool) == Some(true) {
+        return browser_result;
+    }
+    let mut output = http_result;
+    if let Some(object) = output.as_object_mut() {
+        object.insert("browser_fallback".to_owned(), browser_result);
+    }
+    output
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -322,5 +355,29 @@ mod tests {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .contains("No page yielded readable text"));
+    }
+
+    #[tokio::test]
+    async fn browser_fallback_disabled_does_not_change_http_failure_shape() {
+        std::env::remove_var("CODESEEX_WEB_BROWSER_RENDER");
+        std::env::remove_var("CODESEEX_WEB_BROWSER_RENDER_TEST");
+        let url = reqwest::Url::parse("https://example.com/").unwrap();
+        let http_result = json!({
+            "ok": false,
+            "stage": "open",
+            "mode": "open",
+            "error": "request_failed",
+            "url": url.as_str(),
+            "requested_url": url.as_str()
+        });
+
+        let result =
+            maybe_browser_fallback(NetworkProxyMode::System, &url, url.as_str(), http_result).await;
+
+        assert_eq!(
+            result.get("error").and_then(Value::as_str),
+            Some("request_failed")
+        );
+        assert!(result.get("browser_fallback").is_none());
     }
 }

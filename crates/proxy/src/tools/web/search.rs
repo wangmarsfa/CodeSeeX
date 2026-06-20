@@ -907,18 +907,16 @@ fn parse_bing_results(
     max_results: usize,
     source: &'static str,
 ) -> Vec<Value> {
+    let Ok(link_re) = Regex::new(r#"(?is)<a\b[^>]+href\s*=\s*"([^"]+)"[^>]*>(.*?)</a>"#) else {
+        return Vec::new();
+    };
     let Ok(block_re) = Regex::new(
-        r#"(?is)<li\b[^>]*\bclass\s*=\s*(?:"[^"]*\bb_algo\b[^"]*"|'[^']*\bb_algo\b[^']*'|[^\s>]*\bb_algo\b[^\s>]*)[^>]*>(.*?)</li>"#,
+        r#"(?is)<(?:li|div)\b[^>]*\bclass\s*=\s*(?:"[^"]*\b(?:b_algo|b_ans|b_entityTP|b_top|b_card|b_rrsr)\b[^"]*"|'[^']*\b(?:b_algo|b_ans|b_entityTP|b_top|b_card|b_rrsr)\b[^']*'|[^\s>]*\b(?:b_algo|b_ans|b_entityTP|b_top|b_card|b_rrsr)\b[^\s>]*)[^>]*>(.*?)</(?:li|div)>"#,
     ) else {
         return Vec::new();
     };
-    let Ok(link_re) =
-        Regex::new(r#"(?is)<h2[^>]*>.*?<a[^>]+href="([^"]+)"[^>]*>(.*?)</a>.*?</h2>"#)
-    else {
-        return Vec::new();
-    };
     let Ok(snippet_re) = Regex::new(
-        r#"(?is)<(?:p|div)\b[^>]*\bclass\s*=\s*(?:"[^"]*\b(?:b_caption|b_snippet|b_lineclamp\d*)\b[^"]*"|'[^']*\b(?:b_caption|b_snippet|b_lineclamp\d*)\b[^']*'|[^\s>]*\b(?:b_caption|b_snippet|b_lineclamp\d*)\b[^\s>]*)[^>]*>(.*?)</(?:p|div)>"#,
+        r#"(?is)<(?:p|div|span)\b[^>]*\bclass\s*=\s*(?:"[^"]*\b(?:b_caption|b_snippet|b_lineclamp\d*|b_factrow|b_focusTextLarge|b_secondaryText|news_dt|wr_fav|tab-content)\b[^"]*"|'[^']*\b(?:b_caption|b_snippet|b_lineclamp\d*|b_factrow|b_focusTextLarge|b_secondaryText|news_dt|wr_fav|tab-content)\b[^']*'|[^\s>]*\b(?:b_caption|b_snippet|b_lineclamp\d*|b_factrow|b_focusTextLarge|b_secondaryText|news_dt|wr_fav|tab-content)\b[^\s>]*)[^>]*>(.*?)</(?:p|div|span)>"#,
     ) else {
         return Vec::new();
     };
@@ -928,21 +926,124 @@ fn parse_bing_results(
             break;
         }
         let block = block.get(1).map(|value| value.as_str()).unwrap_or_default();
-        let Some(link) = link_re.captures(block) else {
-            continue;
-        };
+        collect_bing_block_result(
+            query,
+            block,
+            &link_re,
+            &snippet_re,
+            source,
+            max_results,
+            &mut results,
+        );
+    }
+    if results.len() < max_results {
+        collect_bing_link_fallbacks(query, html, &link_re, source, max_results, &mut results);
+    }
+    results
+}
+
+fn collect_bing_block_result(
+    query: &str,
+    block: &str,
+    link_re: &Regex,
+    snippet_re: &Regex,
+    source: &'static str,
+    max_results: usize,
+    results: &mut Vec<Value>,
+) {
+    let Some(link) = link_re.captures(block) else {
+        return;
+    };
+    let url = decode_basic_html_entities(link.get(1).map(|value| value.as_str()).unwrap_or(""));
+    if bing_internal_url(&url) {
+        return;
+    }
+    let title = strip_html_tags(link.get(2).map(|value| value.as_str()).unwrap_or(""));
+    let snippet = snippet_re
+        .captures_iter(block)
+        .filter_map(|caps| caps.get(1).map(|value| strip_html_tags(value.as_str())))
+        .filter(|text| !text.trim().is_empty())
+        .take(4)
+        .collect::<Vec<_>>()
+        .join(" ");
+    let snippet = if snippet.is_empty() {
+        block_text_near_link(block, link.get(0).map(|value| value.end()).unwrap_or(0))
+    } else {
+        snippet
+    };
+    if let Some(item) = make_search_result(query, &title, &url, &snippet, source, results.len()) {
+        results.push(item);
+        results.truncate(max_results);
+    }
+}
+
+fn collect_bing_link_fallbacks(
+    query: &str,
+    html: &str,
+    link_re: &Regex,
+    source: &'static str,
+    max_results: usize,
+    results: &mut Vec<Value>,
+) {
+    for link in link_re.captures_iter(html) {
+        if results.len() >= max_results {
+            break;
+        }
         let url = decode_basic_html_entities(link.get(1).map(|value| value.as_str()).unwrap_or(""));
+        if bing_internal_url(&url)
+            || search_chrome_url(&url)
+            || results
+                .iter()
+                .any(|item| item.get("url").and_then(Value::as_str) == Some(url.as_str()))
+        {
+            continue;
+        }
         let title = strip_html_tags(link.get(2).map(|value| value.as_str()).unwrap_or(""));
-        let snippet = snippet_re
-            .captures(block)
-            .and_then(|caps| caps.get(1).map(|value| strip_html_tags(value.as_str())))
-            .unwrap_or_default();
+        if title.chars().count() < 3 {
+            continue;
+        }
+        let snippet = block_text_near_link(html, link.get(0).map(|value| value.end()).unwrap_or(0));
         if let Some(item) = make_search_result(query, &title, &url, &snippet, source, results.len())
         {
             results.push(item);
         }
     }
-    results
+}
+
+fn block_text_near_link(html: &str, link_end: usize) -> String {
+    let end = html.len().min(link_end.saturating_add(1_400));
+    html.get(link_end..end)
+        .map(strip_html_tags)
+        .unwrap_or_default()
+}
+
+fn bing_internal_url(url: &str) -> bool {
+    let lower = url.to_ascii_lowercase();
+    lower.contains("bing.com/search")
+        || lower.contains("bing.com/images")
+        || lower.contains("bing.com/videos")
+        || lower.contains("go.microsoft.com")
+        || lower.starts_with("javascript:")
+        || lower.starts_with('#')
+}
+
+fn search_chrome_url(url: &str) -> bool {
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    let host = parsed.host_str().unwrap_or_default().to_ascii_lowercase();
+    let path = parsed.path().to_ascii_lowercase();
+    matches!(
+        host.as_str(),
+        "privacy.microsoft.com"
+            | "account.microsoft.com"
+            | "support.microsoft.com"
+            | "help.bing.microsoft.com"
+            | "www.microsoft.com"
+    ) || path.contains("/privacy")
+        || path.contains("/terms")
+        || path.contains("/account")
+        || path.contains("/settings")
 }
 
 fn parse_duckduckgo_results(query: &str, html: &str, max_results: usize) -> Vec<Value> {
@@ -1160,6 +1261,66 @@ mod tests {
         assert_eq!(results[0]["url"], "https://example.com/current");
         assert_eq!(results[0]["title"], "Current Result");
         assert_eq!(results[0]["snippet"], "Current Bing HTML snippet.");
+    }
+
+    #[test]
+    fn parses_bing_rich_result_blocks() {
+        let html = r#"
+            <html><body>
+              <div class="b_ans">
+                <a href="https://example.com/weather/current">Zhongshan weather today</a>
+                <span class="b_focusTextLarge">Heavy rain, 29 / 23 C</span>
+                <div class="b_secondaryText">Updated at 08:00 with current conditions.</div>
+              </div>
+            </body></html>
+        "#;
+        let results = parse_bing_results("Zhongshan weather today", html, 5, "bing_html");
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["url"], "https://example.com/weather/current");
+        assert_eq!(results[0]["title"], "Zhongshan weather today");
+        assert!(results[0]["snippet"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Heavy rain"));
+    }
+
+    #[test]
+    fn parses_bing_plain_link_fallbacks() {
+        let html = r#"
+            <html><body>
+              <main>
+                <a href="https://example.com/docs/release">Project release status</a>
+                <p>The project release status page lists the latest stable version.</p>
+              </main>
+            </body></html>
+        "#;
+        let results = parse_bing_results("Project release status latest", html, 5, "bing_html");
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["url"], "https://example.com/docs/release");
+        assert_eq!(results[0]["title"], "Project release status");
+    }
+
+    #[test]
+    fn bing_plain_link_fallback_prefers_result_over_serp_chrome() {
+        let html = r#"
+            <html><body>
+              <header>
+                <a href="https://www.bing.com/search?q=project+release+status">Search</a>
+                <a href="https://www.bing.com/images/search?q=project+release+status">Images</a>
+                <a href="https://privacy.microsoft.com/privacystatement">Privacy</a>
+              </header>
+              <main>
+                <a href="https://example.com/docs/release">Project release status</a>
+                <p>The latest stable release status is listed with changelog notes.</p>
+              </main>
+            </body></html>
+        "#;
+        let results = parse_bing_results("Project release status latest", html, 5, "bing_html");
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["url"], "https://example.com/docs/release");
     }
 
     #[test]

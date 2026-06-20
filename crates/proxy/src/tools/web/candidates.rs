@@ -330,6 +330,8 @@ fn score_search_result(query: &str, title: &str, url: &str, snippet: &str, rank:
     if terms.len() >= 4 && coverage < 0.5 {
         return round_score((0.14_f64 - rank as f64 * 0.01).max(0.0));
     }
+    let exact_phrase_bonus =
+        phrase_match_bonus(&query.to_ascii_lowercase(), title, url, snippet) * coverage;
     let title_bonus = (!title.trim().is_empty()) as u8 as f64 * 0.10 * coverage;
     let snippet_bonus = (snippet.chars().count() >= 40) as u8 as f64 * 0.10 * coverage;
     let url_bonus =
@@ -337,10 +339,31 @@ fn score_search_result(query: &str, title: &str, url: &str, snippet: &str, rank:
     let rank_bonus = (0.14_f64 - rank as f64 * 0.012).max(0.0) * coverage;
     let low_value_penalty = low_value_search_penalty(url, title, snippet);
     round_score(
-        (coverage * 0.58 + title_bonus + snippet_bonus + url_bonus + rank_bonus
+        (coverage * 0.58
+            + exact_phrase_bonus
+            + title_bonus
+            + snippet_bonus
+            + url_bonus
+            + rank_bonus
             - low_value_penalty)
             .clamp(0.0, 1.0),
     )
+}
+
+fn phrase_match_bonus(query: &str, title: &str, url: &str, snippet: &str) -> f64 {
+    let haystack = format!("{title} {url} {snippet}").to_ascii_lowercase();
+    let phrases = query
+        .split(['"', '\'', ':', ',', ';', '|'])
+        .map(str::trim)
+        .filter(|value| value.chars().count() >= 4)
+        .take(6);
+    let mut bonus = 0.0_f64;
+    for phrase in phrases {
+        if haystack.contains(phrase) {
+            bonus += 0.08;
+        }
+    }
+    bonus.min(0.16)
 }
 
 fn is_cjk(ch: char) -> bool {
@@ -497,6 +520,19 @@ mod tests {
             "PEP 745 – Python 3.14 Release Schedule",
             "https://peps.python.org/pep-0745/",
             "Python 3.14 release schedule, final release date, beta, release candidate, and status.",
+            0,
+        );
+
+        assert!(score >= 0.24, "unexpected score: {score}");
+    }
+
+    #[test]
+    fn exact_phrase_result_gets_enough_confidence_for_evidence_opening() {
+        let score = score_search_result(
+            "Zhongshan weather today",
+            "Zhongshan weather today",
+            "https://example.com/weather/zhongshan",
+            "Zhongshan weather today, heavy rain, temperature forecast and current conditions.",
             0,
         );
 

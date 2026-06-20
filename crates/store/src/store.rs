@@ -1845,6 +1845,7 @@ fn compact_event_detail(event_type: &str, detail: &Value) -> Option<Value> {
                             "sources_deprioritized",
                             "source_diagnostics",
                             "fallback_errors",
+                            "browser_fallback",
                         ][..],
                     ),
                 ],

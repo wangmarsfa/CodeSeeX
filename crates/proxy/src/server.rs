@@ -3929,6 +3929,59 @@ fn response_stream_from_chat(params: StreamingResponseParams) -> axum::response:
                     return;
                 }
                 stop_if_cancelled!("response cancelled after tool turn message persistence");
+                if let Some(stop) = tool_loop_diagnostics.web_search_budget_stop() {
+                    let _ = state
+                        .store
+                        .record_event(
+                            "warn",
+                            "tool_loop_web_search_budget_stopped",
+                            "CodeSeeX stopped repeated streaming web_search calls.",
+                            Some(&json!({
+                                "id": response_id,
+                                "iteration": iteration + 1,
+                                "error": stop.message,
+                                "recover_with_final_response": stop.recover_with_final_response
+                            })),
+                        )
+                        .await;
+                    match recover_streaming_tool_loop_with_final_response(
+                        &state,
+                        &config,
+                        auth.as_deref(),
+                        &original_request,
+                        requested_model.as_deref(),
+                        &model,
+                        &response_id,
+                        &mut payload,
+                        &stop,
+                        "web_search budget",
+                    )
+                    .await {
+                        Ok(recovery) => {
+                            completed_tool_iterations += 1;
+                            current_payload = payload.clone();
+                            next_response = Some(recovery);
+                            continue;
+                        }
+                        Err(error) => {
+                            let failed_response = failed_billable_response(
+                                &response_id,
+                                &model,
+                                "tool_loop_web_search_budget_recovery_failed",
+                                &error,
+                                &usage,
+                            );
+                            let detail = json!({
+                                "error": error,
+                                "codeseex_lifecycle": "failed_billable"
+                            });
+                            let _ = state.store.finish_request(&response_id, RequestStatus::Failed, Some(&failed_response), Some(&detail)).await;
+                            yield stream_failed_event(&response_id, &model, created_at, &mut sequence, "tool_loop_web_search_budget_recovery_failed", &error);
+                            yield Bytes::from_static(b"data: [DONE]\n\n");
+                            return;
+                        }
+                    }
+                }
                 if let Some(stop) = repeated_failure_stop {
                     let _ = state
                         .store
@@ -3999,59 +4052,6 @@ fn response_stream_from_chat(params: StreamingResponseParams) -> axum::response:
                     yield stream_failed_event(&response_id, &model, created_at, &mut sequence, "tool_loop_repeated_failure", &error);
                     yield Bytes::from_static(b"data: [DONE]\n\n");
                     return;
-                }
-                if let Some(stop) = tool_loop_diagnostics.web_search_budget_stop() {
-                    let _ = state
-                        .store
-                        .record_event(
-                            "warn",
-                            "tool_loop_web_search_budget_stopped",
-                            "CodeSeeX stopped repeated streaming web_search calls.",
-                            Some(&json!({
-                                "id": response_id,
-                                "iteration": iteration + 1,
-                                "error": stop.message,
-                                "recover_with_final_response": stop.recover_with_final_response
-                            })),
-                        )
-                        .await;
-                    match recover_streaming_tool_loop_with_final_response(
-                        &state,
-                        &config,
-                        auth.as_deref(),
-                        &original_request,
-                        requested_model.as_deref(),
-                        &model,
-                        &response_id,
-                        &mut payload,
-                        &stop,
-                        "web_search budget",
-                    )
-                    .await {
-                        Ok(recovery) => {
-                            completed_tool_iterations += 1;
-                            current_payload = payload.clone();
-                            next_response = Some(recovery);
-                            continue;
-                        }
-                        Err(error) => {
-                            let failed_response = failed_billable_response(
-                                &response_id,
-                                &model,
-                                "tool_loop_web_search_budget_recovery_failed",
-                                &error,
-                                &usage,
-                            );
-                            let detail = json!({
-                                "error": error,
-                                "codeseex_lifecycle": "failed_billable"
-                            });
-                            let _ = state.store.finish_request(&response_id, RequestStatus::Failed, Some(&failed_response), Some(&detail)).await;
-                            yield stream_failed_event(&response_id, &model, created_at, &mut sequence, "tool_loop_web_search_budget_recovery_failed", &error);
-                            yield Bytes::from_static(b"data: [DONE]\n\n");
-                            return;
-                        }
-                    }
                 }
                 if completed_tool_iterations + 1 >= MAX_TOOL_LOOP_ITERATIONS {
                     let error = tool_loop_diagnostics.iteration_limit_error();

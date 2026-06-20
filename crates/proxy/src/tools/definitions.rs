@@ -90,7 +90,7 @@ fn codeseex_system_hosted_tool_definition(id: &str) -> Option<Value> {
             "type": "function",
             "function": {
                 "name": "web_search",
-                "description": "Search the web for public information or open selected public HTTP/HTTPS pages. Use mode=\"search\" with query/queries, then mode=\"open\" with open_urls or open_ids when page content is needed. Returns compact text-only evidence; local/private network targets and binary resources are blocked by default.",
+                "description": "Search the web for public information or open selected public HTTP/HTTPS pages. mode=\"search\" returns candidates and automatically opens top candidates into compact evidence; answer from evidence when sufficient instead of repeating search. Use mode=\"open\" with open_urls or open_ids only when a specific page needs more content. Local/private network targets and binary resources are blocked by default.",
                 "parameters": {
                     "type": "object",
                     "properties": {
