@@ -271,7 +271,7 @@ pub(crate) async fn complete_chat_with_tools(
         )
         .await;
         let mut tool_messages = Vec::new();
-        let mut repeated_failure_stop = None;
+        let mut iteration_results = Vec::new();
         for executed in executed_tools {
             let call = executed.call;
             let mut result = executed.result;
@@ -293,8 +293,6 @@ pub(crate) async fn complete_chat_with_tools(
                     )
                     .await;
             }
-            let repeated_error =
-                loop_diagnostics.record_tool_result_and_repeated_failure(&call, &result);
             let result_summary = summarize_tool_result(&result);
             let result_text = model_replay_tool_result(&call, &result);
             let fact = tool_fact_line(&call, &result);
@@ -330,12 +328,15 @@ pub(crate) async fn complete_chat_with_tools(
                 "tool_call_id": call.id,
                 "content": result_text
             });
+            iteration_results.push((call, result));
             tool_messages.push(tool_message.clone());
             messages.push(tool_message);
-            if let Some(stop) = repeated_error {
-                repeated_failure_stop = Some(stop);
-            }
         }
+        let repeated_failure_stop = loop_diagnostics.record_tool_results_and_repeated_failure(
+            iteration_results
+                .iter()
+                .map(|(call, result)| (call, result)),
+        );
         let mut stored_messages = vec![stored_assistant];
         stored_messages.extend(tool_messages);
         context

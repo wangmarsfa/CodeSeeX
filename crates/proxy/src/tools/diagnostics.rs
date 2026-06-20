@@ -94,25 +94,46 @@ impl ToolLoopDiagnostics {
         call: &ChatToolCall,
         result: &Value,
     ) -> Option<ToolLoopStop> {
-        let health = tool_result_loop_health(call, result);
-        if health == ToolResultLoopHealth::Success {
-            self.consecutive_unsuccessful_by_name
-                .insert(call.name.clone(), 0);
-            return None;
+        self.record_tool_results_and_repeated_failure(std::iter::once((call, result)))
+    }
+
+    pub(crate) fn record_tool_results_and_repeated_failure<'a>(
+        &mut self,
+        results: impl IntoIterator<Item = (&'a ChatToolCall, &'a Value)>,
+    ) -> Option<ToolLoopStop> {
+        let mut batch = BTreeMap::<String, BatchToolHealth>::new();
+        for (call, result) in results {
+            batch
+                .entry(call.name.clone())
+                .or_default()
+                .record(tool_result_loop_health(call, result));
         }
-        let unsuccessful = self
-            .consecutive_unsuccessful_by_name
-            .entry(call.name.clone())
-            .or_insert(0);
-        *unsuccessful = unsuccessful.saturating_add(1);
-        let threshold = consecutive_failure_threshold(&call.name);
-        if *unsuccessful < threshold {
-            return None;
+
+        let mut stop = None;
+        for (tool_name, health) in batch {
+            if health.has_success {
+                self.consecutive_unsuccessful_by_name
+                    .insert(tool_name.clone(), 0);
+                continue;
+            }
+            let Some(loop_health) = health.unsuccessful_health else {
+                continue;
+            };
+            let unsuccessful = self
+                .consecutive_unsuccessful_by_name
+                .entry(tool_name.clone())
+                .or_insert(0);
+            *unsuccessful = unsuccessful.saturating_add(1);
+            let threshold = consecutive_failure_threshold(&tool_name);
+            if *unsuccessful < threshold || stop.is_some() {
+                continue;
+            }
+            stop = Some(ToolLoopStop {
+                message: tool_loop_stop_message(&tool_name, loop_health, *unsuccessful),
+                recover_with_final_response: tool_loop_stop_is_recoverable(&tool_name, loop_health),
+            });
         }
-        Some(ToolLoopStop {
-            message: tool_loop_stop_message(&call.name, health, *unsuccessful),
-            recover_with_final_response: tool_loop_stop_is_recoverable(&call.name, health),
-        })
+        stop
     }
 
     pub(crate) fn iteration_limit_error(&self) -> String {
@@ -153,6 +174,26 @@ enum ToolResultLoopHealth {
     Success,
     Failed,
     LowConfidenceFallback,
+}
+
+#[derive(Debug, Default)]
+struct BatchToolHealth {
+    has_success: bool,
+    unsuccessful_health: Option<ToolResultLoopHealth>,
+}
+
+impl BatchToolHealth {
+    fn record(&mut self, health: ToolResultLoopHealth) {
+        if health == ToolResultLoopHealth::Success {
+            self.has_success = true;
+            return;
+        }
+        if health == ToolResultLoopHealth::Failed {
+            self.unsuccessful_health = Some(ToolResultLoopHealth::Failed);
+        } else if self.unsuccessful_health.is_none() {
+            self.unsuccessful_health = Some(health);
+        }
+    }
 }
 
 fn tool_result_loop_health(call: &ChatToolCall, result: &Value) -> ToolResultLoopHealth {
@@ -345,6 +386,61 @@ mod tests {
         assert!(diagnostics
             .record_tool_result_and_repeated_failure(&call, &result)
             .is_none());
+    }
+
+    #[test]
+    fn mixed_batch_success_prevents_false_consecutive_failure_stop() {
+        let mut diagnostics = ToolLoopDiagnostics::default();
+        let failed_a = call_with_args("call_bad_a", "read_file_range", r#"{"path":"missing-a"}"#);
+        let failed_b = call_with_args("call_bad_b", "read_file_range", r#"{"path":"missing-b"}"#);
+        let failed_c = call_with_args("call_bad_c", "read_file_range", r#"{"path":"missing-c"}"#);
+        let ok = call_with_args("call_ok", "read_file_range", r#"{"path":"src/lib.rs"}"#);
+
+        let stop = diagnostics.record_tool_results_and_repeated_failure([
+            (&failed_a, &json!({ "ok": false, "error": "not_found" })),
+            (&failed_b, &json!({ "ok": false, "error": "not_found" })),
+            (&failed_c, &json!({ "ok": false, "error": "not_found" })),
+            (&ok, &json!({ "ok": true, "content": "pub fn ok() {}" })),
+        ]);
+
+        assert!(stop.is_none());
+        assert_eq!(
+            diagnostics
+                .consecutive_unsuccessful_by_name
+                .get("read_file_range"),
+            Some(&0)
+        );
+    }
+
+    #[test]
+    fn all_failed_batches_stop_after_consecutive_iterations() {
+        let mut diagnostics = ToolLoopDiagnostics::default();
+        let failed_a = call_with_args("call_bad_a", "read_file_range", r#"{"path":"missing-a"}"#);
+        let failed_b = call_with_args("call_bad_b", "read_file_range", r#"{"path":"missing-b"}"#);
+        let result_a = json!({ "ok": false, "error": "not_found" });
+        let result_b = json!({ "ok": false, "error": "not_found" });
+
+        assert!(diagnostics
+            .record_tool_results_and_repeated_failure([
+                (&failed_a, &result_a),
+                (&failed_b, &result_b)
+            ])
+            .is_none());
+        assert!(diagnostics
+            .record_tool_results_and_repeated_failure([
+                (&failed_a, &result_a),
+                (&failed_b, &result_b)
+            ])
+            .is_none());
+        let stop = diagnostics
+            .record_tool_results_and_repeated_failure([
+                (&failed_a, &result_a),
+                (&failed_b, &result_b),
+            ])
+            .expect("third all-failed iteration should stop");
+
+        assert!(stop.message.contains("failed 3 consecutive times"));
+        assert!(!stop.recover_with_final_response);
     }
 
     #[test]
