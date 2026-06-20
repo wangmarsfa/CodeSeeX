@@ -537,15 +537,18 @@ async function refresh(options = {}) {
 
 function maybeRefreshUsage(runtime, options = {}) {
   if (currentView !== "usage") return;
+  const activeRequests = Number(runtime.active_requests || 0);
   const sourceSignature = stableStringify({
+    active_requests: activeRequests,
     request_count: runtime.request_count || 0,
     billable_request_count: runtime.billable_request_count || 0,
     last_request_at: runtime.last_request_at || "",
+    last_activity_at: runtime.last_activity_at || "",
     billing: currentBillingSignature(),
   });
-  if (!options.force && latestUsageRuntime && sourceSignature === lastUsageSourceSignature) return;
+  if (!options.force && activeRequests <= 0 && latestUsageRuntime && sourceSignature === lastUsageSourceSignature) return;
   lastUsageSourceSignature = sourceSignature;
-  refreshUsage({ force: Boolean(options.force) }).catch(() => {});
+  refreshUsage({ force: Boolean(options.force || activeRequests > 0) }).catch(() => {});
 }
 
 async function refreshUsage(options = {}) {
