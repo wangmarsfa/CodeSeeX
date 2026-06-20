@@ -14,6 +14,16 @@ pub(crate) struct StreamingToolCallState {
     arguments: String,
 }
 
+impl StreamingToolCallState {
+    pub(crate) fn from_chat_tool_call(call: ChatToolCall) -> Self {
+        Self {
+            id: call.id,
+            name: call.name,
+            arguments: call.arguments,
+        }
+    }
+}
+
 pub(crate) fn collect_streaming_tool_call_deltas(
     delta: &Value,
     states: &mut BTreeMap<u64, StreamingToolCallState>,
@@ -40,6 +50,30 @@ pub(crate) fn collect_streaming_tool_call_deltas(
                 state.arguments.push_str(arguments);
             }
         }
+    }
+}
+
+pub(crate) fn insert_streaming_tool_calls(
+    calls: Vec<ChatToolCall>,
+    states: &mut BTreeMap<u64, StreamingToolCallState>,
+    last_tool_index: &mut u64,
+) {
+    let mut next_index = states
+        .keys()
+        .next_back()
+        .copied()
+        .unwrap_or(*last_tool_index)
+        .saturating_add(1);
+    for call in calls {
+        while states.contains_key(&next_index) {
+            next_index = next_index.saturating_add(1);
+        }
+        states.insert(
+            next_index,
+            StreamingToolCallState::from_chat_tool_call(call),
+        );
+        *last_tool_index = next_index;
+        next_index = next_index.saturating_add(1);
     }
 }
 

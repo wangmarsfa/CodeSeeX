@@ -1,3 +1,3 @@
 mod store;
 
-pub use store::{RequestStatus, Store};
+pub use store::{ClientToolHandoffCall, ClientToolHandoffGuardStop, RequestStatus, Store};

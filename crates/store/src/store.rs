@@ -22,6 +22,11 @@ const MAX_MEMORY_STRING_CHARS: usize = 64 * 1024;
 const MAX_MEMORY_ARRAY_ITEMS: usize = 256;
 const MAX_USAGE_SESSION_TITLE_CHARS: usize = 80;
 const MAX_USAGE_SEGMENT_SUMMARY_CHARS: usize = 180;
+const MAX_CLIENT_HANDOFF_GUARD_TURNS: usize = 128;
+const MAX_CLIENT_HANDOFF_PENDING_CALLS: usize = 512;
+const MAX_CLIENT_HANDOFF_FAILURES: u32 = 3;
+const MAX_CLIENT_HANDOFF_SIGNATURE_REPEATS: u32 = 3;
+const MAX_CLIENT_HANDOFF_REQUESTS_PER_TURN: u32 = 12;
 const IN_PROGRESS_TTL_SECONDS: i64 = 6 * 60 * 60;
 const LOG_TAIL_CHUNK_BYTES: u64 = 64 * 1024;
 #[cfg(any(debug_assertions, test))]
@@ -43,6 +48,64 @@ struct StoreInner {
     request_order: VecDeque<String>,
     events: VecDeque<EventRecord>,
     next_event_id: i64,
+    client_handoff_guard: ClientHandoffGuardState,
+}
+
+#[derive(Debug, Default)]
+struct ClientHandoffGuardState {
+    turns: HashMap<String, ClientHandoffTurnState>,
+    pending_by_call_id: HashMap<String, ClientHandoffPendingCall>,
+    turn_order: VecDeque<String>,
+}
+
+#[derive(Debug, Default)]
+struct ClientHandoffTurnState {
+    handoff_requests: u32,
+    tool_calls: u32,
+    signature_counts: HashMap<String, u32>,
+    consecutive_failures_by_tool: HashMap<String, u32>,
+    cumulative_input_tokens: u64,
+    cumulative_total_tokens: u64,
+    updated_at: Option<DateTime<Utc>>,
+    stopped: Option<ClientToolHandoffGuardStop>,
+}
+
+#[derive(Debug, Clone)]
+struct ClientHandoffPendingCall {
+    turn_key: String,
+    name: String,
+    arguments_hash: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ClientToolHandoffCall {
+    pub call_id: String,
+    pub name: String,
+    pub arguments: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ClientToolHandoffGuardStop {
+    pub code: String,
+    pub message: String,
+    pub reason: String,
+    pub turn_key: String,
+    pub tool_name: Option<String>,
+    pub arguments_hash: Option<String>,
+    pub failure_summary: Option<String>,
+    pub failure_summary_hash: Option<String>,
+    pub handoff_requests: u32,
+    pub tool_calls: u32,
+    pub repeated_signature_count: u32,
+    pub consecutive_failure_count: u32,
+    pub cumulative_input_tokens: u64,
+    pub cumulative_total_tokens: u64,
+}
+
+impl ClientToolHandoffGuardStop {
+    pub fn diagnostic(&self) -> Value {
+        json!(self)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -164,6 +227,7 @@ pub struct RuntimeSummary {
     pub billable_request_count: u64,
     pub failed_request_count: u64,
     pub last_request_at: Option<String>,
+    pub last_activity_at: Option<String>,
     pub last_turn: Option<RequestTurn>,
     pub last_billable_request: Option<RequestTurn>,
     pub turn_history: Vec<RequestTurn>,
@@ -522,6 +586,199 @@ impl Store {
         request.diagnostic = Some(memory_json_value(diagnostic));
         request.updated_at = Utc::now();
         Ok(())
+    }
+
+    pub async fn settle_client_tool_handoff_outputs(
+        &self,
+        request_id: &str,
+        input: &Value,
+    ) -> Result<Option<ClientToolHandoffGuardStop>> {
+        let mut inner = self.lock_inner()?;
+        let turn_key = client_handoff_turn_key(input);
+        let output_items = client_handoff_output_items(input);
+        if output_items.is_empty() {
+            return Ok(None);
+        }
+        prune_client_handoff_guard(&mut inner.client_handoff_guard);
+        let mut stop = None;
+        for output in output_items {
+            let call_id = output.call_id.trim().to_owned();
+            let Some(pending) = inner
+                .client_handoff_guard
+                .pending_by_call_id
+                .remove(&call_id)
+            else {
+                continue;
+            };
+            let effective_turn_key = if pending.turn_key.is_empty() {
+                turn_key.clone()
+            } else {
+                pending.turn_key.clone()
+            };
+            ensure_client_handoff_turn(&mut inner.client_handoff_guard, &effective_turn_key);
+            let state = inner
+                .client_handoff_guard
+                .turns
+                .get_mut(&effective_turn_key)
+                .expect("guard turn state should exist");
+            state.updated_at = Some(Utc::now());
+            if output.failed {
+                let failure_count = {
+                    let count = state
+                        .consecutive_failures_by_tool
+                        .entry(pending.name.clone())
+                        .or_insert(0);
+                    *count = count.saturating_add(1);
+                    *count
+                };
+                if failure_count >= MAX_CLIENT_HANDOFF_FAILURES && stop.is_none() {
+                    stop = Some(client_handoff_guard_stop(
+                        "consecutive_failures",
+                        &effective_turn_key,
+                        Some(&pending.name),
+                        Some(&pending.arguments_hash),
+                        output.failure_summary.as_deref(),
+                        state,
+                        0,
+                        failure_count,
+                    ));
+                }
+            } else {
+                state
+                    .consecutive_failures_by_tool
+                    .insert(pending.name.clone(), 0);
+            }
+        }
+        if let Some(stop) = stop.clone() {
+            if let Some(state) = inner.client_handoff_guard.turns.get_mut(&stop.turn_key) {
+                state.stopped = Some(stop.clone());
+            }
+        }
+        if let Some(stop) = stop.as_ref() {
+            mark_request_guard_stopped(&mut inner, request_id, stop);
+        }
+        Ok(stop)
+    }
+
+    pub async fn record_client_tool_handoff_calls(
+        &self,
+        request_id: &str,
+        input: &Value,
+        calls: &[ClientToolHandoffCall],
+        usage: Option<&Value>,
+    ) -> Result<Option<ClientToolHandoffGuardStop>> {
+        if calls.is_empty() {
+            return Ok(None);
+        }
+        let mut inner = self.lock_inner()?;
+        prune_client_handoff_guard(&mut inner.client_handoff_guard);
+        let turn_key = client_handoff_turn_key(input);
+        ensure_client_handoff_turn(&mut inner.client_handoff_guard, &turn_key);
+        if let Some(stop) = inner
+            .client_handoff_guard
+            .turns
+            .get(&turn_key)
+            .and_then(|state| state.stopped.clone())
+        {
+            mark_request_guard_stopped(&mut inner, request_id, &stop);
+            return Ok(Some(stop));
+        }
+        let usage_input = usage_input_tokens(usage.unwrap_or(&Value::Null));
+        let usage_total = usage_total_tokens(usage.unwrap_or(&Value::Null), usage_input);
+        let state = inner
+            .client_handoff_guard
+            .turns
+            .get_mut(&turn_key)
+            .expect("guard turn state should exist");
+        state.handoff_requests = state.handoff_requests.saturating_add(1);
+        state.tool_calls = state
+            .tool_calls
+            .saturating_add(u32::try_from(calls.len()).unwrap_or(u32::MAX));
+        state.cumulative_input_tokens = state.cumulative_input_tokens.saturating_add(usage_input);
+        state.cumulative_total_tokens = state.cumulative_total_tokens.saturating_add(usage_total);
+        state.updated_at = Some(Utc::now());
+
+        let mut stop = None;
+        let mut pending_calls = Vec::new();
+        for call in calls {
+            let arguments_hash = stable_hash_hex(call.arguments.as_bytes());
+            let signature = format!("{}\n{}", call.name, arguments_hash);
+            let repeat_count = {
+                let count = state.signature_counts.entry(signature.clone()).or_insert(0);
+                *count = count.saturating_add(1);
+                *count
+            };
+            pending_calls.push((
+                call.call_id.clone(),
+                ClientHandoffPendingCall {
+                    turn_key: turn_key.clone(),
+                    name: call.name.clone(),
+                    arguments_hash: arguments_hash.clone(),
+                },
+            ));
+            if repeat_count >= MAX_CLIENT_HANDOFF_SIGNATURE_REPEATS && stop.is_none() {
+                stop = Some(client_handoff_guard_stop(
+                    "repeated_signature",
+                    &turn_key,
+                    Some(&call.name),
+                    Some(&arguments_hash),
+                    None,
+                    state,
+                    repeat_count,
+                    0,
+                ));
+            }
+        }
+        if state.handoff_requests > MAX_CLIENT_HANDOFF_REQUESTS_PER_TURN && stop.is_none() {
+            stop = Some(client_handoff_guard_stop(
+                "handoff_request_budget",
+                &turn_key,
+                None,
+                None,
+                None,
+                state,
+                0,
+                0,
+            ));
+        }
+        if let Some(stop) = stop.clone() {
+            state.stopped = Some(stop);
+        }
+        let _ = state;
+        if stop.is_none() {
+            for (call_id, pending) in pending_calls {
+                inner
+                    .client_handoff_guard
+                    .pending_by_call_id
+                    .insert(call_id, pending);
+            }
+        }
+        if let Some(stop) = stop.as_ref() {
+            mark_request_guard_stopped(&mut inner, request_id, stop);
+        }
+        Ok(stop)
+    }
+
+    pub async fn client_tool_handoff_guard_preflight(
+        &self,
+        request_id: &str,
+        input: &Value,
+    ) -> Result<Option<ClientToolHandoffGuardStop>> {
+        let mut inner = self.lock_inner()?;
+        prune_client_handoff_guard(&mut inner.client_handoff_guard);
+        let turn_key = client_handoff_turn_key(input);
+        let stop = inner
+            .client_handoff_guard
+            .turns
+            .get_mut(&turn_key)
+            .and_then(|state| {
+                state.updated_at = Some(Utc::now());
+                state.stopped.clone()
+            });
+        if let Some(stop) = stop.as_ref() {
+            mark_request_guard_stopped(&mut inner, request_id, stop);
+        }
+        Ok(stop)
     }
 
     pub async fn recover_interrupted_requests(&self, reason: &str) -> Result<Vec<String>> {
@@ -1197,6 +1454,10 @@ fn is_safe_diagnostic_event_type(event_type: &str) -> bool {
         event_type,
         "client_tool_handoff_diagnostic"
             | "context_compile_diagnostic"
+            | "client_tool_handoff_guard_diagnostic"
+            | "deepseek_tool_protocol_adapted"
+            | "deepseek_tool_protocol_blocked"
+            | "deepseek_tool_protocol_parse_failed"
             | "retry_cache_diagnostic"
             | "tool_exposure_diagnostic"
             | "usage_template_preview_seeded"
@@ -1464,6 +1725,40 @@ fn compact_event_detail(event_type: &str, detail: &Value) -> Option<Value> {
                 ],
             );
         }
+        "deepseek_tool_protocol_adapted"
+        | "deepseek_tool_protocol_blocked"
+        | "deepseek_tool_protocol_parse_failed" => copy_log_fields(
+            object,
+            &mut output,
+            &[
+                "id",
+                "iteration",
+                "channel",
+                "tool_count",
+                "tool_names",
+                "tools_available",
+            ],
+        ),
+        "client_tool_handoff_guard_diagnostic" => copy_log_fields(
+            object,
+            &mut output,
+            &[
+                "id",
+                "code",
+                "reason",
+                "turn_key",
+                "tool_name",
+                "arguments_hash",
+                "failure_summary",
+                "failure_summary_hash",
+                "handoff_requests",
+                "tool_calls",
+                "repeated_signature_count",
+                "consecutive_failure_count",
+                "cumulative_input_tokens",
+                "cumulative_total_tokens",
+            ],
+        ),
         "retry_cache_diagnostic" => {
             copy_log_fields(
                 object,
@@ -1990,6 +2285,12 @@ fn runtime_summary_from_inner(
         .or(last_turn.as_ref())
         .map(|turn| turn.completed_at.clone());
     let usage_sessions = usage_sessions_from_inner(inner, &turn_history, &billable_history);
+    let last_activity_at = usage_sessions
+        .iter()
+        .map(|session| session.completed_at.clone())
+        .chain(inner.events.iter().map(|event| event.ts.clone()))
+        .max()
+        .or_else(|| last_request_at.clone());
     let billable_totals = inner
         .request_order
         .iter()
@@ -2021,6 +2322,7 @@ fn runtime_summary_from_inner(
         billable_request_count,
         failed_request_count,
         last_request_at,
+        last_activity_at,
         last_turn,
         last_billable_request,
         turn_history,
@@ -2044,6 +2346,12 @@ fn usage_sessions_from_inner(
         .map(|turn| (turn.id.clone(), turn))
         .collect::<HashMap<_, _>>();
     let mut sessions = Vec::new();
+    let final_turn_ids = turn_history
+        .iter()
+        .map(|turn| turn.id.as_str())
+        .collect::<HashSet<_>>();
+    let mut handoff_ids_by_final_id = orphan_handoffs_by_final_turn(inner, turn_history);
+    let mut guard_stop_ids_by_final_id = guard_stopped_requests_by_final_turn(inner, turn_history);
 
     for final_turn in turn_history {
         let chain = usage_chain_for_final_turn(inner, &final_turn.id);
@@ -2053,9 +2361,42 @@ fn usage_sessions_from_inner(
                 rows.push(usage_session_row(&turn, turn.id == final_turn.id));
             }
         }
+        if let Some(handoff_ids) = handoff_ids_by_final_id.remove(&final_turn.id) {
+            let existing = rows
+                .iter()
+                .map(|row| row.id.clone())
+                .collect::<HashSet<_>>();
+            for id in handoff_ids {
+                if existing.contains(&id) {
+                    continue;
+                }
+                if let Some(turn) = billable_by_id.remove(&id) {
+                    rows.push(usage_session_row(&turn, false));
+                }
+            }
+        }
+        if let Some(guard_stop_ids) = guard_stop_ids_by_final_id.remove(&final_turn.id) {
+            let existing = rows
+                .iter()
+                .map(|row| row.id.clone())
+                .collect::<HashSet<_>>();
+            for id in guard_stop_ids {
+                if existing.contains(&id) {
+                    continue;
+                }
+                if let Some(turn) = billable_by_id.remove(&id) {
+                    rows.push(usage_session_row(&turn, false));
+                }
+            }
+        }
         if rows.is_empty() {
             rows.push(usage_session_row(final_turn, true));
         }
+        rows.sort_by(|left, right| {
+            row_sort_ts(inner, &left.id)
+                .cmp(&row_sort_ts(inner, &right.id))
+                .then(left.id.cmp(&right.id))
+        });
         sessions.push(usage_session_from_rows(
             final_turn,
             inner.requests.get(&final_turn.id),
@@ -2065,8 +2406,58 @@ fn usage_sessions_from_inner(
         ));
     }
 
+    let mut non_final_rows = billable_by_id
+        .values()
+        .filter(|turn| {
+            turn.lifecycle == "client_tool_handoff"
+                || request_has_guard_stopped_by_id(inner, &turn.id)
+        })
+        .filter_map(|turn| {
+            let request = inner.requests.get(&turn.id)?;
+            Some((
+                usage_non_final_session_key(request),
+                request.created_at,
+                turn.id.clone(),
+            ))
+        })
+        .collect::<Vec<_>>();
+    non_final_rows.sort_by(|left, right| left.1.cmp(&right.1).then(left.2.cmp(&right.2)));
+    let mut non_final_session_ids = HashSet::new();
+    for (session_key, _, _id) in non_final_rows {
+        if !non_final_session_ids.insert(session_key.clone()) {
+            continue;
+        }
+        let ids = billable_by_id
+            .values()
+            .filter_map(|turn| {
+                let request = inner.requests.get(&turn.id)?;
+                (usage_non_final_session_key(request) == session_key).then_some(turn.id.clone())
+            })
+            .collect::<Vec<_>>();
+        let mut rows = Vec::new();
+        for id in ids {
+            if let Some(turn) = billable_by_id.remove(&id) {
+                rows.push(usage_session_row(&turn, false));
+            }
+        }
+        rows.sort_by(|left, right| {
+            row_sort_ts(inner, &left.id)
+                .cmp(&row_sort_ts(inner, &right.id))
+                .then(left.id.cmp(&right.id))
+        });
+        if let Some(anchor) = rows.last().cloned() {
+            sessions.push(usage_non_final_session_from_rows(inner, anchor, rows));
+        }
+    }
+
     for turn in billable_history {
         if let Some(turn) = billable_by_id.remove(&turn.id) {
+            if (turn.lifecycle == "client_tool_handoff"
+                || request_has_guard_stopped_by_id(inner, &turn.id))
+                && !final_turn_ids.contains(turn.id.as_str())
+            {
+                continue;
+            }
             let rows = vec![usage_session_row(&turn, false)];
             sessions.push(usage_session_from_rows(
                 &turn,
@@ -2119,6 +2510,191 @@ fn usage_chain_for_final_turn(inner: &StoreInner, final_id: &str) -> Vec<String>
     }
     newest_first.reverse();
     newest_first
+}
+
+fn orphan_handoffs_by_final_turn(
+    inner: &StoreInner,
+    turn_history: &[RequestTurn],
+) -> HashMap<String, Vec<String>> {
+    let chain_ids = turn_history
+        .iter()
+        .flat_map(|turn| usage_chain_for_final_turn(inner, &turn.id))
+        .collect::<HashSet<_>>();
+    let mut finals = turn_history
+        .iter()
+        .filter_map(|turn| {
+            let request = inner.requests.get(&turn.id)?;
+            Some(UsageFinalAnchor {
+                id: turn.id.clone(),
+                created_at: request.created_at,
+                summary_key: usage_summary_key(request),
+                full_context_key: usage_full_context_key(request),
+                prompt_cache_key: usage_prompt_cache_key(request),
+            })
+        })
+        .collect::<Vec<_>>();
+    finals.sort_by(|left, right| {
+        left.created_at
+            .cmp(&right.created_at)
+            .then(left.id.cmp(&right.id))
+    });
+    let mut output: HashMap<String, Vec<String>> = HashMap::new();
+    for request in inner
+        .request_order
+        .iter()
+        .filter_map(|id| inner.requests.get(id))
+    {
+        if chain_ids.contains(&request.id) || request_lifecycle(request) != "client_tool_handoff" {
+            continue;
+        }
+        let Some(anchor_id) = usage_final_anchor_for_handoff(request, &finals) else {
+            continue;
+        };
+        output
+            .entry(anchor_id)
+            .or_default()
+            .push(request.id.clone());
+    }
+    output
+}
+
+fn guard_stopped_requests_by_final_turn(
+    inner: &StoreInner,
+    turn_history: &[RequestTurn],
+) -> HashMap<String, Vec<String>> {
+    let mut finals = turn_history
+        .iter()
+        .filter_map(|turn| {
+            let request = inner.requests.get(&turn.id)?;
+            Some(UsageFinalAnchor {
+                id: turn.id.clone(),
+                created_at: request.created_at,
+                summary_key: usage_summary_key(request),
+                full_context_key: usage_full_context_key(request),
+                prompt_cache_key: usage_prompt_cache_key(request),
+            })
+        })
+        .collect::<Vec<_>>();
+    finals.sort_by(|left, right| {
+        left.created_at
+            .cmp(&right.created_at)
+            .then(left.id.cmp(&right.id))
+    });
+    let mut output: HashMap<String, Vec<String>> = HashMap::new();
+    for request in inner
+        .request_order
+        .iter()
+        .filter_map(|id| inner.requests.get(id))
+    {
+        if !request_has_guard_stopped(request) {
+            continue;
+        }
+        let Some(anchor_id) = usage_final_anchor_for_handoff(request, &finals) else {
+            continue;
+        };
+        output
+            .entry(anchor_id)
+            .or_default()
+            .push(request.id.clone());
+    }
+    output
+}
+
+#[derive(Debug)]
+struct UsageFinalAnchor {
+    id: String,
+    created_at: DateTime<Utc>,
+    summary_key: Option<String>,
+    full_context_key: Option<String>,
+    prompt_cache_key: Option<String>,
+}
+
+fn usage_final_anchor_for_handoff(
+    handoff: &StoredRequest,
+    finals: &[UsageFinalAnchor],
+) -> Option<String> {
+    let summary_key = usage_summary_key(handoff);
+    let full_context_key = usage_full_context_key(handoff);
+    let prompt_cache_key = usage_prompt_cache_key(handoff);
+    let mut fallback = None;
+    for final_turn in finals {
+        if final_turn.created_at < handoff.created_at {
+            continue;
+        }
+        let delay = final_turn
+            .created_at
+            .signed_duration_since(handoff.created_at);
+        if delay > Duration::minutes(20) {
+            break;
+        }
+        if summary_key.is_some() && summary_key == final_turn.summary_key {
+            return Some(final_turn.id.clone());
+        }
+        if full_context_key.is_some() && full_context_key == final_turn.full_context_key {
+            return Some(final_turn.id.clone());
+        }
+        if prompt_cache_key.is_some() && prompt_cache_key == final_turn.prompt_cache_key {
+            fallback = Some(final_turn.id.clone());
+        } else if fallback.is_none() && delay <= Duration::minutes(3) {
+            fallback = Some(final_turn.id.clone());
+        }
+    }
+    fallback
+}
+
+fn row_sort_ts(inner: &StoreInner, request_id: &str) -> DateTime<Utc> {
+    inner
+        .requests
+        .get(request_id)
+        .map(|request| request.created_at)
+        .unwrap_or_else(Utc::now)
+}
+
+fn usage_summary_key(request: &StoredRequest) -> Option<String> {
+    latest_user_summary(request).map(|summary| stable_hash_hex(summary.as_bytes()))
+}
+
+fn usage_full_context_key(request: &StoredRequest) -> Option<String> {
+    request
+        .input
+        .pointer("/_codeseex_runtime/original_input_hash")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+}
+
+fn usage_prompt_cache_key(request: &StoredRequest) -> Option<String> {
+    request
+        .input
+        .get("prompt_cache_key")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| stable_hash_hex(value.as_bytes()))
+}
+
+fn usage_non_final_session_key(request: &StoredRequest) -> String {
+    usage_summary_key(request)
+        .map(|key| format!("summary:{key}"))
+        .or_else(|| usage_full_context_key(request).map(|key| format!("full_context:{key}")))
+        .or_else(|| usage_prompt_cache_key(request).map(|key| format!("prompt_cache:{key}")))
+        .unwrap_or_else(|| format!("request:{}", request.id))
+}
+
+fn request_has_guard_stopped(request: &StoredRequest) -> bool {
+    request
+        .diagnostic
+        .as_ref()
+        .and_then(|diagnostic| diagnostic.get("client_tool_handoff_guard_stopped"))
+        .and_then(Value::as_bool)
+        == Some(true)
+}
+
+fn request_has_guard_stopped_by_id(inner: &StoreInner, id: &str) -> bool {
+    inner
+        .requests
+        .get(id)
+        .map(request_has_guard_stopped)
+        .unwrap_or(false)
 }
 
 fn usage_session_from_rows(
@@ -2212,6 +2788,58 @@ fn usage_session_from_active_request(
         rows: Vec::new(),
         technical_details: usage_session_technical_details(&anchor, &[]),
     })
+}
+
+fn usage_non_final_session_from_rows(
+    inner: &StoreInner,
+    anchor_row: UsageSessionRow,
+    rows: Vec<UsageSessionRow>,
+) -> UsageSession {
+    let anchor_request = inner.requests.get(&anchor_row.id);
+    let title_turn = RequestTurn {
+        id: anchor_row.id.clone(),
+        model: anchor_row.model.clone(),
+        requested_model: anchor_row.requested_model.clone(),
+        reasoning_effort: anchor_row.reasoning_effort.clone(),
+        lifecycle: anchor_row.lifecycle.clone(),
+        conversation_turn: true,
+        billable: anchor_row.billable,
+        completed_at: anchor_row.completed_at.clone(),
+        cached_input_tokens: anchor_row.cached_input_tokens,
+        cache_miss_input_tokens: anchor_row.cache_miss_input_tokens,
+        output_tokens: anchor_row.output_tokens,
+        total_tokens: anchor_row.total_tokens,
+        request_ms: anchor_row.request_ms,
+    };
+    let cached_input_tokens = rows.iter().map(|row| row.cached_input_tokens).sum();
+    let cache_miss_input_tokens = rows.iter().map(|row| row.cache_miss_input_tokens).sum();
+    let output_tokens = rows.iter().map(|row| row.output_tokens).sum();
+    let total_tokens = rows.iter().map(|row| row.total_tokens).sum();
+    let request_ms = rows.iter().map(|row| row.request_ms).sum();
+    let status = if rows.iter().any(|row| row.status == "failed") {
+        "failed"
+    } else {
+        "completed"
+    }
+    .to_owned();
+    let (title, title_source) = usage_session_title(&title_turn, anchor_request);
+    let segments = usage_session_segments(inner, &rows);
+    UsageSession {
+        id: anchor_row.id.clone(),
+        title,
+        title_source,
+        completed_at: anchor_row.completed_at.clone(),
+        conversation_turn: false,
+        status,
+        cached_input_tokens,
+        cache_miss_input_tokens,
+        output_tokens,
+        total_tokens,
+        request_ms,
+        segments,
+        rows,
+        technical_details: usage_session_technical_details(&title_turn, &[]),
+    }
 }
 
 fn usage_session_row(turn: &RequestTurn, is_final: bool) -> UsageSessionRow {
@@ -2609,6 +3237,228 @@ fn request_has_service_diagnostic_event(inner: &StoreInner, request_id: &str) ->
     })
 }
 
+#[derive(Debug)]
+struct ClientHandoffOutputItem {
+    call_id: String,
+    failed: bool,
+    failure_summary: Option<String>,
+}
+
+fn ensure_client_handoff_turn(guard: &mut ClientHandoffGuardState, turn_key: &str) {
+    if !guard.turns.contains_key(turn_key) {
+        guard.turn_order.push_back(turn_key.to_owned());
+        guard
+            .turns
+            .insert(turn_key.to_owned(), ClientHandoffTurnState::default());
+    }
+    prune_client_handoff_guard(guard);
+}
+
+fn prune_client_handoff_guard(guard: &mut ClientHandoffGuardState) {
+    while guard.turn_order.len() > MAX_CLIENT_HANDOFF_GUARD_TURNS {
+        let Some(oldest) = guard.turn_order.pop_front() else {
+            break;
+        };
+        guard.turns.remove(&oldest);
+        guard
+            .pending_by_call_id
+            .retain(|_, pending| pending.turn_key != oldest);
+    }
+    if guard.pending_by_call_id.len() > MAX_CLIENT_HANDOFF_PENDING_CALLS {
+        let excess = guard
+            .pending_by_call_id
+            .len()
+            .saturating_sub(MAX_CLIENT_HANDOFF_PENDING_CALLS);
+        let keys = guard
+            .pending_by_call_id
+            .keys()
+            .take(excess)
+            .cloned()
+            .collect::<Vec<_>>();
+        for key in keys {
+            guard.pending_by_call_id.remove(&key);
+        }
+    }
+}
+
+fn mark_request_guard_stopped(
+    inner: &mut StoreInner,
+    request_id: &str,
+    stop: &ClientToolHandoffGuardStop,
+) {
+    if let Some(request) = inner.requests.get_mut(request_id) {
+        request.diagnostic = Some(merge_request_diagnostic(
+            request.diagnostic.as_ref(),
+            &json!({
+                "codeseex_lifecycle": "failed_billable",
+                "client_tool_handoff_guard_stopped": true,
+                "client_tool_handoff_guard": stop.diagnostic()
+            }),
+        ));
+        request.updated_at = Utc::now();
+    }
+}
+
+fn client_handoff_guard_stop(
+    reason: &str,
+    turn_key: &str,
+    tool_name: Option<&str>,
+    arguments_hash: Option<&str>,
+    failure_summary: Option<&str>,
+    state: &ClientHandoffTurnState,
+    repeated_signature_count: u32,
+    consecutive_failure_count: u32,
+) -> ClientToolHandoffGuardStop {
+    let failure_summary = failure_summary.and_then(compact_client_handoff_failure_summary);
+    let failure_summary_hash = failure_summary
+        .as_ref()
+        .map(|value| stable_hash_hex(value.as_bytes()));
+    let message = match reason {
+        "consecutive_failures" => format!(
+            "CodeSeeX stopped repeated client tool handoffs after {consecutive_failure_count} consecutive failure(s) for tool '{}'.",
+            tool_name.unwrap_or("unknown")
+        ),
+        "repeated_signature" => format!(
+            "CodeSeeX stopped repeated client tool handoffs after the same tool call signature repeated {repeated_signature_count} time(s)."
+        ),
+        "handoff_request_budget" => format!(
+            "CodeSeeX stopped client tool handoffs after {} handoff request(s) in one user turn.",
+            state.handoff_requests
+        ),
+        _ => "CodeSeeX stopped repeated client tool handoffs.".to_owned(),
+    };
+    ClientToolHandoffGuardStop {
+        code: "client_tool_handoff_guard_stopped".to_owned(),
+        message,
+        reason: reason.to_owned(),
+        turn_key: turn_key.to_owned(),
+        tool_name: tool_name.map(str::to_owned),
+        arguments_hash: arguments_hash.map(str::to_owned),
+        failure_summary,
+        failure_summary_hash,
+        handoff_requests: state.handoff_requests,
+        tool_calls: state.tool_calls,
+        repeated_signature_count,
+        consecutive_failure_count,
+        cumulative_input_tokens: state.cumulative_input_tokens,
+        cumulative_total_tokens: state.cumulative_total_tokens,
+    }
+}
+
+fn client_handoff_turn_key(input: &Value) -> String {
+    runtime_latest_user_summary(input)
+        .map(|summary| format!("summary:{}", stable_hash_hex(summary.as_bytes())))
+        .or_else(|| {
+            input
+                .pointer("/_codeseex_runtime/original_input_hash")
+                .and_then(Value::as_str)
+                .map(|hash| format!("full_context:{hash}"))
+        })
+        .or_else(|| {
+            input
+                .get("prompt_cache_key")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(|value| format!("prompt_cache:{}", stable_hash_hex(value.as_bytes())))
+        })
+        .or_else(|| {
+            latest_user_summary_from_input(input)
+                .map(|summary| format!("input:{}", stable_hash_hex(summary.as_bytes())))
+        })
+        .unwrap_or_else(|| format!("request:{}", stable_hash_hex(input.to_string().as_bytes())))
+}
+
+fn client_handoff_output_items(input: &Value) -> Vec<ClientHandoffOutputItem> {
+    let items = input
+        .get("input")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    items
+        .iter()
+        .filter(|item| {
+            matches!(
+                item.get("type").and_then(Value::as_str),
+                Some("function_call_output")
+                    | Some("custom_tool_call_output")
+                    | Some("tool_search_output")
+            )
+        })
+        .filter_map(|item| {
+            let call_id = item
+                .get("call_id")
+                .or_else(|| item.get("tool_call_id"))
+                .or_else(|| item.get("id"))
+                .and_then(Value::as_str)?
+                .to_owned();
+            let output = item
+                .get("output")
+                .or_else(|| item.get("content"))
+                .or_else(|| item.get("result"))
+                .unwrap_or(&Value::Null);
+            let (failed, failure_summary) = client_handoff_output_failure(output);
+            Some(ClientHandoffOutputItem {
+                call_id,
+                failed,
+                failure_summary,
+            })
+        })
+        .collect()
+}
+
+fn client_handoff_output_failure(output: &Value) -> (bool, Option<String>) {
+    if output.get("ok").and_then(Value::as_bool) == Some(false)
+        || output.get("error").is_some()
+        || output
+            .get("status")
+            .and_then(Value::as_str)
+            .map(|status| {
+                let status = status.trim().to_ascii_lowercase();
+                matches!(status.as_str(), "failed" | "error" | "cancelled")
+            })
+            .unwrap_or(false)
+    {
+        return (true, Some(content_to_text(output)));
+    }
+    let text = content_to_text(output);
+    let normalized = text.trim().to_ascii_lowercase();
+    let failed = normalized.starts_with("error:")
+        || normalized.starts_with("failed:")
+        || normalized.contains("apply_patch verification failed")
+        || normalized.contains("tool execution failed")
+        || normalized.contains("traceback (most recent call last)");
+    (failed, failed.then_some(text))
+}
+
+fn compact_client_handoff_failure_summary(value: &str) -> Option<String> {
+    let text = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    if text.chars().count() <= MAX_USAGE_SEGMENT_SUMMARY_CHARS {
+        return Some(text.to_owned());
+    }
+    Some(format!(
+        "{}...",
+        text.chars()
+            .take(MAX_USAGE_SEGMENT_SUMMARY_CHARS.saturating_sub(1))
+            .collect::<String>()
+    ))
+}
+
+fn usage_input_tokens(usage: &Value) -> u64 {
+    first_u64(usage, &["input_tokens", "prompt_tokens"]).unwrap_or(0)
+}
+
+fn usage_total_tokens(usage: &Value, input_tokens: u64) -> u64 {
+    first_u64(usage, &["total_tokens"]).unwrap_or_else(|| {
+        input_tokens
+            .saturating_add(first_u64(usage, &["output_tokens", "completion_tokens"]).unwrap_or(0))
+    })
+}
+
 fn sanitize_segment_id(value: &str) -> String {
     value
         .chars()
@@ -2763,7 +3613,14 @@ fn usage_session_technical_details(
 }
 
 fn request_is_completed_final_turn(request: &StoredRequest) -> bool {
-    request.status == RequestStatus::Completed && request_lifecycle(request) == "final_turn"
+    request.status == RequestStatus::Completed
+        && request_lifecycle(request) == "final_turn"
+        && request
+            .diagnostic
+            .as_ref()
+            .and_then(|diagnostic| diagnostic.get("client_tool_handoff_guard_stopped"))
+            .and_then(Value::as_bool)
+            != Some(true)
 }
 
 fn request_is_completed_billable_request(request: &StoredRequest) -> bool {
@@ -3336,6 +4193,156 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn client_handoff_guard_stops_repeated_failures_for_same_turn() {
+        let dir = temp_dir("client-handoff-guard-failures");
+        let store = Store::open(&dir).await.expect("open store");
+        let input = json!({
+            "model": "deepseek-v4-pro",
+            "prompt_cache_key": "thread-a",
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "edit the file" }]
+            }]
+        });
+
+        for index in 0..3 {
+            let request_id = format!("resp_handoff_{index}");
+            store
+                .checkpoint_request(&request_id, None, Some("deepseek-v4-pro"), &input)
+                .await
+                .expect("checkpoint");
+            let stop = store
+                .record_client_tool_handoff_calls(
+                    &request_id,
+                    &input,
+                    &[ClientToolHandoffCall {
+                        call_id: format!("call_patch_{index}"),
+                        name: "apply_patch".to_owned(),
+                        arguments: format!("patch {index}"),
+                    }],
+                    Some(&json!({ "input_tokens": 10, "total_tokens": 12 })),
+                )
+                .await
+                .expect("record handoff");
+            assert!(stop.is_none());
+            let followup_id = format!("resp_followup_{index}");
+            let followup_input = json!({
+                "model": "deepseek-v4-pro",
+                "prompt_cache_key": "thread-a",
+                "input": [{
+                    "type": "custom_tool_call_output",
+                    "call_id": format!("call_patch_{index}"),
+                    "output": "apply_patch verification failed: invalid patch"
+                }]
+            });
+            store
+                .checkpoint_request(&followup_id, None, Some("deepseek-v4-pro"), &followup_input)
+                .await
+                .expect("checkpoint followup");
+            let stop = store
+                .settle_client_tool_handoff_outputs(&followup_id, &followup_input)
+                .await
+                .expect("settle output");
+            if index < 2 {
+                assert!(stop.is_none());
+            } else {
+                let stop = stop.expect("third consecutive failure should stop");
+                assert_eq!(stop.code, "client_tool_handoff_guard_stopped");
+                assert_eq!(stop.reason, "consecutive_failures");
+                assert_eq!(stop.tool_name.as_deref(), Some("apply_patch"));
+                assert_eq!(stop.consecutive_failure_count, 3);
+                assert_eq!(stop.cumulative_total_tokens, 36);
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn client_handoff_guard_stops_repeated_signatures() {
+        let dir = temp_dir("client-handoff-guard-signatures");
+        let store = Store::open(&dir).await.expect("open store");
+        let input = json!({
+            "model": "deepseek-v4-pro",
+            "prompt_cache_key": "thread-b",
+            "input": "run the same client tool"
+        });
+        let mut stop = None;
+        for index in 0..3 {
+            let request_id = format!("resp_repeat_{index}");
+            store
+                .checkpoint_request(&request_id, None, Some("deepseek-v4-pro"), &input)
+                .await
+                .expect("checkpoint");
+            stop = store
+                .record_client_tool_handoff_calls(
+                    &request_id,
+                    &input,
+                    &[ClientToolHandoffCall {
+                        call_id: format!("call_repeat_{index}"),
+                        name: "shell_command".to_owned(),
+                        arguments: "{\"command\":\"date\"}".to_owned(),
+                    }],
+                    Some(&json!({ "input_tokens": 20, "total_tokens": 22 })),
+                )
+                .await
+                .expect("record handoff");
+        }
+        let stop = stop.expect("third repeated signature should stop");
+        assert_eq!(stop.reason, "repeated_signature");
+        assert_eq!(stop.tool_name.as_deref(), Some("shell_command"));
+        assert_eq!(stop.repeated_signature_count, 3);
+        assert_eq!(stop.cumulative_total_tokens, 66);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn client_handoff_guard_preflight_stops_after_turn_is_stopped() {
+        let dir = temp_dir("client-handoff-guard-preflight");
+        let store = Store::open(&dir).await.expect("open store");
+        let input = json!({
+            "model": "deepseek-v4-pro",
+            "prompt_cache_key": "guard-thread",
+            "input": [{ "type": "message", "role": "user", "content": "run a client command" }]
+        });
+        for index in 0..3 {
+            let request_id = format!("resp_handoff_{index}");
+            let stop = store
+                .record_client_tool_handoff_calls(
+                    &request_id,
+                    &input,
+                    &[ClientToolHandoffCall {
+                        call_id: format!("call_shell_{index}"),
+                        name: "shell_command".to_owned(),
+                        arguments: "{\"command\":\"date\"}".to_owned(),
+                    }],
+                    Some(&json!({ "input_tokens": 10, "output_tokens": 1, "total_tokens": 11 })),
+                )
+                .await
+                .expect("record handoff");
+            if index < 2 {
+                assert!(stop.is_none());
+            } else {
+                assert_eq!(
+                    stop.as_ref().map(|stop| stop.reason.as_str()),
+                    Some("repeated_signature")
+                );
+            }
+        }
+
+        let stop = store
+            .client_tool_handoff_guard_preflight("resp_followup", &input)
+            .await
+            .expect("preflight")
+            .expect("stopped turn should be remembered");
+        assert_eq!(stop.reason, "repeated_signature");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
     async fn runtime_summary_groups_usage_sessions_by_conversation_chain() {
         let dir = temp_dir("usage-session-chain");
         let store = Store::open(&dir).await.expect("open store");
@@ -3517,6 +4524,195 @@ mod tests {
                 || row.label.contains("写入用量")
                 || row.label == "合计")
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn runtime_summary_groups_orphan_handoffs_into_nearest_user_turn() {
+        let dir = temp_dir("usage-session-orphan-handoffs");
+        let store = Store::open(&dir).await.expect("open store");
+        for index in 0..2 {
+            let id = format!("resp_orphan_handoff_{index}");
+            store
+                .checkpoint_request(
+                    &id,
+                    None,
+                    Some("deepseek-v4-pro"),
+                    &json!({
+                        "model": "deepseek-v4-pro",
+                        "prompt_cache_key": "thread-usage",
+                        "input": [{
+                            "type": "message",
+                            "role": "user",
+                            "content": [{ "type": "input_text", "text": "请检查工具暴露链路，只分析不改代码" }]
+                        }],
+                        "reasoning": { "effort": "high" }
+                    }),
+                )
+                .await
+                .expect("checkpoint handoff");
+            store
+                .finish_request(
+                    &id,
+                    RequestStatus::Completed,
+                    Some(&json!({
+                        "model": "deepseek-v4-pro",
+                        "usage": {
+                            "cached_input_tokens": 100 * (index + 1),
+                            "cache_miss_input_tokens": 10,
+                            "output_tokens": 2,
+                            "total_tokens": 112 * (index + 1)
+                        }
+                    })),
+                    Some(&json!({ "codeseex_lifecycle": "client_tool_handoff" })),
+                )
+                .await
+                .expect("finish handoff");
+        }
+        store
+            .checkpoint_request(
+                "resp_final_orphan_group",
+                None,
+                Some("deepseek-v4-pro"),
+                &json!({
+                    "model": "deepseek-v4-pro",
+                    "prompt_cache_key": "thread-usage",
+                    "input": [{
+                        "type": "message",
+                        "role": "user",
+                        "content": [{ "type": "input_text", "text": "请检查工具暴露链路，只分析不改代码" }]
+                    }],
+                    "reasoning": { "effort": "high" }
+                }),
+            )
+            .await
+            .expect("checkpoint final");
+        store
+            .finish_request(
+                "resp_final_orphan_group",
+                RequestStatus::Completed,
+                Some(&json!({
+                    "model": "deepseek-v4-pro",
+                    "usage": {
+                        "cached_input_tokens": 500,
+                        "cache_miss_input_tokens": 20,
+                        "output_tokens": 6,
+                        "total_tokens": 526
+                    }
+                })),
+                None,
+            )
+            .await
+            .expect("finish final");
+
+        let summary = store.runtime_summary(10).await.expect("summary");
+        assert_eq!(summary.request_count, 1);
+        assert_eq!(summary.billable_request_count, 3);
+        assert_eq!(summary.usage_sessions.len(), 1);
+        let session = &summary.usage_sessions[0];
+        assert_eq!(session.id, "resp_final_orphan_group");
+        assert_eq!(session.rows.len(), 3);
+        assert_eq!(session.rows[0].kind, "intermediate_reply");
+        assert_eq!(session.rows[1].kind, "intermediate_reply");
+        assert_eq!(session.rows[2].kind, "final_reply");
+        assert_eq!(session.cache_miss_input_tokens, 40);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn runtime_summary_groups_non_final_handoff_guard_chain_into_one_session() {
+        let dir = temp_dir("usage-session-handoff-guard-chain");
+        let store = Store::open(&dir).await.expect("open store");
+        for index in 0..2 {
+            let id = format!("resp_handoff_guard_chain_{index}");
+            store
+                .checkpoint_request(
+                    &id,
+                    None,
+                    Some("deepseek-v4-pro"),
+                    &json!({
+                        "model": "deepseek-v4-pro",
+                        "prompt_cache_key": "guard-session",
+                        "input": [{
+                            "type": "message",
+                            "role": "user",
+                            "content": [{ "type": "input_text", "text": "update a file with apply_patch" }]
+                        }]
+                    }),
+                )
+                .await
+                .expect("checkpoint handoff");
+            store
+                .finish_request(
+                    &id,
+                    RequestStatus::Completed,
+                    Some(&json!({
+                        "model": "deepseek-v4-pro",
+                        "usage": {
+                            "cached_input_tokens": 100,
+                            "cache_miss_input_tokens": 10,
+                            "output_tokens": 2,
+                            "total_tokens": 112
+                        }
+                    })),
+                    Some(&json!({ "codeseex_lifecycle": "client_tool_handoff" })),
+                )
+                .await
+                .expect("finish handoff");
+        }
+        store
+            .checkpoint_request(
+                "resp_guard_stopped",
+                None,
+                Some("deepseek-v4-pro"),
+                &json!({
+                    "model": "deepseek-v4-pro",
+                    "prompt_cache_key": "guard-session",
+                    "input": [{
+                        "type": "message",
+                        "role": "user",
+                        "content": [{ "type": "input_text", "text": "update a file with apply_patch" }]
+                    }]
+                }),
+            )
+            .await
+            .expect("checkpoint guard stop");
+        store
+            .finish_request(
+                "resp_guard_stopped",
+                RequestStatus::Completed,
+                Some(&json!({
+                    "model": "deepseek-v4-pro",
+                    "status": "completed",
+                    "usage": {
+                        "cached_input_tokens": 120,
+                        "cache_miss_input_tokens": 8,
+                        "output_tokens": 1,
+                        "total_tokens": 129
+                    }
+                })),
+                Some(&json!({
+                    "codeseex_lifecycle": "failed_billable",
+                    "client_tool_handoff_guard_stopped": true
+                })),
+            )
+            .await
+            .expect("finish guard stop");
+
+        let summary = store.runtime_summary(10).await.expect("summary");
+        assert_eq!(summary.request_count, 0);
+        assert_eq!(summary.billable_request_count, 3);
+        assert_eq!(summary.usage_sessions.len(), 1);
+        let session = &summary.usage_sessions[0];
+        assert!(!session.conversation_turn);
+        assert_eq!(session.rows.len(), 3);
+        assert_eq!(session.rows[0].kind, "intermediate_reply");
+        assert_eq!(session.rows[1].kind, "intermediate_reply");
+        assert_eq!(session.rows[2].kind, "failed_reply");
+        assert_eq!(session.cache_miss_input_tokens, 28);
+        assert_eq!(session.total_tokens, 353);
+
         let _ = std::fs::remove_dir_all(dir);
     }
 

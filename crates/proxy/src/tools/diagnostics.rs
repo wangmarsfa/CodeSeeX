@@ -33,7 +33,7 @@ pub(crate) fn prepare_tool_loop_recovery_payload(
     messages.push(json!({
         "role": "user",
         "content": format!(
-            "CodeSeeX stopped repeated unsuccessful web_search calls to avoid wasting tokens: {stop_message} Provide a final answer now using the available search results and tool diagnostics. If the evidence is insufficient, say so briefly."
+            "CodeSeeX stopped the tool loop and removed tools for this recovery turn: {stop_message} Provide the final answer now using only the existing conversation evidence, returned tool results, and diagnostics. Do not request or encode additional tool calls in the response text. If the evidence is insufficient, say so briefly."
         )
     }));
     Ok(())

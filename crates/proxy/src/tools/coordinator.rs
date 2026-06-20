@@ -22,7 +22,7 @@ use crate::tools::response_items::{
     proxy_visible_response_items, web_search_call_output_response_item,
 };
 use codeseex_core::AppConfig;
-use codeseex_store::Store;
+use codeseex_store::{ClientToolHandoffCall, Store};
 use serde_json::{json, Value};
 
 pub(crate) struct ToolLoopContext<'a> {
@@ -49,6 +49,7 @@ pub(crate) enum ToolLoopResult {
 }
 
 pub(crate) struct ToolLoopError {
+    pub(crate) code: String,
     pub(crate) message: String,
     pub(crate) usage: Value,
 }
@@ -56,6 +57,15 @@ pub(crate) struct ToolLoopError {
 impl ToolLoopError {
     fn new(message: impl Into<String>, usage: &Value) -> Self {
         Self {
+            code: "tool_loop_failed".to_owned(),
+            message: message.into(),
+            usage: usage.clone(),
+        }
+    }
+
+    fn with_code(code: impl Into<String>, message: impl Into<String>, usage: &Value) -> Self {
+        Self {
+            code: code.into(),
             message: message.into(),
             usage: usage.clone(),
         }
@@ -125,6 +135,37 @@ pub(crate) async fn complete_chat_with_tools(
         }
         let has_client_tools = partition.has_client_executed_calls();
         if has_client_tools && !partition.has_proxy_executed_calls() {
+            if let Some(stop) = context
+                .store
+                .record_client_tool_handoff_calls(
+                    context.request_id,
+                    context.original_request,
+                    &client_handoff_guard_calls(&partition),
+                    Some(&cumulative_usage),
+                )
+                .await
+                .map_err(|error| {
+                    ToolLoopError::new(
+                        format!("failed to evaluate client tool handoff guard: {error}"),
+                        &cumulative_usage,
+                    )
+                })?
+            {
+                let _ = context
+                    .store
+                    .record_event(
+                        "warn",
+                        "client_tool_handoff_guard_diagnostic",
+                        "CodeSeeX stopped repeated client tool handoffs.",
+                        Some(&client_handoff_guard_diagnostic(context.request_id, &stop)),
+                    )
+                    .await;
+                return Err(ToolLoopError::with_code(
+                    stop.code,
+                    stop.message,
+                    &cumulative_usage,
+                ));
+            }
             let stored_assistant = full_assistant_tool_message_from_chat(&chat)
                 .map_err(|error| ToolLoopError::new(error, &cumulative_usage))?;
             context
@@ -397,6 +438,37 @@ pub(crate) async fn complete_chat_with_tools(
                     )),
                 )
                 .await;
+            if let Some(stop) = context
+                .store
+                .record_client_tool_handoff_calls(
+                    context.request_id,
+                    context.original_request,
+                    &client_handoff_guard_calls(&partition),
+                    Some(&cumulative_usage),
+                )
+                .await
+                .map_err(|error| {
+                    ToolLoopError::new(
+                        format!("failed to evaluate client tool handoff guard: {error}"),
+                        &cumulative_usage,
+                    )
+                })?
+            {
+                let _ = context
+                    .store
+                    .record_event(
+                        "warn",
+                        "client_tool_handoff_guard_diagnostic",
+                        "CodeSeeX stopped repeated client tool handoffs.",
+                        Some(&client_handoff_guard_diagnostic(context.request_id, &stop)),
+                    )
+                    .await;
+                return Err(ToolLoopError::with_code(
+                    stop.code,
+                    stop.message,
+                    &cumulative_usage,
+                ));
+            }
             return Ok(ToolLoopResult::ClientToolCalls(ToolLoopResponse {
                 chat,
                 response_items,
@@ -487,6 +559,30 @@ pub(crate) async fn complete_chat_with_tools(
             )
             .await;
     }
+}
+
+fn client_handoff_guard_calls(
+    partition: &crate::tools::ownership::ToolCallPartition,
+) -> Vec<ClientToolHandoffCall> {
+    partition
+        .native
+        .iter()
+        .chain(partition.external.iter())
+        .map(|call| ClientToolHandoffCall {
+            call_id: call.id.clone(),
+            name: call.name.clone(),
+            arguments: call.arguments.clone(),
+        })
+        .collect()
+}
+
+fn client_handoff_guard_diagnostic(
+    request_id: &str,
+    stop: &codeseex_store::ClientToolHandoffGuardStop,
+) -> Value {
+    let mut detail = stop.diagnostic();
+    detail["id"] = json!(request_id);
+    detail
 }
 
 async fn recover_final_response_after_tool_loop_stop(

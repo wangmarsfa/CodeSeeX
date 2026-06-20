@@ -377,6 +377,77 @@ async fn v1_routes_keep_openai_compatible_cors() {
 }
 
 #[tokio::test]
+async fn api_models_returns_app_server_model_list_shape() {
+    let config = test_config(temp_workspace("api-models"));
+    let (data_dir, addr) = spawn_test_app(config).await;
+
+    let response = reqwest::Client::new()
+        .get(format!("http://{addr}/api/models?limit=1"))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.json::<Value>().await.unwrap();
+    assert_eq!(
+        body.pointer("/data/0/id").and_then(Value::as_str),
+        Some("deepseek-v4-flash")
+    );
+    assert_eq!(
+        body.pointer("/data/0/model").and_then(Value::as_str),
+        Some("deepseek-v4-flash")
+    );
+    assert_eq!(
+        body.pointer("/data/0/defaultReasoningEffort")
+            .and_then(Value::as_str),
+        Some("medium")
+    );
+    assert_eq!(
+        body.pointer("/data/0/supportedReasoningEfforts/0/reasoningEffort")
+            .and_then(Value::as_str),
+        Some("low")
+    );
+    assert_eq!(body.get("nextCursor").and_then(Value::as_str), Some("1"));
+    let _ = std::fs::remove_dir_all(data_dir);
+}
+
+#[tokio::test]
+async fn app_server_rpc_dispatches_model_list() {
+    let config = test_config(temp_workspace("api-app-server-model-list"));
+    let (data_dir, addr) = spawn_test_app(config).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("http://{addr}/api/app-server"))
+        .json(&json!({
+            "id": 6,
+            "method": "model/list",
+            "params": {
+                "limit": 20,
+                "includeHidden": false
+            }
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.json::<Value>().await.unwrap();
+    assert_eq!(body.get("id").and_then(Value::as_u64), Some(6));
+    assert!(body.get("error").is_none());
+    assert_eq!(
+        body.pointer("/result/data/1/id").and_then(Value::as_str),
+        Some("deepseek-v4-pro")
+    );
+    assert_eq!(
+        body.pointer("/result/data/1/inputModalities/1")
+            .and_then(Value::as_str),
+        Some("image")
+    );
+    assert_eq!(body.pointer("/result/nextCursor"), Some(&Value::Null));
+    let _ = std::fs::remove_dir_all(data_dir);
+}
+
+#[tokio::test]
 async fn web_search_source_probe_runs_after_proxy_startup_event() {
     let data_dir = temp_workspace("search-probe-startup");
     let config = test_config(data_dir.clone());
@@ -856,6 +927,187 @@ async fn fake_budgeted_web_search_streaming_chat_completions(
         .expect("fake upstream response should build")
 }
 
+async fn fake_budgeted_web_search_then_deepseek_protocol_streaming_chat_completions(
+    State(state): State<FakeUpstreamState>,
+    Json(payload): Json<Value>,
+) -> axum::response::Response {
+    let has_tools = payload
+        .get("tools")
+        .and_then(Value::as_array)
+        .map(|items| !items.is_empty())
+        .unwrap_or(false);
+    let request_index = {
+        let mut requests = state.requests.lock().expect("fake upstream lock poisoned");
+        requests.push(payload);
+        requests.len()
+    };
+    let body = if has_tools {
+        format!(
+            concat!(
+                "data: {{\"choices\":[{{\"delta\":{{\"tool_calls\":[{{\"index\":0,\"id\":\"call_web_{}\",\"type\":\"function\",\"function\":{{\"name\":\"web_search\",\"arguments\":\"{{\\\"query\\\":\\\"bounded dsml search {}\\\"}}\"}}}}]}}}}]}}\n\n",
+                "data: {{\"choices\":[],\"usage\":{{\"prompt_tokens\":8,\"completion_tokens\":2,\"total_tokens\":10}}}}\n\n",
+                "data: [DONE]\n\n"
+            ),
+            Uuid::new_v4().simple(),
+            request_index
+        )
+    } else {
+        concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"<\\uff5c\\uff5cDSML\\uff5c\\uff5ctool_calls><\\uff5c\\uff5cDSML\\uff5c\\uff5cinvoke name=\\\"web_search\\\"><\\uff5c\\uff5cDSML\\uff5c\\uff5cparameter name=\\\"query\\\" string=\\\"true\\\">retry</\\uff5c\\uff5cDSML\\uff5c\\uff5cparameter></\\uff5c\\uff5cDSML\\uff5c\\uff5cinvoke></\\uff5c\\uff5cDSML\\uff5c\\uff5ctool_calls>\"}}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":13,\"completion_tokens\":7,\"total_tokens\":20}}\n\n",
+            "data: [DONE]\n\n"
+        )
+        .to_owned()
+    };
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .body(Body::from(body))
+        .expect("fake upstream response should build")
+}
+
+async fn fake_deepseek_reasoning_protocol_streaming_chat_completions(
+    State(state): State<FakeUpstreamState>,
+    Json(payload): Json<Value>,
+) -> axum::response::Response {
+    let has_tool_result = payload
+        .get("messages")
+        .and_then(Value::as_array)
+        .map(|messages| {
+            messages.iter().any(|message| {
+                message.get("role").and_then(Value::as_str) == Some("tool")
+                    && message
+                        .get("tool_call_id")
+                        .and_then(Value::as_str)
+                        .is_some()
+            })
+        })
+        .unwrap_or(false);
+    {
+        let mut requests = state.requests.lock().expect("fake upstream lock poisoned");
+        requests.push(payload);
+    }
+    let body = if has_tool_result {
+        concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"used reasoning protocol tool result\"}}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":13,\"completion_tokens\":7,\"total_tokens\":20}}\n\n",
+            "data: [DONE]\n\n"
+        )
+        .to_owned()
+    } else {
+        concat!(
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"<\\uff5c\\uff5cDSML\\uff5c\\uff5ctool_calls><\\uff5c\\uff5cDSML\\uff5c\\uff5cinvoke name=\\\"web_search\\\"><\\uff5c\\uff5cDSML\\uff5c\\uff5cparameter name=\\\"query\\\" string=\\\"true\\\">reasoning protocol search</\\uff5c\\uff5cDSML\\uff5c\\uff5cparameter></\\uff5c\\uff5cDSML\\uff5c\\uff5cinvoke></\\uff5c\\uff5cDSML\\uff5c\\uff5ctool_calls>\"}}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":8,\"completion_tokens\":2,\"total_tokens\":10}}\n\n",
+            "data: [DONE]\n\n"
+        )
+        .to_owned()
+    };
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .body(Body::from(body))
+        .expect("fake upstream response should build")
+}
+
+async fn fake_budgeted_web_search_then_deepseek_reasoning_protocol_streaming_chat_completions(
+    State(state): State<FakeUpstreamState>,
+    Json(payload): Json<Value>,
+) -> axum::response::Response {
+    let has_tools = payload
+        .get("tools")
+        .and_then(Value::as_array)
+        .map(|items| !items.is_empty())
+        .unwrap_or(false);
+    let request_index = {
+        let mut requests = state.requests.lock().expect("fake upstream lock poisoned");
+        requests.push(payload);
+        requests.len()
+    };
+    let body = if has_tools {
+        format!(
+            concat!(
+                "data: {{\"choices\":[{{\"delta\":{{\"tool_calls\":[{{\"index\":0,\"id\":\"call_web_{}\",\"type\":\"function\",\"function\":{{\"name\":\"web_search\",\"arguments\":\"{{\\\"query\\\":\\\"bounded reasoning dsml search {}\\\"}}\"}}}}]}}}}]}}\n\n",
+                "data: {{\"choices\":[],\"usage\":{{\"prompt_tokens\":8,\"completion_tokens\":2,\"total_tokens\":10}}}}\n\n",
+                "data: [DONE]\n\n"
+            ),
+            Uuid::new_v4().simple(),
+            request_index
+        )
+    } else {
+        concat!(
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"<\\uff5c\\uff5cDSML\\uff5c\\uff5ctool_calls><\\uff5c\\uff5cDSML\\uff5c\\uff5cinvoke name=\\\"web_search\\\"><\\uff5c\\uff5cDSML\\uff5c\\uff5cparameter name=\\\"query\\\" string=\\\"true\\\">retry reasoning</\\uff5c\\uff5cDSML\\uff5c\\uff5cparameter></\\uff5c\\uff5cDSML\\uff5c\\uff5cinvoke></\\uff5c\\uff5cDSML\\uff5c\\uff5ctool_calls>\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"recovered without leaking reasoning protocol\"}}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":13,\"completion_tokens\":7,\"total_tokens\":20}}\n\n",
+            "data: [DONE]\n\n"
+        )
+        .to_owned()
+    };
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .body(Body::from(body))
+        .expect("fake upstream response should build")
+}
+
+async fn fake_protocol_marker_text_streaming_chat_completions(
+    State(state): State<FakeUpstreamState>,
+    Json(payload): Json<Value>,
+) -> axum::response::Response {
+    {
+        let mut requests = state.requests.lock().expect("fake upstream lock poisoned");
+        requests.push(payload);
+    }
+    let body = concat!(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"custom upstream visible <\\uff5c\\uff5cDSML\\uff5c\\uff5ctool_calls> text\"}}]}\n\n",
+        "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":4,\"total_tokens\":9}}\n\n",
+        "data: [DONE]\n\n"
+    );
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .body(Body::from(body))
+        .expect("fake upstream response should build")
+}
+
+async fn fake_budgeted_web_search_then_tool_delta_streaming_chat_completions(
+    State(state): State<FakeUpstreamState>,
+    Json(payload): Json<Value>,
+) -> axum::response::Response {
+    let has_tools = payload
+        .get("tools")
+        .and_then(Value::as_array)
+        .map(|items| !items.is_empty())
+        .unwrap_or(false);
+    let request_index = {
+        let mut requests = state.requests.lock().expect("fake upstream lock poisoned");
+        requests.push(payload);
+        requests.len()
+    };
+    let body = if has_tools {
+        format!(
+            concat!(
+                "data: {{\"choices\":[{{\"delta\":{{\"tool_calls\":[{{\"index\":0,\"id\":\"call_web_{}\",\"type\":\"function\",\"function\":{{\"name\":\"web_search\",\"arguments\":\"{{\\\"query\\\":\\\"bounded standard search {}\\\"}}\"}}}}]}}}}]}}\n\n",
+                "data: {{\"choices\":[],\"usage\":{{\"prompt_tokens\":8,\"completion_tokens\":2,\"total_tokens\":10}}}}\n\n",
+                "data: [DONE]\n\n"
+            ),
+            Uuid::new_v4().simple(),
+            request_index
+        )
+    } else {
+        concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_recovery\",\"type\":\"function\",\"function\":{\"name\":\"web_search\",\"arguments\":\"{\\\"query\\\":\\\"retry\\\"}\"}}]}}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":13,\"completion_tokens\":7,\"total_tokens\":20}}\n\n",
+            "data: [DONE]\n\n"
+        )
+        .to_owned()
+    };
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .body(Body::from(body))
+        .expect("fake upstream response should build")
+}
+
 async fn fake_repeated_failing_list_directory_chat_completions(
     State(state): State<FakeUpstreamState>,
     Json(payload): Json<Value>,
@@ -1090,6 +1342,36 @@ async fn fake_codex_handoff_then_final_chat_completions(
             "completion_tokens": 12,
             "total_tokens": 432
         }
+    }))
+    .into_response()
+}
+
+async fn fake_repeated_shell_handoff_chat_completions(
+    State(state): State<FakeUpstreamState>,
+    Json(payload): Json<Value>,
+) -> axum::response::Response {
+    let request_index = {
+        let mut requests = state.requests.lock().expect("fake upstream lock poisoned");
+        requests.push(payload);
+        requests.len()
+    };
+    Json(json!({
+        "choices": [{
+            "finish_reason": "tool_calls",
+            "message": {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": format!("call_shell_{request_index}"),
+                    "type": "function",
+                    "function": {
+                        "name": "shell_command",
+                        "arguments": format!("{{\"command\":\"date\",\"nonce\":{request_index}}}")
+                    }
+                }]
+            }
+        }],
+        "usage": { "prompt_tokens": 30, "completion_tokens": 2, "total_tokens": 32 }
     }))
     .into_response()
 }
@@ -4486,7 +4768,7 @@ async fn streaming_web_search_repeated_failure_recovers_with_final_answer() {
                 .get("content")
                 .and_then(Value::as_str)
                 .unwrap_or_default()
-                .contains("stopped repeated unsuccessful web_search calls")
+                .contains("stopped the tool loop and removed tools")
     }));
 
     let (events, _) = store.recent_events(80, None).await.unwrap();
@@ -4572,14 +4854,18 @@ async fn streaming_web_search_budget_recovers_with_final_answer() {
     assert!(requests[2].get("tools").is_some());
     assert!(requests[3].get("tools").is_none());
     let recovery_messages = requests[3]["messages"].as_array().unwrap();
-    assert!(recovery_messages.iter().any(|message| {
-        message.get("role").and_then(Value::as_str) == Some("user")
-            && message
-                .get("content")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .contains("reached its per-response budget")
-    }), "{}", serde_json::to_string_pretty(recovery_messages).unwrap());
+    assert!(
+        recovery_messages.iter().any(|message| {
+            message.get("role").and_then(Value::as_str) == Some("user")
+                && message
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .contains("reached its per-response budget")
+        }),
+        "{}",
+        serde_json::to_string_pretty(recovery_messages).unwrap()
+    );
 
     let (events, _) = store.recent_events(80, None).await.unwrap();
     assert!(events.iter().any(|event| {
@@ -4594,6 +4880,348 @@ async fn streaming_web_search_budget_recovers_with_final_answer() {
     assert!(!events
         .iter()
         .any(|event| event.event_type == "request_failed"));
+
+    let _ = std::fs::remove_dir_all(data_dir);
+}
+
+#[tokio::test]
+async fn streaming_recovery_blocks_deepseek_tool_protocol_when_tools_are_removed() {
+    let fake_state = FakeUpstreamState::default();
+    let fake_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let fake_addr = fake_listener.local_addr().unwrap();
+    let fake_app = Router::new()
+        .route(
+            "/chat/completions",
+            post(fake_budgeted_web_search_then_deepseek_protocol_streaming_chat_completions),
+        )
+        .with_state(fake_state.clone());
+    tokio::spawn(async move {
+        axum::serve(fake_listener, fake_app).await.unwrap();
+    });
+
+    let data_dir = temp_workspace("streaming-recovery-blocks-deepseek-protocol");
+    let config = test_config_with_upstream(data_dir.clone(), fake_addr);
+    let store = Store::open(&config.data_dir).await.unwrap();
+    let proxy_state = ProxyState::for_test(config, store.clone());
+    let proxy_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    let proxy_app = Router::new()
+        .route("/v1/responses", post(responses))
+        .with_state(proxy_state);
+    tokio::spawn(async move {
+        axum::serve(proxy_listener, proxy_app).await.unwrap();
+    });
+
+    let body = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/responses"))
+        .json(&json!({
+            "id": "resp_stream_recovery_blocks_deepseek_protocol",
+            "model": "deepseek-v4-pro",
+            "stream": true,
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "keep searching until the recovery turn emits a provider tool protocol block" }]
+            }]
+        }))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+
+    assert!(body.contains("response.completed"), "{body}");
+    assert!(!body.contains("response.failed"), "{body}");
+    assert!(
+        !body.contains(&format!("<{}DSML", "\u{ff5c}\u{ff5c}")),
+        "{body}"
+    );
+    assert!(!body.contains("\\uff5c\\uff5cDSML"), "{body}");
+    assert!(!body.contains("invoke name=\\\"web_search\\\""), "{body}");
+
+    let (events, _) = store.recent_events(120, None).await.unwrap();
+    assert!(events
+        .iter()
+        .any(|event| event.event_type == "deepseek_tool_protocol_blocked"));
+
+    let _ = std::fs::remove_dir_all(data_dir);
+}
+
+#[tokio::test]
+async fn streaming_recovery_blocks_deepseek_reasoning_tool_protocol_when_tools_are_removed() {
+    let fake_state = FakeUpstreamState::default();
+    let fake_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let fake_addr = fake_listener.local_addr().unwrap();
+    let fake_app = Router::new()
+        .route(
+            "/chat/completions",
+            post(fake_budgeted_web_search_then_deepseek_reasoning_protocol_streaming_chat_completions),
+        )
+        .with_state(fake_state.clone());
+    tokio::spawn(async move {
+        axum::serve(fake_listener, fake_app).await.unwrap();
+    });
+
+    let data_dir = temp_workspace("streaming-recovery-blocks-deepseek-reasoning-protocol");
+    let config = test_config_with_upstream(data_dir.clone(), fake_addr);
+    let store = Store::open(&config.data_dir).await.unwrap();
+    let proxy_state = ProxyState::for_test(config, store.clone());
+    let proxy_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    let proxy_app = Router::new()
+        .route("/v1/responses", post(responses))
+        .with_state(proxy_state);
+    tokio::spawn(async move {
+        axum::serve(proxy_listener, proxy_app).await.unwrap();
+    });
+
+    let body = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/responses"))
+        .json(&json!({
+            "id": "resp_stream_recovery_blocks_deepseek_reasoning_protocol",
+            "model": "deepseek-v4-pro",
+            "stream": true,
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "keep searching until recovery reasoning emits protocol" }]
+            }]
+        }))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+
+    assert!(
+        body.contains("recovered without leaking reasoning protocol"),
+        "{body}"
+    );
+    assert!(body.contains("response.completed"), "{body}");
+    assert!(!body.contains("response.failed"), "{body}");
+    assert!(
+        !body.contains(&format!("<{}DSML", "\u{ff5c}\u{ff5c}")),
+        "{body}"
+    );
+    assert!(!body.contains("\\uff5c\\uff5cDSML"), "{body}");
+    assert!(!body.contains("retry reasoning"), "{body}");
+
+    let (events, _) = store.recent_events(140, None).await.unwrap();
+    assert!(events.iter().any(|event| {
+        event.event_type == "deepseek_tool_protocol_blocked"
+            && event
+                .detail
+                .as_ref()
+                .and_then(|detail| detail.get("channel"))
+                .and_then(Value::as_str)
+                == Some("reasoning_content")
+    }));
+
+    let _ = std::fs::remove_dir_all(data_dir);
+}
+
+#[tokio::test]
+async fn streaming_adapts_deepseek_tool_protocol_from_reasoning_content() {
+    let fake_state = FakeUpstreamState::default();
+    let fake_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let fake_addr = fake_listener.local_addr().unwrap();
+    let fake_app = Router::new()
+        .route(
+            "/chat/completions",
+            post(fake_deepseek_reasoning_protocol_streaming_chat_completions),
+        )
+        .with_state(fake_state.clone());
+    tokio::spawn(async move {
+        axum::serve(fake_listener, fake_app).await.unwrap();
+    });
+
+    let data_dir = temp_workspace("streaming-adapts-deepseek-reasoning-protocol");
+    let config = test_config_with_upstream(data_dir.clone(), fake_addr);
+    let store = Store::open(&config.data_dir).await.unwrap();
+    let proxy_state = ProxyState::for_test(config, store.clone());
+    let proxy_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    let proxy_app = Router::new()
+        .route("/v1/responses", post(responses))
+        .with_state(proxy_state);
+    tokio::spawn(async move {
+        axum::serve(proxy_listener, proxy_app).await.unwrap();
+    });
+
+    let body = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/responses"))
+        .json(&json!({
+            "id": "resp_stream_adapts_deepseek_reasoning_protocol",
+            "model": "deepseek-v4-pro",
+            "stream": true,
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "reasoning emits provider tool protocol" }]
+            }]
+        }))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+
+    assert!(
+        body.contains("response.web_search_call.searching"),
+        "{body}"
+    );
+    assert!(
+        body.contains("used reasoning protocol tool result"),
+        "{body}"
+    );
+    assert!(
+        !body.contains(&format!("<{}DSML", "\u{ff5c}\u{ff5c}")),
+        "{body}"
+    );
+    assert!(!body.contains("\\uff5c\\uff5cDSML"), "{body}");
+    assert!(!body.contains("invoke name="), "{body}");
+
+    let (events, _) = store.recent_events(120, None).await.unwrap();
+    assert!(events.iter().any(|event| {
+        event.event_type == "deepseek_tool_protocol_adapted"
+            && event
+                .detail
+                .as_ref()
+                .and_then(|detail| detail.get("channel"))
+                .and_then(Value::as_str)
+                == Some("reasoning_content")
+    }));
+
+    let _ = std::fs::remove_dir_all(data_dir);
+}
+
+#[tokio::test]
+async fn streaming_custom_upstream_does_not_apply_deepseek_tool_protocol_adapter() {
+    let fake_state = FakeUpstreamState::default();
+    let fake_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let fake_addr = fake_listener.local_addr().unwrap();
+    let fake_app = Router::new()
+        .route(
+            "/chat/completions",
+            post(fake_protocol_marker_text_streaming_chat_completions),
+        )
+        .with_state(fake_state.clone());
+    tokio::spawn(async move {
+        axum::serve(fake_listener, fake_app).await.unwrap();
+    });
+
+    let data_dir = temp_workspace("streaming-custom-upstream-no-deepseek-adapter");
+    let config = test_config_with_upstream(data_dir.clone(), fake_addr);
+    let store = Store::open(&config.data_dir).await.unwrap();
+    let proxy_state = ProxyState::for_test(config, store.clone());
+    let proxy_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    let proxy_app = Router::new()
+        .route("/v1/responses", post(responses))
+        .with_state(proxy_state);
+    tokio::spawn(async move {
+        axum::serve(proxy_listener, proxy_app).await.unwrap();
+    });
+
+    let body = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/responses"))
+        .json(&json!({
+            "id": "resp_custom_upstream_protocol_text",
+            "model": "gpt-4o",
+            "stream": true,
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "echo provider protocol marker text" }]
+            }]
+        }))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+
+    assert!(body.contains("response.completed"), "{body}");
+    assert!(
+        body.contains(&format!("<{}DSML", "\u{ff5c}\u{ff5c}")),
+        "{body}"
+    );
+
+    let (events, _) = store.recent_events(120, None).await.unwrap();
+    assert!(!events
+        .iter()
+        .any(|event| event.event_type.starts_with("deepseek_tool_protocol_")));
+
+    let _ = std::fs::remove_dir_all(data_dir);
+}
+
+#[tokio::test]
+async fn streaming_recovery_blocks_standard_tool_calls_when_tools_are_removed() {
+    let fake_state = FakeUpstreamState::default();
+    let fake_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let fake_addr = fake_listener.local_addr().unwrap();
+    let fake_app = Router::new()
+        .route(
+            "/chat/completions",
+            post(fake_budgeted_web_search_then_tool_delta_streaming_chat_completions),
+        )
+        .with_state(fake_state.clone());
+    tokio::spawn(async move {
+        axum::serve(fake_listener, fake_app).await.unwrap();
+    });
+
+    let data_dir = temp_workspace("streaming-recovery-blocks-standard-tools");
+    let config = test_config_with_upstream(data_dir.clone(), fake_addr);
+    let store = Store::open(&config.data_dir).await.unwrap();
+    let proxy_state = ProxyState::for_test(config, store.clone());
+    let proxy_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    let proxy_app = Router::new()
+        .route("/v1/responses", post(responses))
+        .with_state(proxy_state);
+    tokio::spawn(async move {
+        axum::serve(proxy_listener, proxy_app).await.unwrap();
+    });
+
+    let body = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/responses"))
+        .json(&json!({
+            "id": "resp_stream_recovery_blocks_standard_tool",
+            "model": "deepseek-v4-pro",
+            "stream": true,
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "keep searching until the recovery turn emits tool delta" }]
+            }]
+        }))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+
+    assert!(body.contains("response.completed"), "{body}");
+    assert!(!body.contains("response.failed"), "{body}");
+    assert!(!body.contains("call_recovery"), "{body}");
+
+    let requests = fake_state
+        .requests
+        .lock()
+        .expect("fake upstream lock poisoned")
+        .clone();
+    assert_eq!(requests.len(), 4);
+    assert!(requests[3].get("tools").is_none());
+
+    let (events, _) = store.recent_events(120, None).await.unwrap();
+    assert!(events
+        .iter()
+        .any(|event| event.event_type == "streaming_tool_call_blocked"));
 
     let _ = std::fs::remove_dir_all(data_dir);
 }
@@ -4981,15 +5609,15 @@ async fn repeated_failing_web_search_stops_after_two_failures() {
                 .and_then(Value::as_bool)
                 == Some(true)
     }));
-    assert!(!events
-        .iter()
-        .any(|event| event.event_type == "request_failed"
+    assert!(!events.iter().any(|event| {
+        event.event_type == "request_failed"
             && event
                 .detail
                 .as_ref()
                 .and_then(|detail| detail.get("id"))
                 .and_then(Value::as_str)
-                == Some("resp_repeated_failing_web_search")));
+                == Some("resp_repeated_failing_web_search")
+    }));
 
     let _ = std::fs::remove_dir_all(data_dir);
 }
@@ -5678,6 +6306,170 @@ async fn nonstreaming_client_tool_handoff_is_not_user_completed_turn() {
 
     let _ = std::fs::remove_file(&patch_file);
     let _ = std::fs::remove_dir_all(patch_dir);
+    let _ = std::fs::remove_dir_all(data_dir);
+}
+
+#[tokio::test]
+async fn client_tool_handoff_guard_stops_repeated_failures_before_upstream_retry() {
+    let fake_state = FakeUpstreamState::default();
+    let fake_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let fake_addr = fake_listener.local_addr().unwrap();
+    let fake_app = Router::new()
+        .route(
+            "/chat/completions",
+            post(fake_repeated_shell_handoff_chat_completions),
+        )
+        .with_state(fake_state.clone());
+    tokio::spawn(async move {
+        axum::serve(fake_listener, fake_app).await.unwrap();
+    });
+
+    let data_dir = temp_workspace("client-handoff-guard-failures");
+    let config = test_config_with_upstream(data_dir.clone(), fake_addr);
+    let store = Store::open(&config.data_dir).await.unwrap();
+    let proxy_state = ProxyState::for_test(config, store.clone());
+    let proxy_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    let proxy_app = Router::new()
+        .route("/v1/responses", post(responses))
+        .with_state(proxy_state);
+    tokio::spawn(async move {
+        axum::serve(proxy_listener, proxy_app).await.unwrap();
+    });
+
+    let client = reqwest::Client::new();
+    for index in 0..3 {
+        let response = client
+            .post(format!("http://{proxy_addr}/v1/responses"))
+            .json(&json!({
+                "id": format!("resp_guard_handoff_{index}"),
+                "model": "deepseek-v4-pro",
+                "prompt_cache_key": "guard-thread",
+                "input": [{
+                    "type": "message",
+                    "role": "user",
+                    "content": [{ "type": "input_text", "text": "run a client command" }]
+                }],
+                "tools": [{
+                    "type": "function",
+                    "function": {
+                        "name": "shell_command",
+                        "description": "Run a shell command.",
+                        "parameters": { "type": "object", "properties": {} }
+                    }
+                }]
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert!(response.status().is_success());
+        let body = response.json::<Value>().await.unwrap();
+        let call = body["output"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item.get("type").and_then(Value::as_str) == Some("function_call"))
+            .expect("function call");
+        let call_id = call
+            .get("call_id")
+            .and_then(Value::as_str)
+            .expect("call id")
+            .to_owned();
+
+        let followup = client
+            .post(format!("http://{proxy_addr}/v1/responses"))
+            .json(&json!({
+                "id": format!("resp_guard_followup_{index}"),
+                "model": "deepseek-v4-pro",
+                "prompt_cache_key": "guard-thread",
+                "input": [{
+                    "type": "function_call_output",
+                    "call_id": call_id,
+                    "output": "Error: shell execution failed"
+                }],
+                "tools": [{
+                    "type": "function",
+                    "function": {
+                        "name": "shell_command",
+                        "description": "Run a shell command.",
+                        "parameters": { "type": "object", "properties": {} }
+                    }
+                }]
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert!(followup.status().is_success());
+        let body = followup.json::<Value>().await.unwrap();
+        if index < 2 {
+            assert_eq!(body["status"], "completed");
+        } else {
+            assert_eq!(body["status"], "completed");
+            assert_eq!(
+                body.pointer("/incomplete_details/reason")
+                    .and_then(Value::as_str),
+                Some("client_tool_handoff_guard_stopped")
+            );
+            assert_eq!(
+                body.pointer("/output/0/type").and_then(Value::as_str),
+                Some("message")
+            );
+        }
+    }
+
+    let preflight = client
+        .post(format!("http://{proxy_addr}/v1/responses"))
+        .json(&json!({
+            "id": "resp_guard_after_stop",
+            "model": "deepseek-v4-pro",
+            "prompt_cache_key": "guard-thread",
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "run a client command again" }]
+            }],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "shell_command",
+                    "description": "Run a shell command.",
+                    "parameters": { "type": "object", "properties": {} }
+                }
+            }]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(preflight.status().is_success());
+    let body = preflight.json::<Value>().await.unwrap();
+    assert_eq!(body["status"], "completed");
+    assert_eq!(
+        body.pointer("/incomplete_details/reason")
+            .and_then(Value::as_str),
+        Some("client_tool_handoff_guard_stopped")
+    );
+
+    let requests = fake_state
+        .requests
+        .lock()
+        .expect("fake upstream lock poisoned")
+        .clone();
+    assert_eq!(
+        requests.len(),
+        5,
+        "third failing followup and later same-turn request must stop before another upstream request"
+    );
+    let (events, _) = store.recent_events(80, None).await.expect("events");
+    assert!(events.iter().any(|event| {
+        event.event_type == "client_tool_handoff_guard_diagnostic"
+            && event
+                .detail
+                .as_ref()
+                .and_then(|detail| detail.get("reason"))
+                .and_then(Value::as_str)
+                == Some("consecutive_failures")
+    }));
+
     let _ = std::fs::remove_dir_all(data_dir);
 }
 

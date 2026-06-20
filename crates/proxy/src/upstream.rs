@@ -4,6 +4,7 @@ use codeseex_core::urls::chat_completions_url;
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYPE};
 use serde_json::Value;
 
+pub(crate) mod deepseek;
 pub(crate) mod payload;
 
 pub async fn post_chat_completions(

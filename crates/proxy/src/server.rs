@@ -28,8 +28,8 @@ use crate::responses::conversion::{
     text_is_thinking_display_markdown,
 };
 use crate::responses::stream_tool_calls::{
-    collect_streaming_tool_call_deltas, streaming_tool_calls, StreamingToolCallState,
-    StreamingVisibleToolBridge,
+    collect_streaming_tool_call_deltas, insert_streaming_tool_calls, streaming_tool_calls,
+    StreamingToolCallState, StreamingVisibleToolBridge,
 };
 use crate::responses::usage::{merge_response_usage, response_usage_from_chat_usage};
 use crate::runtime_config::RuntimeConfigChangeKind;
@@ -56,6 +56,9 @@ use crate::tools::response_items::{
     native_apply_patch_response_item_from_chat_call, proxy_visible_response_items,
     web_search_call_output_response_item,
 };
+use crate::upstream::deepseek::{
+    should_adapt_tool_protocol, tool_protocol::DeepSeekStreamToolAdapter,
+};
 use crate::upstream::payload::{
     codex_service_request_kind, normalize_chat_payload, request_is_codex_service,
     request_shape_diagnostic, resolve_upstream_model, CodexServiceRequestKind,
@@ -63,7 +66,7 @@ use crate::upstream::payload::{
 use crate::upstream::{codex_request_markers, CodexRequestMarkers};
 use axum::body::{Body, Bytes};
 use axum::extract::{DefaultBodyLimit, Path, Request, State};
-use axum::http::{header, HeaderMap, Response, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, Response, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
@@ -72,7 +75,7 @@ use codeseex_core::context::request_looks_like_codex_full_context;
 use codeseex_core::models::available_models;
 use codeseex_core::protocol::ChatMessage;
 use codeseex_core::{AppConfig, UserConfig};
-use codeseex_store::{RequestStatus, Store};
+use codeseex_store::{ClientToolHandoffCall, RequestStatus, Store};
 use futures_util::stream::BoxStream;
 use futures_util::StreamExt;
 use serde_json::{json, Value};
@@ -1389,6 +1392,141 @@ async fn responses(
     )
     .await;
 
+    if let Some(stop) = match state
+        .store
+        .settle_client_tool_handoff_outputs(&id, &input)
+        .await
+    {
+        Ok(stop) => stop,
+        Err(error) => {
+            return json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "client_tool_handoff_guard_failed",
+                error.to_string(),
+            );
+        }
+    } {
+        let terminal_response = client_handoff_guard_terminal_response(
+            &id,
+            &model,
+            &stop.code,
+            &stop.message,
+            &Value::Null,
+        );
+        let detail = client_handoff_guard_terminal_diagnostic(&stop);
+        let _ = state
+            .store
+            .finish_request(
+                &id,
+                RequestStatus::Completed,
+                Some(&terminal_response),
+                Some(&detail),
+            )
+            .await;
+        record_client_tool_handoff_guard_stop(&state.store, &id, &stop).await;
+        let _ = state
+            .store
+            .record_event(
+                "error",
+                "request_failed",
+                "CodeSeeX stopped repeated client tool handoffs.",
+                Some(&json!({
+                    "id": id,
+                    "requested_model": requested_model.as_deref(),
+                    "model": upstream_model.as_str(),
+                    "error": stop.message.clone()
+                })),
+            )
+            .await;
+        if stream_requested {
+            let mut sequence = 0_u64;
+            let mut bytes = client_handoff_guard_terminal_sse(
+                &id,
+                &model,
+                &stop.code,
+                &stop.message,
+                &Value::Null,
+                &mut sequence,
+            )
+            .to_vec();
+            bytes.extend_from_slice(b"data: [DONE]\n\n");
+            return response_from_bytes(
+                reqwest::StatusCode::OK,
+                Some(HeaderValue::from_static("text/event-stream")),
+                bytes,
+            );
+        }
+        return json_response(terminal_response);
+    }
+
+    if let Some(stop) = match state
+        .store
+        .client_tool_handoff_guard_preflight(&id, &input)
+        .await
+    {
+        Ok(stop) => stop,
+        Err(error) => {
+            return json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "client_tool_handoff_guard_failed",
+                error.to_string(),
+            );
+        }
+    } {
+        let terminal_response = client_handoff_guard_terminal_response(
+            &id,
+            &model,
+            &stop.code,
+            &stop.message,
+            &Value::Null,
+        );
+        let detail = client_handoff_guard_terminal_diagnostic(&stop);
+        let _ = state
+            .store
+            .finish_request(
+                &id,
+                RequestStatus::Completed,
+                Some(&terminal_response),
+                Some(&detail),
+            )
+            .await;
+        record_client_tool_handoff_guard_stop(&state.store, &id, &stop).await;
+        let _ = state
+            .store
+            .record_event(
+                "warn",
+                "request_completed",
+                "CodeSeeX ended a repeated client tool handoff before another upstream call.",
+                Some(&request_completed_detail(
+                    &id,
+                    Some(model.as_str()),
+                    Some(model.as_str()),
+                    Some("failed_billable"),
+                    Some(&terminal_response),
+                )),
+            )
+            .await;
+        if stream_requested {
+            let mut sequence = 0_u64;
+            let mut bytes = client_handoff_guard_terminal_sse(
+                &id,
+                &model,
+                &stop.code,
+                &stop.message,
+                &Value::Null,
+                &mut sequence,
+            )
+            .to_vec();
+            bytes.extend_from_slice(b"data: [DONE]\n\n");
+            return response_from_bytes(
+                reqwest::StatusCode::OK,
+                Some(HeaderValue::from_static("text/event-stream")),
+                bytes,
+            );
+        }
+        return json_response(terminal_response);
+    }
+
     let auth = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
@@ -1557,10 +1695,11 @@ async fn responses(
                         match complete_chat_with_tools(tool_loop_context, payload, chat).await {
                             Ok(result) => result,
                             Err(error) => {
+                                let error_code = error.code.clone();
                                 let failed_response = failed_billable_response(
                                     &id,
                                     &model,
-                                    "tool_loop_failed",
+                                    &error_code,
                                     &error.message,
                                     &error.usage,
                                 );
@@ -1588,7 +1727,7 @@ async fn responses(
                                     .await;
                                 return json_error(
                                     StatusCode::BAD_GATEWAY,
-                                    "tool_loop_failed",
+                                    &error_code,
                                     error.message,
                                 );
                             }
@@ -1880,6 +2019,80 @@ fn failed_billable_response(
         "output": [],
         "usage": usage
     })
+}
+
+fn client_handoff_guard_terminal_response(
+    id: &str,
+    model: &str,
+    code: &str,
+    message: &str,
+    usage: &Value,
+) -> Value {
+    json!({
+        "id": id,
+        "object": "response",
+        "created_at": now_seconds(),
+        "model": model,
+        "status": "completed",
+        "error": Value::Null,
+        "incomplete_details": {
+            "reason": code,
+            "message": message
+        },
+        "parallel_tool_calls": true,
+        "output": [{
+            "id": format!("msg_{}", Uuid::new_v4().simple()),
+            "type": "message",
+            "status": "completed",
+            "role": "assistant",
+            "phase": "final_answer",
+            "content": [{
+                "type": "output_text",
+                "text": message,
+                "annotations": []
+            }]
+        }],
+        "usage": usage
+    })
+}
+
+fn client_handoff_guard_terminal_diagnostic(
+    stop: &codeseex_store::ClientToolHandoffGuardStop,
+) -> Value {
+    json!({
+        "error": stop.message.clone(),
+        "codeseex_lifecycle": "failed_billable",
+        "client_tool_handoff_guard_stopped": true,
+        "client_tool_handoff_guard": stop.diagnostic()
+    })
+}
+
+fn client_handoff_guard_terminal_sse(
+    response_id: &str,
+    model: &str,
+    code: &str,
+    message: &str,
+    usage: &Value,
+    sequence: &mut u64,
+) -> Bytes {
+    let response = client_handoff_guard_terminal_response(response_id, model, code, message, usage);
+    let mut bytes = Vec::new();
+    if let Some(item) = response
+        .get("output")
+        .and_then(Value::as_array)
+        .and_then(|items| items.first())
+    {
+        bytes.extend_from_slice(&message_item_sse_events(response_id, 0, item, sequence));
+    }
+    bytes.extend_from_slice(&sse_bytes(
+        "response.completed",
+        json!({
+            "type": "response.completed",
+            "response": response,
+            "sequence_number": next_sequence(sequence)
+        }),
+    ));
+    Bytes::from(bytes)
 }
 
 fn usage_u64(usage: &Value, keys: &[&str]) -> Option<u64> {
@@ -2320,6 +2533,38 @@ fn response_item_requires_client_tool_execution(item: &Value) -> bool {
     )
 }
 
+fn client_handoff_guard_calls(
+    partition: &crate::tools::ownership::ToolCallPartition,
+) -> Vec<ClientToolHandoffCall> {
+    partition
+        .native
+        .iter()
+        .chain(partition.external.iter())
+        .map(|call| ClientToolHandoffCall {
+            call_id: call.id.clone(),
+            name: call.name.clone(),
+            arguments: call.arguments.clone(),
+        })
+        .collect()
+}
+
+async fn record_client_tool_handoff_guard_stop(
+    store: &Store,
+    request_id: &str,
+    stop: &codeseex_store::ClientToolHandoffGuardStop,
+) {
+    let mut detail = stop.diagnostic();
+    detail["id"] = json!(request_id);
+    let _ = store
+        .record_event(
+            "warn",
+            "client_tool_handoff_guard_diagnostic",
+            "CodeSeeX stopped repeated client tool handoffs.",
+            Some(&detail),
+        )
+        .await;
+}
+
 fn show_thinking_enabled(config: &AppConfig) -> bool {
     UserConfig::read_from(&config.config_path())
         .ok()
@@ -2639,6 +2884,8 @@ fn response_stream_from_chat(params: StreamingResponseParams) -> axum::response:
             }));
 
             let visible_thinking_enabled = show_thinking_enabled(&config);
+            let adapt_deepseek_tool_protocol =
+                should_adapt_tool_protocol(&config.upstream, &model);
             let mut completed_tool_iterations = 0_u32;
             let mut tool_loop_diagnostics = ToolLoopDiagnostics::default();
             let mut thinking_title_emitted = false;
@@ -2665,6 +2912,8 @@ fn response_stream_from_chat(params: StreamingResponseParams) -> axum::response:
                 let mut output_done = false;
                 let mut last_tool_index = 0_u64;
                 let mut tool_states: BTreeMap<u64, StreamingToolCallState> = BTreeMap::new();
+                let mut provider_content_tool_adapter = DeepSeekStreamToolAdapter::default();
+                let mut provider_reasoning_tool_adapter = DeepSeekStreamToolAdapter::default();
                 let mut visible_tool_bridge = StreamingVisibleToolBridge::default();
                 let mut upstream = response.bytes_stream();
                 let mut iteration_usage = response_usage_from_chat_usage(None);
@@ -2735,54 +2984,59 @@ fn response_stream_from_chat(params: StreamingResponseParams) -> axum::response:
                     }};
                 }
 
-                loop {
-                    let next_chunk = tokio::select! {
-                        chunk = upstream.next() => chunk,
-                        _ = cancelled.cancelled() => None,
-                    };
-                    stop_if_cancelled!("response cancelled while reading upstream stream");
-                    let Some(chunk) = next_chunk else {
-                        break;
-                    };
-                    let bytes = match chunk {
-                        Ok(bytes) => bytes,
-                        Err(error) => {
-                            let message = error.to_string();
-                            let detail = json!({ "error": message });
-                            let _ = state.store.finish_request(&response_id, RequestStatus::Failed, None, Some(&detail)).await;
-                            let _ = state
-                                .store
-                                .record_event(
-                                    "error",
-                                    "request_failed",
-                                    "Streaming response failed.",
-                                    Some(&json!({ "id": response_id, "error": detail["error"] })),
-                                )
-                                .await;
-                            yield stream_failed_event(&response_id, &model, created_at, &mut sequence, "upstream_stream_failed", &detail["error"].to_string());
-                            yield Bytes::from_static(b"data: [DONE]\n\n");
-                            return;
+                macro_rules! emit_content_delta {
+                    ($content:expr) => {{
+                        let content = $content;
+                        if !content.is_empty() && !turn_output_closed {
+                            close_reasoning_if_needed!();
+                            if !turn_output_open {
+                                turn_output_open = true;
+                                let current_output_index = output_index;
+                                turn_output_index = Some(current_output_index);
+                                output_index += 1;
+                                yield sse_bytes("response.output_item.added", json!({
+                                    "type": "response.output_item.added",
+                                    "response_id": response_id,
+                                    "output_index": current_output_index,
+                                    "item": {
+                                        "id": turn_item_id,
+                                        "type": "message",
+                                        "status": "in_progress",
+                                        "role": "assistant",
+                                        "phase": "commentary",
+                                        "content": []
+                                    },
+                                    "sequence_number": next_sequence(&mut sequence)
+                                }));
+                                yield sse_bytes("response.content_part.added", json!({
+                                    "type": "response.content_part.added",
+                                    "response_id": response_id,
+                                    "item_id": turn_item_id,
+                                    "output_index": current_output_index,
+                                    "content_index": 0,
+                                    "part": { "type": "output_text", "text": "", "annotations": [] },
+                                    "sequence_number": next_sequence(&mut sequence)
+                                }));
+                            }
+                            turn_text.push_str(content);
+                            let current_output_index = turn_output_index.unwrap_or_default();
+                            yield sse_bytes("response.output_text.delta", json!({
+                                "type": "response.output_text.delta",
+                                "response_id": response_id,
+                                "item_id": turn_item_id,
+                                "output_index": current_output_index,
+                                "content_index": 0,
+                                "delta": content,
+                                "sequence_number": next_sequence(&mut sequence)
+                            }));
                         }
-                    };
-                    buffer.push_str(&String::from_utf8_lossy(&bytes));
-                    while let Some(frame) = take_sse_frame(&mut buffer) {
-                        let Some(data) = sse_data(&frame) else { continue };
-                        if data.trim() == "[DONE]" {
-                            output_done = true;
-                            break;
-                        }
-                        let Ok(parsed) = serde_json::from_str::<Value>(&data) else { continue };
-                        if let Some(next_usage) = parsed.get("usage") {
-                            let parsed_usage = response_usage_from_chat_usage(Some(next_usage));
-                            iteration_usage = merge_response_usage(&iteration_usage, &parsed_usage);
-                            usage = merge_response_usage(&usage, &parsed_usage);
-                        }
-                        let delta = parsed.pointer("/choices/0/delta").cloned().unwrap_or(Value::Null);
-                        if let Some(reasoning) = delta
-                            .get("reasoning_content")
-                            .and_then(Value::as_str)
-                            .filter(|value| !value.is_empty() && !reasoning_closed)
-                        {
+                    }};
+                }
+
+                macro_rules! emit_reasoning_delta {
+                    ($reasoning:expr) => {{
+                        let reasoning = $reasoning;
+                        if !reasoning.is_empty() && !reasoning_closed {
                             if !reasoning_open && !reasoning_closed && visible_thinking_enabled {
                                 reasoning_open = true;
                                 let current_output_index = output_index;
@@ -2858,49 +3112,161 @@ fn response_stream_from_chat(params: StreamingResponseParams) -> axum::response:
                                 }
                             }
                         }
+                    }};
+                }
+
+                macro_rules! handle_provider_tool_content {
+                    ($chunk:expr, $tools_available:expr, $channel:expr) => {{
+                        let tool_content = $chunk;
+                        let channel = $channel;
+                        if channel == "reasoning_content" {
+                            emit_reasoning_delta!(&tool_content.visible_text);
+                        } else {
+                            emit_content_delta!(&tool_content.visible_text);
+                        }
+                        if !tool_content.tool_calls.is_empty() {
+                            let tool_names = tool_content
+                                .tool_calls
+                                .iter()
+                                .map(|call| call.name.clone())
+                                .collect::<Vec<_>>();
+                            let _ = state
+                                .store
+                                .record_event(
+                                    "info",
+                                    "deepseek_tool_protocol_adapted",
+                                    "DeepSeek tool protocol content was adapted into standard tool calls.",
+                                    Some(&json!({
+                                        "id": response_id,
+                                        "iteration": iteration + 1,
+                                        "channel": channel,
+                                        "tool_count": tool_content.tool_calls.len(),
+                                        "tool_names": tool_names
+                                    })),
+                                )
+                                .await;
+                            insert_streaming_tool_calls(
+                                tool_content.tool_calls,
+                                &mut tool_states,
+                                &mut last_tool_index,
+                            );
+                        }
+                        if tool_content.blocked {
+                            let _ = state
+                                .store
+                                .record_event(
+                                    "warn",
+                                    "deepseek_tool_protocol_blocked",
+                                    "DeepSeek tool protocol content was blocked because this upstream turn has no tools.",
+                                    Some(&json!({
+                                        "id": response_id,
+                                        "iteration": iteration + 1,
+                                        "channel": channel,
+                                        "tools_available": $tools_available
+                                    })),
+                                )
+                                .await;
+                        }
+                        if tool_content.parse_failed {
+                            let _ = state
+                                .store
+                                .record_event(
+                                    "warn",
+                                    "deepseek_tool_protocol_parse_failed",
+                                    "DeepSeek tool protocol content could not be parsed.",
+                                    Some(&json!({
+                                        "id": response_id,
+                                        "iteration": iteration + 1,
+                                        "channel": channel,
+                                        "tools_available": $tools_available
+                                    })),
+                                )
+                                .await;
+                        }
+                    }};
+                }
+
+                loop {
+                    let next_chunk = tokio::select! {
+                        chunk = upstream.next() => chunk,
+                        _ = cancelled.cancelled() => None,
+                    };
+                    stop_if_cancelled!("response cancelled while reading upstream stream");
+                    let Some(chunk) = next_chunk else {
+                        break;
+                    };
+                    let bytes = match chunk {
+                        Ok(bytes) => bytes,
+                        Err(error) => {
+                            let message = error.to_string();
+                            let detail = json!({ "error": message });
+                            let _ = state.store.finish_request(&response_id, RequestStatus::Failed, None, Some(&detail)).await;
+                            let _ = state
+                                .store
+                                .record_event(
+                                    "error",
+                                    "request_failed",
+                                    "Streaming response failed.",
+                                    Some(&json!({ "id": response_id, "error": detail["error"] })),
+                                )
+                                .await;
+                            yield stream_failed_event(&response_id, &model, created_at, &mut sequence, "upstream_stream_failed", &detail["error"].to_string());
+                            yield Bytes::from_static(b"data: [DONE]\n\n");
+                            return;
+                        }
+                    };
+                    buffer.push_str(&String::from_utf8_lossy(&bytes));
+                    while let Some(frame) = take_sse_frame(&mut buffer) {
+                        let Some(data) = sse_data(&frame) else { continue };
+                        if data.trim() == "[DONE]" {
+                            output_done = true;
+                            break;
+                        }
+                        let Ok(parsed) = serde_json::from_str::<Value>(&data) else { continue };
+                        if let Some(next_usage) = parsed.get("usage") {
+                            let parsed_usage = response_usage_from_chat_usage(Some(next_usage));
+                            iteration_usage = merge_response_usage(&iteration_usage, &parsed_usage);
+                            usage = merge_response_usage(&usage, &parsed_usage);
+                        }
+                        let delta = parsed.pointer("/choices/0/delta").cloned().unwrap_or(Value::Null);
+                        if let Some(reasoning) = delta
+                            .get("reasoning_content")
+                            .and_then(Value::as_str)
+                            .filter(|value| !value.is_empty() && !reasoning_closed)
+                        {
+                            if adapt_deepseek_tool_protocol {
+                                let tools_available = payload
+                                    .get("tools")
+                                    .and_then(Value::as_array)
+                                    .map(|tools| !tools.is_empty())
+                                    .unwrap_or(false);
+                                let tool_content =
+                                    provider_reasoning_tool_adapter.push(reasoning, tools_available);
+                                handle_provider_tool_content!(
+                                    tool_content,
+                                    tools_available,
+                                    "reasoning_content"
+                                );
+                            } else {
+                                emit_reasoning_delta!(reasoning);
+                            }
+                        }
                         if let Some(content) = delta.get("content").and_then(Value::as_str).filter(|value| !value.is_empty()) {
-                            if !turn_output_closed {
-                                close_reasoning_if_needed!();
-                                if !turn_output_open {
-                                    turn_output_open = true;
-                                    let current_output_index = output_index;
-                                    turn_output_index = Some(current_output_index);
-                                    output_index += 1;
-                                    yield sse_bytes("response.output_item.added", json!({
-                                        "type": "response.output_item.added",
-                                        "response_id": response_id,
-                                        "output_index": current_output_index,
-                                        "item": {
-                                            "id": turn_item_id,
-                                        "type": "message",
-                                        "status": "in_progress",
-                                        "role": "assistant",
-                                        "phase": "commentary",
-                                        "content": []
-                                    },
-                                    "sequence_number": next_sequence(&mut sequence)
-                                }));
-                                    yield sse_bytes("response.content_part.added", json!({
-                                        "type": "response.content_part.added",
-                                        "response_id": response_id,
-                                        "item_id": turn_item_id,
-                                        "output_index": current_output_index,
-                                        "content_index": 0,
-                                        "part": { "type": "output_text", "text": "", "annotations": [] },
-                                    "sequence_number": next_sequence(&mut sequence)
-                                }));
-                                }
-                                turn_text.push_str(content);
-                                let current_output_index = turn_output_index.unwrap_or_default();
-                                yield sse_bytes("response.output_text.delta", json!({
-                                    "type": "response.output_text.delta",
-                                    "response_id": response_id,
-                                    "item_id": turn_item_id,
-                                    "output_index": current_output_index,
-                                    "content_index": 0,
-                                    "delta": content,
-                                    "sequence_number": next_sequence(&mut sequence)
-                                }));
+                            if adapt_deepseek_tool_protocol {
+                                let tools_available = payload
+                                    .get("tools")
+                                    .and_then(Value::as_array)
+                                    .map(|tools| !tools.is_empty())
+                                    .unwrap_or(false);
+                                let tool_content =
+                                    provider_content_tool_adapter.push(content, tools_available);
+                                handle_provider_tool_content!(
+                                    tool_content,
+                                    tools_available,
+                                    "content"
+                                );
+                            } else {
+                                emit_content_delta!(content);
                             }
                         }
                         let has_tool_delta = delta
@@ -2909,23 +3275,69 @@ fn response_stream_from_chat(params: StreamingResponseParams) -> axum::response:
                             .map(|calls| !calls.is_empty())
                             .unwrap_or(false);
                         if has_tool_delta {
-                            close_reasoning_if_needed!();
-                            close_content_if_needed!("commentary");
-                            for event in visible_tool_bridge.process_delta(
-                                &response_id,
-                                &delta,
-                                &external_tool_context,
-                                &mut output_index,
-                                &mut sequence,
-                            ) {
-                                yield event;
+                            let tools_available = payload
+                                .get("tools")
+                                .and_then(Value::as_array)
+                                .map(|tools| !tools.is_empty())
+                                .unwrap_or(false);
+                            if tools_available {
+                                close_reasoning_if_needed!();
+                                close_content_if_needed!("commentary");
+                                for event in visible_tool_bridge.process_delta(
+                                    &response_id,
+                                    &delta,
+                                    &external_tool_context,
+                                    &mut output_index,
+                                    &mut sequence,
+                                ) {
+                                    yield event;
+                                }
+                                collect_streaming_tool_call_deltas(
+                                    &delta,
+                                    &mut tool_states,
+                                    &mut last_tool_index,
+                                );
+                            } else {
+                                let tool_count = delta
+                                    .get("tool_calls")
+                                    .and_then(Value::as_array)
+                                    .map(Vec::len)
+                                    .unwrap_or(0);
+                                let _ = state
+                                    .store
+                                    .record_event(
+                                        "warn",
+                                        "streaming_tool_call_blocked",
+                                        "Streaming tool call deltas were blocked because this upstream turn has no tools.",
+                                        Some(&json!({
+                                            "id": response_id,
+                                            "iteration": iteration + 1,
+                                            "tool_count": tool_count
+                                        })),
+                                    )
+                                    .await;
                             }
                         }
-                        collect_streaming_tool_call_deltas(&delta, &mut tool_states, &mut last_tool_index);
                     }
                     if output_done {
                         break;
                     }
+                }
+
+                if adapt_deepseek_tool_protocol {
+                    let tools_available = payload
+                        .get("tools")
+                        .and_then(Value::as_array)
+                        .map(|tools| !tools.is_empty())
+                        .unwrap_or(false);
+                    let tool_content = provider_reasoning_tool_adapter.finish(tools_available);
+                    handle_provider_tool_content!(
+                        tool_content,
+                        tools_available,
+                        "reasoning_content"
+                    );
+                    let tool_content = provider_content_tool_adapter.finish(tools_available);
+                    handle_provider_tool_content!(tool_content, tools_available, "content");
                 }
 
                 stop_if_cancelled!("response cancelled after upstream stream");
@@ -3163,6 +3575,46 @@ fn response_stream_from_chat(params: StreamingResponseParams) -> axum::response:
                 let has_client_tools = partition.has_client_executed_calls();
                 if has_client_tools && !partition.has_proxy_executed_calls() {
                     stop_if_cancelled!("response cancelled before client tool handoff");
+                    if let Some(stop) = match state
+                        .store
+                        .record_client_tool_handoff_calls(
+                            &response_id,
+                            &original_request,
+                            &client_handoff_guard_calls(&partition),
+                            Some(&usage),
+                        )
+                        .await
+                    {
+                        Ok(stop) => stop,
+                        Err(error) => {
+                            let detail = json!({ "error": error.to_string() });
+                            let _ = state.store.finish_request(&response_id, RequestStatus::Failed, None, Some(&detail)).await;
+                            yield stream_failed_event(&response_id, &model, created_at, &mut sequence, "client_tool_handoff_guard_failed", &detail["error"].to_string());
+                            yield Bytes::from_static(b"data: [DONE]\n\n");
+                            return;
+                        }
+                    } {
+                        record_client_tool_handoff_guard_stop(&state.store, &response_id, &stop).await;
+                        let terminal_response = client_handoff_guard_terminal_response(
+                            &response_id,
+                            &model,
+                            &stop.code,
+                            &stop.message,
+                            &usage,
+                        );
+                        let detail = client_handoff_guard_terminal_diagnostic(&stop);
+                        let _ = state.store.finish_request(&response_id, RequestStatus::Completed, Some(&terminal_response), Some(&detail)).await;
+                        yield client_handoff_guard_terminal_sse(
+                            &response_id,
+                            &model,
+                            &stop.code,
+                            &stop.message,
+                            &usage,
+                            &mut sequence,
+                        );
+                        yield Bytes::from_static(b"data: [DONE]\n\n");
+                        return;
+                    }
                     let stored_assistant = chat_tool_calls_to_assistant_message(
                         &all_tool_calls,
                         &turn_text,
@@ -3636,6 +4088,46 @@ fn response_stream_from_chat(params: StreamingResponseParams) -> axum::response:
 
                 if has_client_tools {
                     stop_if_cancelled!("response cancelled before native/external handoff");
+                    if let Some(stop) = match state
+                        .store
+                        .record_client_tool_handoff_calls(
+                            &response_id,
+                            &original_request,
+                            &client_handoff_guard_calls(&partition),
+                            Some(&usage),
+                        )
+                        .await
+                    {
+                        Ok(stop) => stop,
+                        Err(error) => {
+                            let detail = json!({ "error": error.to_string() });
+                            let _ = state.store.finish_request(&response_id, RequestStatus::Failed, None, Some(&detail)).await;
+                            yield stream_failed_event(&response_id, &model, created_at, &mut sequence, "client_tool_handoff_guard_failed", &detail["error"].to_string());
+                            yield Bytes::from_static(b"data: [DONE]\n\n");
+                            return;
+                        }
+                    } {
+                        record_client_tool_handoff_guard_stop(&state.store, &response_id, &stop).await;
+                        let terminal_response = client_handoff_guard_terminal_response(
+                            &response_id,
+                            &model,
+                            &stop.code,
+                            &stop.message,
+                            &usage,
+                        );
+                        let detail = client_handoff_guard_terminal_diagnostic(&stop);
+                        let _ = state.store.finish_request(&response_id, RequestStatus::Completed, Some(&terminal_response), Some(&detail)).await;
+                        yield client_handoff_guard_terminal_sse(
+                            &response_id,
+                            &model,
+                            &stop.code,
+                            &stop.message,
+                            &usage,
+                            &mut sequence,
+                        );
+                        yield Bytes::from_static(b"data: [DONE]\n\n");
+                        return;
+                    }
                     for call in &partition.native {
                         let (bytes, item) = native_apply_patch_client_tool_sse_events(
                             &response_id,
