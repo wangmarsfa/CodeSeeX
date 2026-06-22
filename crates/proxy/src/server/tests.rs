@@ -1,8 +1,10 @@
+use super::streaming_state::unregister_streaming_response;
 use super::*;
 use crate::responses::context::{
     response_history_messages, response_output_tool_call_messages,
     response_output_tool_call_messages_with_config,
 };
+use crate::tool_passthrough::ToolContext;
 use crate::tools::chat_protocol::assistant_message_from_chat_tool_subset;
 use crate::tools::ownership::ChatToolCall;
 use codeseex_core::config::UpstreamConfig;
