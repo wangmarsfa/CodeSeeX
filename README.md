@@ -7,7 +7,7 @@
 </p>
 
 <p align="center">
-  <a href="docs/website/index.html">Official website</a>
+  <a href="https://tastesteak.github.io/CodeSeeX/">Official website</a>
   ·
   <a href="README_CN.md">简体中文</a>
 </p>

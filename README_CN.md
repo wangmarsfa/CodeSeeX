@@ -7,7 +7,7 @@
 </p>
 
 <p align="center">
-  <a href="docs/website/index.html">官方网站</a>
+  <a href="https://tastesteak.github.io/CodeSeeX/">官方网站</a>
   ·
   <a href="README.md">English</a>
 </p>
